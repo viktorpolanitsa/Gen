@@ -127,7 +127,6 @@ check_and_install_package() {
 
 echo "Checking and installing dependencies..."
 check_and_install_package "sys-kernel/gentoo-sources" "Kernel sources"
-check_and_install_package "sys-devel/make" "Build system"
 check_and_install_package "sys-devel/gcc" "Compiler"
 check_and_install_package "app-laptop/laptop-mode-tools" "Power management"
 check_and_install_package "x11-base/xorg-drivers" "Graphics drivers"
@@ -269,7 +268,7 @@ if [[ "$BUILD_KERNEL" == "y" ]]; then
 fi
 
 # -----------------------------
-# Шаг 7: Установка XFCE/Xorg
+# Шаг 7: Установка XFCE/Xorg с автоматическим запуском
 # -----------------------------
 if [[ "$INSTALL_XFCE" == "y" ]]; then
     echo "Installing XFCE desktop environment..."
@@ -292,23 +291,50 @@ if [[ "$INSTALL_XFCE" == "y" ]]; then
         fi
     done
     
-    echo "[INFO] Configuring LightDM..."
+    echo "[INFO] Configuring LightDM for automatic startup..."
+    
+    # Включаем LightDM в автозагрузку
     if [[ -f /etc/init.d/lightdm ]]; then
         if ! rc-update show default | grep -q lightdm; then
             rc-update add lightdm default
             check_status "LightDM service activation"
         fi
         
+        # Настраиваем LightDM
         mkdir -p /etc/lightdm/lightdm.conf.d
         echo '[LightDM]' > /etc/lightdm/lightdm.conf.d/timeout.conf
         echo 'minimum-display-server-timeout=10' >> /etc/lightdm/lightdm.conf.d/timeout.conf
         
+        # Устанавливаем XFCE как сессию по умолчанию
         echo "[INFO] Setting XFCE as default session..."
+        echo "user-session=xfce" > /etc/lightdm/lightdm.conf.d/xfce.conf
+        
+        # Создаем файл для автоматического запуска XFCE
         echo "exec startxfce4" > /etc/lightdm/Xsession
         chmod +x /etc/lightdm/Xsession
+        
+        echo "[INFO] Configured XFCE to start automatically on boot"
     else
         echo "[WARNING] LightDM not found! Please configure display manager manually."
     fi
+    
+    # Устанавливаем графический уровень запуска по умолчанию
+    if [[ -f /etc/inittab ]]; then
+        sed -i 's/^id:.*:initdefault:/id:5:initdefault:/' /etc/inittab
+        echo "[INFO] Set default runlevel to 5 (graphical mode)"
+    fi
+    
+    # Создаем файл .xinitrc для пользователей
+    for user_dir in /home/*; do
+        if [[ -d "$user_dir" ]]; then
+            username=$(basename "$user_dir")
+            home_dir="/home/$username"
+            echo "exec startxfce4" > "$home_dir/.xinitrc"
+            chown "$username" "$home_dir/.xinitrc"
+            chmod 755 "$home_dir/.xinitrc"
+            echo "[INFO] Created .xinitrc for user $username"
+        fi
+    done
 fi
 
 # -----------------------------
@@ -355,9 +381,16 @@ echo "Logs:"
 echo "- Kernel build: $KERNEL_LOG"
 echo "- XFCE installation: $XFCE_LOG"
 echo ""
+echo "System configuration:"
+if [[ "$INSTALL_XFCE" == "y" ]]; then
+    echo "- XFCE will start automatically on boot"
+    echo "- LightDM display manager is configured"
+    echo "- Graphical mode (runlevel 5) is set as default"
+fi
+echo ""
 echo "Next steps:"
 echo "1. Reboot your system: reboot"
-echo "2. After reboot, login and start XFCE with: startx (if LightDM doesn't start automatically)"
-echo "3. Configure your system further as needed"
+echo "2. After reboot, you should be greeted with the LightDM login screen"
+echo "3. Login and enjoy your XFCE desktop environment"
 echo "=============================================="
 exit 0
