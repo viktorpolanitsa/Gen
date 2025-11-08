@@ -1,22 +1,20 @@
 #!/bin/bash
 set -euo pipefail
 
-# gentoo_autobuilder_pro_builtin_final.sh
-# Full Gentoo AutoBuilder Pro (built-in kernel) final script
-# - OpenRC + UEFI + XFS + XFCE
-# - Kernel selection, force built-in config, genkernel initramfs, GRUB update
-# - make.conf optimization for AMD A10, HDD/XFS/PWR tuning
-# - Backups, rollback (best-effort), dry-run and auto modes
-# - DOES NOT install sys-devel/make automatically (user requested)
+# gentoo_autobuilder_auto_detect.sh
+# Automatic UUID detection + full Gentoo AutoBuilder Pro (built-in kernel)
+# - Auto-detect root and EFI partitions and UUIDs (no manual UUID input)
+# - Auto-create /boot and /boot/efi mountpoints if missing
+# - Update /etc/fstab, attempt mounting, wait for udev
+# - Kernel selection, force built-in config (CONFIG_*=y), build, genkernel initramfs
+# - GRUB/UEFI update, install XFCE/Xorg & LightDM (OpenRC), XFS/HDD/Power tuning
+# - Backups, rollback (best-effort), dry-run (--dry-run) and non-interactive (--auto) modes
+# NOTE: Script will NOT install sys-devel/make automatically. Ensure build tools present.
 
-LOG="/var/log/gentoo_autobuilder_pro_builtin_final.log"
+LOG="/var/log/gentoo_autobuilder_auto_detect.log"
 : > "$LOG"
 
-# === Default partition UUIDs (override if needed) ===
-EFI_UUID="${EFI_UUID:-CD9F-1D11}"                          # /dev/sda1 vfat
-ROOT_UUID="${ROOT_UUID:-a13ed2b3-12b6-45a3-8076-4d275a46c0b5}"  # /dev/sda2 xfs
-
-# === Configurable variables ===
+# Configuration
 BACKUP_DIR="/var/backups/gentoo_autobuilder"
 KEEP_BACKUPS=3
 KERNEL_CONFIG_STORE="/etc/kernel-configs"
@@ -24,15 +22,13 @@ DRY_RUN=false
 AUTO_MODE=false
 EMERGE_JOBS=""
 EMERGE_LOAD=""
-
-# === Emergence base opts (do not include --ask to allow non-interactive) ===
 EMERGE_BASE_OPTS=(--verbose --quiet-build=y --with-bdeps=y)
 
-# === Logging helpers ===
-log()   { printf '[INFO] %s\n' "$*" | tee -a "$LOG"; }
-warn()  { printf '[WARN] %s\n' "$*" | tee -a "$LOG" >&2; }
-err()   { printf '[ERROR] %s\n' "$*" | tee -a "$LOG" >&2; }
-die()   { err "$*"; exit 1; }
+# Logging helpers
+log(){ printf '[INFO] %s\n' "$*" | tee -a "$LOG"; }
+warn(){ printf '[WARN] %s\n' "$*" | tee -a "$LOG" >&2; }
+err(){ printf '[ERROR] %s\n' "$*" | tee -a "$LOG" >&2; }
+die(){ err "$*"; exit 1; }
 
 usage(){
   cat <<EOF
@@ -44,7 +40,7 @@ Usage: $0 [--dry-run] [--auto] [-j N] [-h]
 EOF
 }
 
-# === Args ===
+# Parse args
 while [[ "${1:-}" != "" ]]; do
   case "$1" in
     --dry-run) DRY_RUN=true; shift ;;
@@ -55,9 +51,7 @@ while [[ "${1:-}" != "" ]]; do
   esac
 done
 
-get_cpu_cores(){
-  if command -v nproc &>/dev/null; then nproc --all; else echo 4; fi
-}
+get_cpu_cores(){ command -v nproc &>/dev/null && nproc --all || echo 4; }
 if [[ -z "$EMERGE_JOBS" ]]; then EMERGE_JOBS="$(get_cpu_cores)"; fi
 EMERGE_LOAD="$EMERGE_JOBS"
 
@@ -72,17 +66,14 @@ run_or_dry(){
 
 confirm(){
   local prompt="$1"; local default="${2:-n}"
-  if $AUTO_MODE; then
-    [[ "$default" == "y" ]] && echo "y" || echo "n"
-    return
-  fi
+  if $AUTO_MODE; then [[ "$default" == "y" ]] && echo "y" || echo "n"; return; fi
   read -r -p "$prompt" ans
   ans="${ans:-$default}"
   ans="$(printf '%s' "$ans" | tr '[:upper:]' '[:lower:]')"
   echo "${ans:0:1}"
 }
 
-# === Safety: trap and rollback ===
+# Safety: backup and rollback
 CURRENT_BACKUP=""
 trap 'on_error $?' ERR
 on_error(){
@@ -91,7 +82,7 @@ on_error(){
   if [[ -n "$CURRENT_BACKUP" && -f "$CURRENT_BACKUP" ]]; then
     warn "Restoring backup $CURRENT_BACKUP ..."
     if $DRY_RUN; then
-      log "DRY-RUN: restore from $CURRENT_BACKUP"
+      log "DRY-RUN: restore $CURRENT_BACKUP"
     else
       tar -xzf "$CURRENT_BACKUP" -C / || warn "Rollback extraction returned non-zero"
       log "Rollback attempted."
@@ -115,17 +106,14 @@ make_backup(){
   else
     tar -czf "$backupfile" --absolute-names "${files[@]}" || warn "tar returned non-zero (some files may be missing)"
     log "Backup created: $backupfile"
-    # rotate
-    ls -1t "$BACKUP_DIR"/gentoo_autobuilder_backup_*.tar.gz 2>/dev/null | tail -n +$((KEEP_BACKUPS+1)) | xargs -r rm -f
+    ls -1t "$BACKUP_DIR"/gentoo_autobuilder_backup_*.tar.gz 2>/dev/null | tail -n +$((KEEP_BACKUPS+1)) | xargs -r rm -f || true
   fi
 }
 
-# === Portage helpers ===
+# Portage helpers
 is_installed_pkg(){
   local atom="$1"
-  if command -v equery &>/dev/null; then
-    equery list "$atom" >/dev/null 2>&1 && return 0
-  fi
+  if command -v equery &>/dev/null; then equery list "$atom" >/dev/null 2>&1 && return 0; fi
   [[ -d /var/db/pkg ]] && find /var/db/pkg -maxdepth 2 -type d -name "${atom##*/}*" | grep -q . && return 0
   return 1
 }
@@ -140,8 +128,8 @@ emerge_with_autounmask(){
   if emerge -j"${EMERGE_JOBS}" --load-average="${EMERGE_LOAD}" "${EMERGE_BASE_OPTS[@]}" "$pkg"; then return 0; fi
   warn "Initial emerge failed; trying autounmask-write..."
   if emerge -j"${EMERGE_JOBS}" --load-average="${EMERGE_LOAD}" --autounmask-write=y "$pkg"; then
-    if command -v etc-update &>/dev/null; then etc-update --automode -5 || true; fi
-    if command -v dispatch-conf &>/dev/null; then dispatch-conf --auto-merge || true; fi
+    command -v etc-update &>/dev/null && etc-update --automode -5 || true
+    command -v dispatch-conf &>/dev/null && dispatch-conf --auto-merge || true
     emerge -j"${EMERGE_JOBS}" --load-average="${EMERGE_LOAD}" "${EMERGE_BASE_OPTS[@]}" "$pkg" || return 1
     return 0
   fi
@@ -149,73 +137,156 @@ emerge_with_autounmask(){
   return 1
 }
 
-# === Prechecks ===
+# Prechecks
 if [[ "$(id -u)" -ne 0 ]]; then die "Run as root"; fi
-if ! command -v make &>/dev/null; then die "make not found. Please install build tools (user requested not to auto-install sys-devel/make)"; fi
+if ! command -v make &>/dev/null; then die "make not found. Please install build tools (script will not auto-install sys-devel/make)."; fi
 
 check_network(){
   log "Checking network..."
-  if ping -c1 -W2 gentoo.org &>/dev/null || ping -c1 -W2 8.8.8.8 &>/dev/null; then
-    log "Network OK"
-  else
-    warn "Network unreachable"
-    if [[ "$(confirm 'Continue without network? [y/N] ' 'n')" != "y" ]]; then die "Network required"; fi
+  if ping -c1 -W2 gentoo.org &>/dev/null || ping -c1 -W2 8.8.8.8 &>/dev/null; then log "Network OK"; else warn "Network unreachable"; if [[ "$(confirm 'Continue without network? [y/N] ' 'n')" != "y" ]]; then die "Network required"; fi; fi
+}
+
+# Auto-detect partitions and UUIDs
+detect_partitions(){
+  log "Detecting root and EFI partitions (blkid + findmnt + lsblk heuristics)..."
+
+  # try to get root device from findmnt
+  ROOT_DEV="$(findmnt -n -o SOURCE / 2>/dev/null || true)"
+  if [[ -n "$ROOT_DEV" && -b "$ROOT_DEV" ]]; then
+    ROOT_UUID="$(blkid -s UUID -o value "$ROOT_DEV" 2>/dev/null || true)"
+    ROOT_FSTYPE="$(blkid -s TYPE -o value "$ROOT_DEV" 2>/dev/null || true)"
+    log "Root device detected: $ROOT_DEV (UUID=${ROOT_UUID}, TYPE=${ROOT_FSTYPE})"
+  fi
+
+  # EFI: check mountpoints first
+  EFI_DEV="$(findmnt -n -o SOURCE /boot/efi 2>/dev/null || true)"
+  if [[ -n "$EFI_DEV" && -b "$EFI_DEV" ]]; then
+    EFI_UUID="$(blkid -s UUID -o value "$EFI_DEV" 2>/dev/null || true)"
+    EFI_FSTYPE="$(blkid -s TYPE -o value "$EFI_DEV" 2>/dev/null || true)"
+    log "EFI device detected: $EFI_DEV (UUID=${EFI_UUID}, TYPE=${EFI_FSTYPE})"
+  fi
+
+  # If not found, search blkid output: prefer vfat with EFIsize (<=1G) or PARTLABEL containing EFI
+  if [[ -z "${EFI_UUID:-}" ]]; then
+    while IFS= read -r line; do
+      dev=$(cut -d: -f1 <<< "$line")
+      ftype=$(blkid -s TYPE -o value "$dev" 2>/dev/null || true)
+      label=$(blkid -s PARTLABEL -o value "$dev" 2>/dev/null || true)
+      size_kb=$(blockdev --getsize64 "$dev" 2>/dev/null || true)
+      # treat small vfat or partlabel containing EFI as EFI partition
+      if [[ "$ftype" == "vfat" ]] || [[ "$label" =~ [Ee][Ff][Ii] ]]; then
+        EFI_UUID="$(blkid -s UUID -o value "$dev" 2>/dev/null || true)"
+        EFI_DEV="$dev"
+        EFI_FSTYPE="$ftype"
+        log "Selected EFI candidate: $EFI_DEV (UUID=${EFI_UUID}, TYPE=${EFI_FSTYPE}, PARTLABEL=${label})"
+        break
+      fi
+    done < <(blkid -o udev 2>/dev/null | grep -oP '/dev/\S+' | sort -u)
+  fi
+
+  # If root device not detected (unusual), try to find largest xfs/ext4 partition or mounted partition candidate
+  if [[ -z "${ROOT_UUID:-}" || -z "${ROOT_DEV:-}" ]]; then
+    log "Root device not found via findmnt; scanning for likely root (xfs/ext4)..."
+    candidate=""
+    while IFS= read -r line; do
+      dev=$(cut -d: -f1 <<< "$line")
+      ftype=$(blkid -s TYPE -o value "$dev" 2>/dev/null || true)
+      if [[ "$ftype" == "xfs" || "$ftype" == "ext4" || "$ftype" == "btrfs" ]]; then
+        # choose largest by size
+        size=$(blockdev --getsize64 "$dev" 2>/dev/null || echo 0)
+        if [[ -z "$candidate" ]]; then
+          candidate="$dev"
+          candidate_size="$size"
+        else
+          if (( size > candidate_size )); then candidate="$dev"; candidate_size="$size"; fi
+        fi
+      fi
+    done < <(blkid -o device 2>/dev/null)
+    if [[ -n "$candidate" ]]; then
+      ROOT_DEV="$candidate"
+      ROOT_UUID="$(blkid -s UUID -o value "$ROOT_DEV" 2>/dev/null || true)"
+      ROOT_FSTYPE="$(blkid -s TYPE -o value "$ROOT_DEV" 2>/dev/null || true)"
+      log "Selected root candidate: $ROOT_DEV (UUID=${ROOT_UUID}, TYPE=${ROOT_FSTYPE})"
+    fi
+  fi
+
+  # Final checks
+  if [[ -z "${ROOT_UUID:-}" || -z "${ROOT_DEV:-}" ]]; then
+    warn "Could not reliably detect root device/UUID. The script will try to continue but may fail."
+  fi
+  if [[ -z "${EFI_UUID:-}" || -z "${EFI_DEV:-}" ]]; then
+    warn "Could not reliably detect EFI device/UUID. The script will try to continue but UEFI steps may fail."
   fi
 }
 
-check_and_mount_boots(){
-  # Ensure /boot and /boot/efi entries exist in /etc/fstab; if not, add them using provided UUIDs.
-  log "Ensuring / and /boot/efi entries in /etc/fstab"
-  # Root (xfs)
-  if ! grep -q ' / ' /etc/fstab 2>/dev/null; then
-    log "/etc/fstab missing root entry; adding using ROOT_UUID"
+# Create mountpoints, update /etc/fstab and mount
+create_update_mount(){
+  log "Ensuring /boot and /boot/efi exist, updating /etc/fstab and mounting by UUID"
+
+  run_or_dry mkdir -p /boot /boot/efi
+
+  # Ensure root entry exists: check by matching UUID or mountpoint '/'
+  root_in_fstab=false
+  if grep -E '^[[:space:]]*UUID=' /etc/fstab >/dev/null 2>&1; then
+    if [[ -n "${ROOT_UUID:-}" ]] && grep -q "UUID=${ROOT_UUID}" /etc/fstab 2>/dev/null; then root_in_fstab=true; fi
+  fi
+  if ! $root_in_fstab; then
     if $DRY_RUN; then
-      log "DRY-RUN: echo 'UUID=${ROOT_UUID} / xfs defaults,noatime,logbufs=8,logbsize=256k 0 1' >> /etc/fstab"
+      log "DRY-RUN: append root UUID ${ROOT_UUID} to /etc/fstab"
     else
-      echo "UUID=${ROOT_UUID} / xfs defaults,noatime,logbufs=8,logbsize=256k 0 1" >> /etc/fstab
+      if [[ -n "${ROOT_UUID:-}" ]]; then
+        echo "UUID=${ROOT_UUID} / ${ROOT_FSTYPE:-xfs} defaults,noatime,logbufs=8,logbsize=256k 0 1" >> /etc/fstab
+        log "Added root entry to /etc/fstab"
+      else
+        warn "Root UUID unknown; skipping fstab root entry"
+      fi
     fi
+  else
+    log "Root entry already present in /etc/fstab"
   fi
 
-  # EFI mount (common path /boot/efi)
-  if ! grep -q '/boot/efi' /etc/fstab 2>/dev/null; then
-    log "/etc/fstab missing /boot/efi entry; adding using EFI_UUID"
-    if $DRY_RUN; then
-      log "DRY-RUN: echo 'UUID=${EFI_UUID} /boot/efi vfat umask=0077,noatime 0 2' >> /etc/fstab"
+  # Ensure /boot/efi entry exists
+  if [[ -n "${EFI_UUID:-}" ]]; then
+    if grep -q "UUID=${EFI_UUID}" /etc/fstab 2>/dev/null; then
+      log "EFI entry already present in /etc/fstab"
     else
-      echo "UUID=${EFI_UUID} /boot/efi vfat umask=0077,noatime 0 2" >> /etc/fstab
+      if $DRY_RUN; then
+        log "DRY-RUN: append EFI UUID ${EFI_UUID} to /etc/fstab"
+      else
+        echo "UUID=${EFI_UUID} /boot/efi vfat umask=0077,noatime 0 2" >> /etc/fstab
+        log "Added /boot/efi entry to /etc/fstab"
+      fi
     fi
+  else
+    warn "EFI UUID unknown; /etc/fstab will not be modified for EFI"
   fi
 
-  # Ensure /boot exists and mount it: if EFI uses /boot/efi, we still ensure /boot exists
-  if [[ ! -d /boot ]]; then
-    run_or_dry mkdir -p /boot
+  # ensure udev devices are present
+  command -v udevadm &>/dev/null && run_or_dry udevadm settle --timeout=10 || true
+
+  # try mount -a
+  if $DRY_RUN; then
+    log "DRY-RUN: mount -a"
+  else
+    run_or_dry mount -a || true
   fi
-  if ! mountpoint -q /boot; then
-    # Try mounting /boot (will mount /boot/efi when fstab has /boot/efi)
+
+  # If mounting still missing, mount by /dev/disk/by-uuid
+  if ! mountpoint -q /boot/efi 2>/dev/null && [[ -n "${EFI_UUID:-}" ]]; then
     if $DRY_RUN; then
-      log "DRY-RUN: mount -a"
+      log "DRY-RUN: mount -t vfat /dev/disk/by-uuid/${EFI_UUID} /boot/efi"
     else
-      run_or_dry mount -a || true
-      if ! mountpoint -q /boot; then
-        warn "/boot still not mounted after mount -a; attempt to mount /boot/efi specifically"
-        if $DRY_RUN; then
-          log "DRY-RUN: mount /boot/efi"
-        else
-          mount /boot/efi >/dev/null 2>&1 || warn "mount /boot/efi failed"
-        fi
+      if [[ -e "/dev/disk/by-uuid/${EFI_UUID}" ]]; then
+        mount -t vfat "/dev/disk/by-uuid/${EFI_UUID}" /boot/efi || warn "Mount by UUID for EFI failed"
+      else
+        warn "Device /dev/disk/by-uuid/${EFI_UUID} not found"
       fi
     fi
   fi
 
-  # Check /boot space
-  if mountpoint -q /boot; then
-    avail_kb=$(df --output=avail -k /boot | tail -n1)
-    if [[ -n "$avail_kb" && "$avail_kb" -lt $((50*1024)) ]]; then
-      warn "/boot available space <50MB ($avail_kb KB)"
-      if [[ "$(confirm 'Continue despite small /boot? [y/N] ' 'n')" != "y" ]]; then die "/boot too small"; fi
-    fi
-  else
-    warn "/boot not mounted - some operations (grub update) may fail"
+  # If /boot not mounted separately (some systems use root for /boot), warn
+  if ! mountpoint -q /boot 2>/dev/null; then
+    warn "/boot not a separate mountpoint (may be part of root). Some operations may require /boot mounted explicitly."
   fi
 }
 
@@ -228,21 +299,14 @@ validate_fstab(){
   fi
 }
 
-# === Kernel selection ===
+# Kernel selection
 select_kernel(){
   log "Scanning /usr/src for linux-* directories..."
   mapfile -t KLIST < <(find /usr/src -maxdepth 1 -type d -name 'linux-*' -printf '%f\n' 2>/dev/null | sort -V)
   if [[ ${#KLIST[@]} -eq 0 ]]; then die "No kernel sources found in /usr/src"; fi
   echo "Available kernels:"
-  for i in "${!KLIST[@]}"; do
-    printf " [%d] %s\n" $((i+1)) "${KLIST[$i]}"
-  done
-  if $AUTO_MODE; then
-    choice=1
-    log "AUTO_MODE: selecting ${KLIST[0]}"
-  else
-    read -r -p "Enter kernel number to use: " choice
-  fi
+  for i in "${!KLIST[@]}"; do printf " [%d] %s\n" $((i+1)) "${KLIST[$i]}"; done
+  if $AUTO_MODE; then choice=1; log "AUTO_MODE: selecting ${KLIST[0]}"; else read -r -p "Enter kernel number to use: " choice; fi
   if ! [[ "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#KLIST[@]} )); then die "Invalid selection"; fi
   TARGET_KERNEL="${KLIST[$((choice-1))]}"
   KERNEL_SRC="/usr/src/${TARGET_KERNEL}"
@@ -257,20 +321,15 @@ save_kernel_config(){
   fi
 }
 
-# === Force built-in ===
+# Force built-in kernel options
 make_all_built_in(){
   log "Forcing key kernel options to built-in (=y)"
   cfg="$KERNEL_SRC/.config"
   if [[ ! -f "$cfg" ]]; then
-    warn ".config not found; attempting to create from running kernel or defconfig"
-    if [[ -f /proc/config.gz ]]; then
-      zcat /proc/config.gz > "$cfg" || true
-    else
-      run_or_dry bash -c "cd $KERNEL_SRC && make defconfig"
-    fi
+    warn ".config not found; trying /proc/config.gz or defconfig"
+    if [[ -f /proc/config.gz ]]; then zcat /proc/config.gz > "$cfg" || true; else run_or_dry bash -c "cd $KERNEL_SRC && make defconfig"; fi
   fi
-  # backup
-  if [[ -f "$cfg" ]]; then cp -a "$cfg" "${cfg}.autobuilder.bak.$(date +%Y%m%d_%H%M%S)"; fi
+  [[ -f "$cfg" ]] && cp -a "$cfg" "${cfg}.autobuilder.bak.$(date +%Y%m%d_%H%M%S)"
 
   read -r -d '' BUILTIN_SYMBOLS <<'SYMS' || true
 DEVTMPFS
@@ -304,116 +363,46 @@ CPU_IDLE
 CPU_FREQ_GOV_ONDEMAND
 SYMS
 
-  # Use scripts/config if present
   if [[ -x "$KERNEL_SRC/scripts/config" ]]; then
     log "Using scripts/config to enable symbols"
-    while read -r sym; do
-      [[ -z "$sym" ]] && continue
-      run_or_dry bash -c "cd $KERNEL_SRC && ./scripts/config --enable $sym || true"
-    done <<< "$BUILTIN_SYMBOLS"
+    while read -r sym; do [[ -z "$sym" ]] && continue; run_or_dry bash -c "cd $KERNEL_SRC && ./scripts/config --enable $sym || true"; done <<< "$BUILTIN_SYMBOLS"
   else
     warn "scripts/config not available; will patch .config directly"
   fi
 
-  # replace CONFIG_FOO=m -> CONFIG_FOO=y
   if [[ -f "$cfg" ]]; then
-    if $DRY_RUN; then
-      log "DRY-RUN: would convert CONFIG_* = m to = y in $cfg"
-    else
-      sed -ri 's/^(CONFIG_[A-Za-z0-9_]+=)m$/\1y/' "$cfg" || true
-      while read -r sym; do
-        [[ -z "$sym" ]] && continue
-        if ! grep -q "^CONFIG_${sym}=" "$cfg"; then echo "CONFIG_${sym}=y" >> "$cfg"; else sed -i "s/^CONFIG_${sym}=.*/CONFIG_${sym}=y/" "$cfg"; fi
-      done <<< "$BUILTIN_SYMBOLS"
-    fi
+    if $DRY_RUN; then log "DRY-RUN: would convert CONFIG_* = m -> = y in $cfg"; else sed -ri 's/^(CONFIG_[A-Za-z0-9_]+=)m$/\1y/' "$cfg" || true; while read -r sym; do [[ -z "$sym" ]] && continue; if ! grep -q "^CONFIG_${sym}=" "$cfg"; then echo "CONFIG_${sym}=y" >> "$cfg"; else sed -i "s/^CONFIG_${sym}=.*/CONFIG_${sym}=y/" "$cfg"; fi; done <<< "$BUILTIN_SYMBOLS"; fi
   fi
 
   run_or_dry bash -c "cd $KERNEL_SRC && make olddefconfig"
   log "Built-in conversion applied"
 }
 
-# === Build kernel (no modules_install) ===
+# Build kernel (no modules_install)
 build_kernel(){
   log "Building kernel ${TARGET_KERNEL} with built-in drivers"
   if [[ ! -d "$KERNEL_SRC" ]]; then die "Kernel source $KERNEL_SRC missing"; fi
   save_kernel_config
   make_all_built_in
-  if $DRY_RUN; then
-    log "DRY-RUN: make -j${EMERGE_JOBS} in $KERNEL_SRC"
-  else
-    (cd "$KERNEL_SRC" && make -j"${EMERGE_JOBS}") 2>&1 | tee -a "$LOG"
-  fi
+  if $DRY_RUN; then log "DRY-RUN: make -j${EMERGE_JOBS} in $KERNEL_SRC"; else (cd "$KERNEL_SRC" && make -j"${EMERGE_JOBS}") 2>&1 | tee -a "$LOG"; fi
 
-  # copy kernel artifacts
-  if $DRY_RUN; then
-    log "DRY-RUN: copy bzImage to /boot/vmlinuz-${TARGET_KERNEL}"
-  else
-    cp -a "$KERNEL_SRC/arch/x86/boot/bzImage" "/boot/vmlinuz-${TARGET_KERNEL}"
-    cp -a "$KERNEL_SRC/System.map" "/boot/System.map-${TARGET_KERNEL}" 2>/dev/null || true
-    cp -a "$KERNEL_SRC/.config" "/boot/config-${TARGET_KERNEL}" 2>/dev/null || true
-    log "Kernel installed to /boot for ${TARGET_KERNEL}"
-  fi
+  if $DRY_RUN; then log "DRY-RUN: copy bzImage to /boot"; else cp -a "$KERNEL_SRC/arch/x86/boot/bzImage" "/boot/vmlinuz-${TARGET_KERNEL}"; cp -a "$KERNEL_SRC/System.map" "/boot/System.map-${TARGET_KERNEL}" 2>/dev/null || true; cp -a "$KERNEL_SRC/.config" "/boot/config-${TARGET_KERNEL}" 2>/dev/null || true; log "Kernel installed to /boot for ${TARGET_KERNEL}"; fi
 
-  # ensure genkernel
-  if ! command -v genkernel &>/dev/null; then
-    warn "genkernel not installed; attempting to install"
-    emerge_with_autounmask "sys-kernel/genkernel" || warn "Failed to install genkernel"
-  fi
-  if command -v genkernel &>/dev/null; then
-    run_or_dry genkernel --install --no-mrproper initramfs
-  else
-    warn "genkernel not available; initramfs not built"
-  fi
+  if ! command -v genkernel &>/dev/null; then warn "genkernel not installed; attempting to install"; emerge_with_autounmask "sys-kernel/genkernel" || warn "Failed to install genkernel"; fi
+  if command -v genkernel &>/dev/null; then run_or_dry genkernel --install --no-mrproper initramfs; else warn "genkernel not available; initramfs not built"; fi
 }
 
-# === GRUB/UEFI handling ===
-determine_grub_cfg(){
-  if [[ -d /boot/efi/EFI/gentoo ]]; then echo "/boot/efi/EFI/gentoo/grub.cfg"; else echo "/boot/grub/grub.cfg"; fi
-}
-update_grub(){
-  cfg="$(determine_grub_cfg)"
-  run_or_dry grub-mkconfig -o "$cfg"
-  if command -v efibootmgr &>/dev/null && ! $DRY_RUN; then
-    efipart=$(findmnt -n -o SOURCE /boot/efi 2>/dev/null || true)
-    if [[ -n "$efipart" ]]; then
-      efibootmgr -c -l '\EFI\gentoo\grubx64.efi' -L "Gentoo ${TARGET_KERNEL}" 2>/dev/null || warn "efibootmgr entry creation failed"
-    fi
-  fi
-}
+# GRUB/UEFI
+determine_grub_cfg(){ if [[ -d /boot/efi/EFI/gentoo ]]; then echo "/boot/efi/EFI/gentoo/grub.cfg"; else echo "/boot/grub/grub.cfg"; fi; }
+update_grub(){ cfg="$(determine_grub_cfg)"; run_or_dry grub-mkconfig -o "$cfg"; if command -v efibootmgr &>/dev/null && ! $DRY_RUN; then efipart=$(findmnt -n -o SOURCE /boot/efi 2>/dev/null || true); if [[ -n "$efipart" ]]; then efibootmgr -c -l '\EFI\gentoo\grubx64.efi' -L "Gentoo ${TARGET_KERNEL}" 2>/dev/null || warn "efibootmgr entry creation failed"; fi; fi; }
+set_grub_default(){ cfg="$(determine_grub_cfg)"; if $DRY_RUN; then log "DRY-RUN: set grub default for vmlinuz-${TARGET_KERNEL}"; return 0; fi; if [[ ! -f "$cfg" ]]; then warn "grub.cfg not found"; return 1; fi; if ! grep -q "vmlinuz-${TARGET_KERNEL}" "$cfg"; then warn "grub.cfg does not reference vmlinuz-${TARGET_KERNEL}"; return 1; fi; title=$(awk -v pat="vmlinuz-${TARGET_KERNEL}" '/^menuentry /{t=$0} $0 ~ pat {gsub(/^menuentry '\''/,"",t); gsub(/'\''.*/,"",t); print t; exit}' "$cfg" || true); if [[ -n "$title" ]]; then run_or_dry grub-set-default "$title" || warn "grub-set-default failed"; else warn "Could not determine menu title"; fi; }
 
-set_grub_default(){
-  cfg="$(determine_grub_cfg)"
-  if $DRY_RUN; then
-    log "DRY-RUN: set grub default for vmlinuz-${TARGET_KERNEL}"
-    return 0
-  fi
-  if [[ ! -f "$cfg" ]]; then warn "grub.cfg not found"; return 1; fi
-  if ! grep -q "vmlinuz-${TARGET_KERNEL}" "$cfg"; then warn "grub.cfg does not reference vmlinuz-${TARGET_KERNEL}"; return 1; fi
-  local title
-  title=$(awk -v pat="vmlinuz-${TARGET_KERNEL}" '
-    /^menuentry /{title_line=$0}
-    $0 ~ pat { gsub(/^menuentry '\''/,"",title_line); gsub(/'\''.*/,"",title_line); print title_line; exit }
-  ' "$cfg" || true)
-  if [[ -n "$title" ]]; then
-    run_or_dry grub-set-default "$title" || warn "grub-set-default failed"
-  else
-    warn "Could not determine menu title; leaving default"
-  fi
-}
-
-# === make.conf optimization ===
+# make.conf optimize
 optimize_makeconf(){
-  conf="/etc/portage/make.conf"
-  backup="/etc/portage/make.conf.autobuilder.bak"
-  [[ -f "$conf" ]] || touch "$conf"
-  [[ -f "$backup" ]] || cp -a "$conf" "$backup"
-  cores=$(get_cpu_cores)
-  makeopts="-j$((cores+1)) -l${cores}"
-  march="-march=bdver4"
-  if $DRY_RUN; then
-    log "DRY-RUN: would write optimized /etc/portage/make.conf"
-  else
-    cat > "$conf" <<EOF
+  conf="/etc/portage/make.conf"; bak="/etc/portage/make.conf.autobuilder.bak"
+  [[ -f "$conf" ]] || touch "$conf"; [[ -f "$bak" ]] || cp -a "$conf" "$bak"
+  cores=$(get_cpu_cores); makeopts="-j$((cores+1)) -l${cores}"; march="-march=bdver4"
+  if $DRY_RUN; then log "DRY-RUN: would write optimized /etc/portage/make.conf"; else cat > "$conf" <<EOF
 # Auto-generated make.conf
 COMMON_FLAGS="${march} -O2 -pipe -fomit-frame-pointer"
 CFLAGS="\${COMMON_FLAGS}"
@@ -433,17 +422,14 @@ DISTDIR="/var/cache/distfiles"
 PKGDIR="/var/cache/binpkgs"
 FILE_SYSTEMS="xfs ext4 tmpfs"
 EOF
-    log "/etc/portage/make.conf written (backup: $backup)"
+    log "/etc/portage/make.conf written (backup: $bak)"
   fi
 }
 
-# === HDD/XFS tuning ===
+# HDD/XFS tuning
 optimize_hdd_xfs(){
-  log "Applying HDD and XFS tuning"
-  if $DRY_RUN; then
-    log "DRY-RUN: write /etc/sysctl.d/99-gentoo-hdd.conf"
-  else
-    cat > /etc/sysctl.d/99-gentoo-hdd.conf <<EOF
+  log "Applying HDD/XFS tuning"
+  if $DRY_RUN; then log "DRY-RUN: write sysctl and udev rules"; else cat > /etc/sysctl.d/99-gentoo-hdd.conf <<EOF
 vm.swappiness=10
 vm.vfs_cache_pressure=50
 vm.dirty_ratio=10
@@ -454,45 +440,27 @@ EOF
     sysctl --system || true
   fi
 
-  # set scheduler per block device
   for dev in /sys/block/*; do
     [[ -e "$dev/queue/rotational" ]] || continue
     rot=$(cat "$dev/queue/rotational")
     bname=$(basename "$dev")
     if [[ "$rot" == "1" ]]; then
-      run_or_dry bash -c "echo bfq > /sys/block/$bname/queue/scheduler" || warn "Cannot set scheduler for $bname"
-      if $DRY_RUN; then
-        log "DRY-RUN: create /etc/udev/rules.d/60-io-$bname.rules"
-      else
-        echo 'ACTION=="add|change", KERNEL=="'"$bname"'", ATTR{queue/scheduler}="bfq"' > /etc/udev/rules.d/60-io-"$bname".rules
-      fi
+      run_or_dry bash -c "echo bfq > /sys/block/$bname/queue/scheduler" || true
+      if $DRY_RUN; then log "DRY-RUN: create udev rule for $bname"; else echo 'ACTION=="add|change", KERNEL=="'"$bname"'", ATTR{queue/scheduler}="bfq"' > /etc/udev/rules.d/60-io-"$bname".rules; fi
     else
       run_or_dry bash -c "echo mq-deadline > /sys/block/$bname/queue/scheduler" || true
     fi
   done
 
-  # XFS mount options in fstab
-  if grep -q 'xfs' /etc/fstab 2>/dev/null; then
-    run_or_dry sed -ri 's|(\b[xX][fF][sS]\b[^ ]* )defaults|\1defaults,noatime,logbufs=8,logbsize=256k|' /etc/fstab || true
-  fi
-
-  # tmpfs for portage and tmp
-  if ! grep -q '/var/tmp/portage' /etc/fstab 2>/dev/null; then
-    run_or_dry bash -c 'echo "tmpfs /var/tmp/portage tmpfs size=4G,noatime,nodev,nosuid,mode=1777 0 0" >> /etc/fstab'
-  fi
-  if ! grep -q '/tmp' /etc/fstab 2>/dev/null; then
-    run_or_dry bash -c 'echo "tmpfs /tmp tmpfs size=2G,noatime,nodev,nosuid,mode=1777 0 0" >> /etc/fstab'
-  fi
+  if grep -q 'xfs' /etc/fstab 2>/dev/null; then run_or_dry sed -ri 's|(\b[xX][fF][sS]\b[^ ]* )defaults|\1defaults,noatime,logbufs=8,logbsize=256k|' /etc/fstab || true; fi
+  if ! grep -q '/var/tmp/portage' /etc/fstab 2>/dev/null; then run_or_dry bash -c 'echo "tmpfs /var/tmp/portage tmpfs size=4G,noatime,nodev,nosuid,mode=1777 0 0" >> /etc/fstab'; fi
+  if ! grep -q '/tmp' /etc/fstab 2>/dev/null; then run_or_dry bash -c 'echo "tmpfs /tmp tmpfs size=2G,noatime,nodev,nosuid,mode=1777 0 0" >> /etc/fstab'; fi
 }
 
-# === Power scripts (local.d) ===
+# Power scripts
 install_power_scripts(){
   log "Installing power management script"
-  if $DRY_RUN; then
-    log "DRY-RUN: write /etc/local.d/power.start and rc-update add local"
-  else
-    mkdir -p /etc/local.d
-    cat > /etc/local.d/power.start <<'EOF'
+  if $DRY_RUN; then log "DRY-RUN: write /etc/local.d/power.start and rc-update add local"; else mkdir -p /etc/local.d; cat > /etc/local.d/power.start <<'EOF'
 #!/bin/sh
 # Local power tuning (OpenRC local service)
 for cpu in /sys/devices/system/cpu/cpu[0-9]*; do
@@ -515,16 +483,12 @@ EOF
   fi
 }
 
-# === XFCE/XORG installation & enable LightDM ===
+# XFCE/Xorg install
 install_xfce(){
   log "Installing XFCE and Xorg"
   packages=(x11-base/xorg-server x11-base/xorg-drivers x11-misc/lightdm x11-misc/lightdm-gtk-greeter xfce-base/xfce4-meta xfce-extra/xfce4-goodies media-libs/mesa x11-drivers/xf86-video-amdgpu app-admin/eselect-opengl app-misc/pciutils app-misc/usbutils)
   for p in "${packages[@]}"; do
-    if is_installed_pkg "$p"; then
-      log "$p already installed"
-    else
-      emerge_with_autounmask "$p" || warn "Failed to install $p"
-    fi
+    if is_installed_pkg "$p"; then log "$p already installed"; else emerge_with_autounmask "$p" || warn "Failed to install $p"; fi
   done
   run_or_dry rc-update add lightdm default || warn "rc-update add lightdm failed"
   run_or_dry mkdir -p /etc/lightdm/lightdm.conf.d
@@ -542,19 +506,15 @@ EOF
   log "XFCE and LightDM configured"
 }
 
-# === ccache/distcc optional ===
 install_ccache_distcc(){
   log "Installing ccache and distcc (optional)"
   emerge_with_autounmask "dev-util/ccache" || warn "ccache failed"
   emerge_with_autounmask "sys-devel/distcc" || warn "distcc failed"
-  if ! grep -q "ccache" /etc/portage/make.conf 2>/dev/null; then
-    run_or_dry bash -c 'echo "FEATURES=\"${FEATURES} ccache\"" >> /etc/portage/make.conf'
-  fi
+  if ! grep -q "ccache" /etc/portage/make.conf 2>/dev/null; then run_or_dry bash -c 'echo "FEATURES=\"${FEATURES} ccache\"" >> /etc/portage/make.conf'; fi
 }
 
-# === cleanup ===
 auto_cleanup(){
-  log "Running auto cleanup (eclean-kernel, eclean-dist, eclean-pkg)"
+  log "Running auto cleanup"
   run_or_dry eclean-kernel -n 2 || true
   run_or_dry eclean-dist --deep || true
   run_or_dry eclean-pkg --deep || true
@@ -563,31 +523,23 @@ auto_cleanup(){
   log "Cleanup done"
 }
 
-# === cron & parallel boot ===
 install_cron(){
   cronfile="/etc/cron.d/gentoo_autobuilder"
-  if $DRY_RUN; then
-    log "DRY-RUN: write $cronfile and enable parallel boot"
-  else
-    cat > "$cronfile" <<EOF
+  if $DRY_RUN; then log "DRY-RUN: write $cronfile and enable parallel boot"; else cat > "$cronfile" <<EOF
 # Weekly maintenance
-0 4 * * 1 root /usr/local/sbin/gentoo_autobuilder_pro_builtin_final.sh --auto >> /var/log/gentoo_autobuilder_cron.log 2>&1
+0 4 * * 1 root /usr/local/sbin/gentoo_autobuilder_auto_detect.sh --auto >> /var/log/gentoo_autobuilder_cron.log 2>&1
 EOF
     chmod 644 "$cronfile"
-    if grep -q '^rc_parallel=' /etc/rc.conf 2>/dev/null; then
-      sed -i 's/^rc_parallel=.*/rc_parallel="YES"/' /etc/rc.conf || true
-    else
-      echo 'rc_parallel="YES"' >> /etc/rc.conf
-    fi
-    log "Cron installed and parallel boot enabled"
-  fi
+    if grep -q '^rc_parallel=' /etc/rc.conf 2>/dev/null; then sed -i 's/^rc_parallel=.*/rc_parallel="YES"/' /etc/rc.conf || true; else echo 'rc_parallel="YES"' >> /etc/rc.conf; fi
+    log "Cron installed and parallel boot enabled"; fi
 }
 
-# === Main flow ===
+# Main flow
 main(){
-  log "Gentoo AutoBuilder Pro (built-in) start: $(date --iso-8601=seconds)"
+  log "Gentoo AutoBuilder Pro (auto-detect) start: $(date --iso-8601=seconds)"
   check_network
-  check_and_mount_boots
+  detect_partitions
+  create_update_mount
   validate_fstab
   make_backup
 
