@@ -130,7 +130,7 @@ echo "Checking and installing dependencies..."
 # Основные зависимости
 check_and_install_package "sys-kernel/gentoo-sources" "Kernel sources"
 check_and_install_package "sys-devel/gcc" "Compiler"
-check_and_install_package "sys-power/laptop-mode-tools" "Power management"
+check_and_install_package "app-laptop/laptop-mode-tools" "Power management"
 check_and_install_package "x11-base/xorg-drivers" "Graphics drivers"
 check_and_install_package "x11-base/xorg-server" "X server"
 check_and_install_package "media-libs/mesa" "OpenGL support"
