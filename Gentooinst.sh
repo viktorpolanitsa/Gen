@@ -4,18 +4,18 @@ set -e
 # Проверка root
 # -----------------------------
 if [[ $EUID -ne 0 ]]; then
-    echo "Run this script as root!"
+    echo "[ERROR] Run this script as root!"
     exit 1
 fi
 
 # -----------------------------
 # Проверка необходимых утилит
 # -----------------------------
-REQUIRED_UTILS=("equery" "grep" "awk" "sed" "ls" "cp" "mkdir" "rm" "ln" "make" "grub-mkconfig")
+REQUIRED_UTILS=("grep" "awk" "sed" "ls" "cp" "mkdir" "rm" "ln" "make" "grub-mkconfig" "equery")
 for util in "${REQUIRED_UTILS[@]}"; do
     if ! command -v "$util" &>/dev/null; then
         echo "[ERROR] Required utility '$util' not found!"
-        echo "Please install it first: emerge --ask sys-apps/${util}"
+        echo "Please install it first: emerge --ask sys-apps/$(echo $util | sed 's/-/_/g')"
         exit 1
     fi
 done
@@ -46,7 +46,7 @@ if [[ ! -d /usr/src ]]; then
 fi
 
 # Используем find для более надежного поиска
-mapfile -t KERNELS < <(find /usr/src -maxdepth 1 -type d -name "linux-*" -exec basename {} \;)
+mapfile -t KERNELS < <(find /usr/src -maxdepth 1 -type d -name "linux-*" -exec basename {} \; 2>/dev/null)
 if [[ ${#KERNELS[@]} -eq 0 ]]; then
     echo "[ERROR] No kernel sources found in /usr/src!"
     echo "You may need to install kernel sources first:"
@@ -126,6 +126,8 @@ check_and_install_package() {
 }
 
 echo "Checking and installing dependencies..."
+
+# Основные зависимости
 check_and_install_package "sys-kernel/gentoo-sources" "Kernel sources"
 check_and_install_package "sys-devel/make" "Build system"
 check_and_install_package "sys-devel/gcc" "Compiler"
@@ -135,6 +137,7 @@ check_and_install_package "x11-base/xorg-server" "X server"
 check_and_install_package "media-libs/mesa" "OpenGL support"
 check_and_install_package "app-admin/eselect" "Configuration tool"
 
+# Зависимости XFCE
 if [[ "$INSTALL_XFCE" == "y" ]]; then
     check_and_install_package "xfce-base/xfce4-meta" "XFCE desktop environment"
     check_and_install_package "xfce-extra/xfce4-goodies" "XFCE additional apps"
@@ -154,12 +157,18 @@ if [[ "$BACKUP_CHOICE" == "y" ]]; then
     BACKUP_DIR="/boot/backup_kernel_$(date +%F_%H-%M-%S)"
     mkdir -p "$BACKUP_DIR"
     
+    echo "[INFO] Creating backup in $BACKUP_DIR..."
+    
     if ls /boot/vmlinuz-* &>/dev/null; then
         cp /boot/vmlinuz-* "$BACKUP_DIR/" 2>/dev/null || echo "[WARNING] Some vmlinuz files could not be backed up"
+    else
+        echo "[INFO] No vmlinuz files found in /boot"
     fi
     
     if ls /boot/initramfs-* &>/dev/null; then
         cp /boot/initramfs-* "$BACKUP_DIR/" 2>/dev/null || echo "[WARNING] Some initramfs files could not be backed up"
+    else
+        echo "[INFO] No initramfs files found in /boot"
     fi
     
     echo "[INFO] Backup saved in $BACKUP_DIR"
@@ -174,6 +183,7 @@ if [[ -L linux || -e linux ]]; then
     rm -f linux
 fi
 ln -sf "$(basename "$KERNEL_SRC")" linux
+echo "[INFO] Created symlink: linux -> $(basename "$KERNEL_SRC")"
 cd linux || exit 1
 
 # -----------------------------
@@ -286,6 +296,65 @@ if [[ "$INSTALL_XFCE" == "y" ]]; then
     done
     
     echo "[INFO] Configuring LightDM..."
+    if ! rc-update show default | grep -q lightdm; then
+        rc-update add lightdm default
+        check_status "LightDM service activation"
+    fi
+    
+    mkdir -p /etc/lightdm/lightdm.conf.d
+    echo '[LightDM]' > /etc/lightdm/lightdm.conf.d/timeout.conf
+    echo 'minimum-display-server-timeout=10' >> /etc/lightdm/lightdm.conf.d/timeout.conf
+    
+    echo "[INFO] Setting XFCE as default session..."
+    echo "exec startxfce4" > /etc/lightdm/Xsession
+    chmod +x /etc/lightdm/Xsession
+fi
+
+# -----------------------------
+# Шаг 8: Оптимизация энергопотребления
+# -----------------------------
+if [[ "$HDD_OPT" == "y" ]]; then
+    echo "[INFO] Configuring power management optimizations..."
+    
+    if ! rc-update show default | grep -q laptop-mode; then
+        rc-update add laptop-mode default
+        echo "[INFO] Added laptop-mode to default runlevel"
+    fi
+    
+    if ! rc-update show default | grep -q cpufreq; then
+        rc-update add cpufreq default
+        echo "[INFO] Added cpufreq to default runlevel"
+    fi
+    
+    # Проверяем, нет ли уже таких строк в sysctl.conf
+    if ! grep -q "vm.swappiness=10" /etc/sysctl.conf; then
+        echo "vm.swappiness=10" >> /etc/sysctl.conf
+        echo "[INFO] Added vm.swappiness=10 to sysctl.conf"
+    fi
+    
+    if ! grep -q "vm.vfs_cache_pressure=50" /etc/sysctl.conf; then
+        echo "vm.vfs_cache_pressure=50" >> /etc/sysctl.conf
+        echo "[INFO] Added vm.vfs_cache_pressure=50 to sysctl.conf"
+    fi
+    
+    sysctl -p &>/dev/null
+    echo "[INFO] Applied sysctl settings"
+fi
+
+# -----------------------------
+# Завершение
+# -----------------------------
+echo "=============================================="
+echo "All steps completed successfully!"
+echo "Logs:"
+echo "- Kernel build: $KERNEL_LOG"
+echo "- XFCE installation: $XFCE_LOG"
+echo ""
+echo "Next steps:"
+echo "1. Reboot your system: reboot"
+echo "2. After reboot, login and start XFCE with: startx (if LightDM doesn't start automatically)"
+echo "3. Configure your system further as needed"
+echo "=============================================="FO] Configuring LightDM..."
     if ! rc-update show default | grep -q lightdm; then
         rc-update add lightdm default
         check_status "LightDM service activation"
