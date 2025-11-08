@@ -129,7 +129,6 @@ echo "Checking and installing dependencies..."
 
 # Основные зависимости
 check_and_install_package "sys-kernel/gentoo-sources" "Kernel sources"
-check_and_install_package "sys-devel/make" "Build system"
 check_and_install_package "sys-devel/gcc" "Compiler"
 check_and_install_package "sys-power/laptop-mode-tools" "Power management"
 check_and_install_package "x11-base/xorg-drivers" "Graphics drivers"
