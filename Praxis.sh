@@ -2,7 +2,7 @@
 # shellcheck disable=SC1091,SC2016
 
 # The Ultimate Gentoo Autobuilder & Deployer
-# Version: 35.4 "Bulldozer v4"
+# Version: 1.0"
 #
 # This version corrects the -march flag for AMD A-Series APUs to 'bdver4',
 # which is compatible with modern GCC versions.
