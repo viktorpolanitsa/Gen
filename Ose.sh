@@ -2,13 +2,13 @@
 # shellcheck disable=SC1091,SC2016
 
 # The Ultimate Gentoo Autobuilder & Deployer
-# Version: 23.0 "Genesis"
+# Version: 28.0 "Titan"
 #
-# This is the final creation, delivered via heredoc to ensure absolute integrity.
-# It employs the most aggressive "Absolute Zero" pre-format protocol, designed to
-# defeat the most hostile automounting environments by repeatedly stopping all
-# block device subsystems and wiping signatures immediately before formatting.
-# There are no more fallback positions. This is the beginning.
+# This version represents the perfect synthesis of automation and user control.
+# It retains the full power and resilience of the Monolith/Genesis versions,
+# including the aggressive disk cleaning and network retries, but restores
+# the interactive user and password creation phase at the end of the process.
+# It is the ultimate tool for the creator who commands the machine.
 
 set -euo pipefail
 
@@ -55,7 +55,7 @@ pre_flight_checks() {
 # ==============================================================================
 dependency_check() {
     step_log "Verifying LiveCD Dependencies"
-    local missing_deps=(); local deps=(curl wget sgdisk partprobe mkfs.vfat mkfs.xfs blkid lsblk sha512sum chroot wipefs vgchange dmraid mdadm blockdev)
+    local missing_deps=(); local deps=(curl wget sgdisk partprobe mkfs.vfat mkfs.xfs blkid lsblk sha512sum chroot wipefs blockdev)
     for cmd in "${deps[@]}"; do if ! command -v "$cmd" &>/dev/null; then missing_deps+=("$cmd"); fi; done
     if (( ${#missing_deps[@]} > 0 )); then die "Required commands not found: ${missing_deps[*]}"; fi
     log "All dependencies are satisfied."
@@ -67,10 +67,10 @@ dependency_check() {
 interactive_setup() {
     step_log "Interactive Setup Wizard"; warn "This script will perform a DESTRUCTIVE installation of Gentoo Linux."; log "Available block devices:"; lsblk -d -o NAME,SIZE,TYPE
     while true; do read -r -p "Enter the target device for installation (e.g., /dev/sda): " TARGET_DEVICE; if [[ -b "$TARGET_DEVICE" ]]; then local disk_size_gb; disk_size_gb=$(lsblk -b -d -n -o SIZE "${TARGET_DEVICE}" | awk '{print int($1/1024/1024/1024)}'); if (( disk_size_gb < 30 )); then err "Target device is only ${disk_size_gb}GB. A minimum of 30GB is recommended."; if ! ask_confirm "Continue anyway?"; then die "Installation cancelled."; fi; fi; break; else err "Device '$TARGET_DEVICE' does not exist."; fi; done
-    read -r -p "Enter timezone [Default: Europe/Moscow]: " SYSTEM_TIMEZONE; [[ -z "$SYSTEM_TIMEZONE" ]] && SYSTEM_TIMEZONE="Europe/Moscow"
+    read -r -p "Enter timezone [Default: UTC]: " SYSTEM_TIMEZONE; [[ -z "$SYSTEM_TIMEZONE" ]] && SYSTEM_TIMEZONE="UTC"
     read -r -p "Enter locale [Default: en_US.UTF-8]: " SYSTEM_LOCALE; [[ -z "$SYSTEM_LOCALE" ]] && SYSTEM_LOCALE="en_US.UTF-8"
     read -r -p "Enter CPU architecture (-march) [Default: native]: " CPU_MARCH; [[ -z "$CPU_MARCH" ]] && CPU_MARCH="native"
-    read -r -p "Enter hostname [Default: gentoo-xfce]: " SYSTEM_HOSTNAME; [[ -z "$SYSTEM_HOSTNAME" ]] && SYSTEM_HOSTNAME="gentoo-xfce"
+    read -r -p "Enter hostname [Default: gentoo-desktop]: " SYSTEM_HOSTNAME; [[ -z "$SYSTEM_HOSTNAME" ]] && SYSTEM_HOSTNAME="gentoo-desktop"
     SYSTEM_HOSTNAME=$(echo "$SYSTEM_HOSTNAME" | sed -e 's/[^a-zA-Z0-9-]//g'); log "Using sanitized hostname: ${SYSTEM_HOSTNAME}"
     local detected_cores; detected_cores=$(nproc --all 2>/dev/null || echo 2); local default_makeopts="-j${detected_cores} -l${detected_cores}"; read -r -p "Enter MAKEOPTS [Default: ${default_makeopts}]: " MAKEOPTS; [[ -z "$MAKEOPTS" ]] && MAKEOPTS="$default_makeopts"
     log "--- Configuration Summary ---"; log "  Target Device:   ${TARGET_DEVICE}, Boot Mode: ${BOOT_MODE}"; log "  Hostname:        ${SYSTEM_HOSTNAME}, MAKEOPTS: ${MAKEOPTS}"; if ! ask_confirm "Proceed with this configuration?"; then die "Installation cancelled."; fi
@@ -82,32 +82,18 @@ interactive_setup() {
 # ==============================================================================
 stage0_partition_and_format() {
     step_log "Disk Partitioning and Formatting (Mode: ${BOOT_MODE})"; warn "Final confirmation. ALL DATA ON ${TARGET_DEVICE} WILL BE PERMANENTLY DESTROYED!"; read -r -p "To confirm, type the full device name ('${TARGET_DEVICE}'): " confirmation; if [[ "$confirmation" != "${TARGET_DEVICE}" ]]; then die "Confirmation failed. Aborting."; fi
-    
-    log "Initiating 'Absolute Zero' protocol to free the device..."
-    umount "${TARGET_DEVICE}"* >/dev/null 2>&1 || true
-    mdadm --stop --scan >/dev/null 2>&1 || true
-    dmraid -an >/dev/null 2>&1 || true
-    vgchange -an >/dev/null 2>&1 || true
-    sync; blockdev --flushbufs "${TARGET_DEVICE}" >/dev/null 2>&1 || true
-    log "Device locks released."
-
+    log "Initiating 'Absolute Zero' protocol to free the device..."; umount "${TARGET_DEVICE}"* >/dev/null 2>&1 || true
+    if command -v mdadm &>/dev/null; then mdadm --stop --scan >/dev/null 2>&1 || true; fi
+    if command -v dmraid &>/dev/null; then dmraid -an >/dev/null 2>&1 || true; fi
+    if command -v vgchange &>/dev/null; then vgchange -an >/dev/null 2>&1 || true; fi
+    sync; blockdev --flushbufs "${TARGET_DEVICE}" >/dev/null 2>&1 || true; log "Device locks released."
     log "Wiping partition table on ${TARGET_DEVICE}..."; sgdisk --zap-all "${TARGET_DEVICE}"; sync
     if [[ "$BOOT_MODE" == "UEFI" ]]; then log "Creating GPT partitions for UEFI..."; sgdisk -n 1:0:+512M -t 1:ef00 -c 1:"EFI System" "${TARGET_DEVICE}"; sgdisk -n 2:0:0 -t 2:8300 -c 2:"Gentoo Root" "${TARGET_DEVICE}"; else log "Creating GPT partitions for Legacy BIOS..."; sgdisk -n 1:0:+2M -t 1:ef02 -c 1:"BIOS Boot" "${TARGET_DEVICE}"; sgdisk -n 2:0:0 -t 2:8300 -c 2:"Gentoo Root" "${TARGET_DEVICE}"; fi
-    sync; partprobe "${TARGET_DEVICE}"
-    
-    local P_SEPARATOR=""; if [[ "${TARGET_DEVICE}" == *nvme* || "${TARGET_DEVICE}" == *mmcblk* ]]; then P_SEPARATOR="p"; fi
+    sync; partprobe "${TARGET_DEVICE}"; local P_SEPARATOR=""; if [[ "${TARGET_DEVICE}" == *nvme* || "${TARGET_DEVICE}" == *mmcblk* ]]; then P_SEPARATOR="p"; fi
     if [[ "$BOOT_MODE" == "UEFI" ]]; then EFI_PART="${TARGET_DEVICE}${P_SEPARATOR}1"; ROOT_PART="${TARGET_DEVICE}${P_SEPARATOR}2"; else ROOT_PART="${TARGET_DEVICE}${P_SEPARATOR}2"; fi
-    
     log "Probing for root partition ${ROOT_PART}..."; local wait_time=20; while (( wait_time > 0 )); do if [[ -b "${ROOT_PART}" ]]; then log "Root partition found."; break; fi; sleep 1; partprobe "${TARGET_DEVICE}"; wait_time=$((wait_time - 1)); done; if (( wait_time == 0 )); then die "Timed out waiting for root partition."; fi
-    
-    log "Formatting partitions...";
-    if [[ "$BOOT_MODE" == "UEFI" ]]; then
-        log "Final cleaning of EFI partition..."; umount "${EFI_PART}" >/dev/null 2>&1 || true; wipefs -a "${EFI_PART}"; sync
-        mkfs.vfat -F 32 "${EFI_PART}"
-    fi
-    log "Final cleaning of Root partition..."; umount "${ROOT_PART}" >/dev/null 2>&1 || true; wipefs -a "${ROOT_PART}"; sync
-    mkfs.xfs -f "${ROOT_PART}"; sync
-    
+    log "Formatting partitions..."; if [[ "$BOOT_MODE" == "UEFI" ]]; then log "Final cleaning of EFI partition..."; umount "${EFI_PART}" >/dev/null 2>&1 || true; wipefs -a "${EFI_PART}"; sync; mkfs.vfat -F 32 "${EFI_PART}"; fi
+    log "Final cleaning of Root partition..."; umount "${ROOT_PART}" >/dev/null 2>&1 || true; wipefs -a "${ROOT_PART}"; sync; mkfs.xfs -f "${ROOT_PART}"; sync
     log "Mounting partitions..."; mkdir -p "${GENTOO_MNT}"; mount "${ROOT_PART}" "${GENTOO_MNT}"; if [[ "$BOOT_MODE" == "UEFI" ]]; then mkdir -p "${GENTOO_MNT}/boot/efi"; mount "${EFI_PART}" "${GENTOO_MNT}/boot/efi"; fi
 }
 
@@ -131,7 +117,7 @@ stage2_prepare_chroot() {
     log "Writing make.conf..."; local grub_platforms="pc"; if [[ "$BOOT_MODE" == "UEFI" ]]; then grub_platforms="efi-64"; fi
     # shellcheck disable=SC2154
     cat > "${GENTOO_MNT}/etc/portage/make.conf" <<EOF
-# --- Generated by Genesis Autobuilder ---
+# --- Generated by Titan Autobuilder ---
 COMMON_FLAGS="-O2 -pipe -march=${CPU_MARCH}"; CFLAGS="\${COMMON_FLAGS}"; CXXFLAGS="\${COMMON_FLAGS}"; MAKEOPTS="${MAKEOPTS}"
 EMERGE_DEFAULT_OPTS="--jobs=${EMERGE_JOBS} --load-average=${EMERGE_JOBS} --quiet-build=y --autounmask-write=y --with-bdeps=y"
 VIDEO_CARDS="amdgpu radeonsi"; INPUT_DEVICES="libinput synaptics"
@@ -154,12 +140,13 @@ EOF
 # --- STAGES 3 through 7 ---
 # ==============================================================================
 stage3_configure_in_chroot() {
-    step_log "System Configuration (Inside Chroot)"; source /etc/profile; export PS1="(chroot) ${PS1:-}"; log "Syncing Portage tree..."; emerge-webrsync || die "Failed to sync portage tree."; emerge --sync; log "Optimizing mirrors..."; emerge --verbose app-portage/mirrorselect; cp /etc/portage/make.conf /etc/portage/make.conf.bak; sed -i '/^GENTOO_MIRRORS/d' /etc/portage/make.conf; mirrorselect -s4 -b10 -o -D >> /etc/portage/make.conf; log "Fastest mirrors selected."
+    step_log "System Configuration (Inside Chroot)"; source /etc/profile; export PS1="(chroot) ${PS1:-}"; log "Syncing Portage tree..."; emerge-webrsync || die "Failed to sync portage tree."; emerge --sync
     log "Selecting latest desktop/openrc profile..."; local latest_profile; latest_profile=$(eselect profile list | grep 'desktop/openrc' | grep -v 'systemd' | tail -n 1 | awk '{print $1}' | tr -d '[]*'); if [[ -z "$latest_profile" ]]; then die "Could not determine a suitable profile."; fi; log "Setting profile to: ${latest_profile}"; eselect profile set "${latest_profile}"
     log "Configuring timezone and locale..."; ln -sf "/usr/share/zoneinfo/${SYSTEM_TIMEZONE}" /etc/localtime; echo "${SYSTEM_LOCALE} UTF-8" > /etc/locale.gen; echo "en_US.UTF-8 UTF-8" >> /etc/locale.gen; locale-gen; eselect locale set "${SYSTEM_LOCALE}"; env-update && source /etc/profile; log "Setting hostname..."; echo "hostname=\"${SYSTEM_HOSTNAME}\"" > /etc/conf.d/hostname
 }
 stage4_build_world_and_kernel() {
     step_log "Updating @world set (3-stage process)"; log "[1/3] Generating config updates..."; emerge -v --update --deep --newuse @world --autounmask-write || true; log "[2/3] Applying config updates..."; etc-update --automode -9; log "[3/3] Building world..."; emerge -v --update --deep --newuse @world
+    log "Optimizing mirrors..."; emerge --verbose app-portage/mirrorselect; cp /etc/portage/make.conf /etc/portage/make.conf.bak; sed -i '/^GENTOO_MIRRORS/d' /etc/portage/make.conf; mirrorselect -s4 -b10 -o -D >> /etc/portage/make.conf; log "Fastest mirrors selected."
     log "Installing firmware and kernel..."; emerge -v sys-kernel/linux-firmware sys-kernel/gentoo-sources; log "Building kernel with genkernel"; emerge -v sys-kernel/genkernel; genkernel all
 }
 stage5_install_bootloader() {
@@ -170,8 +157,10 @@ stage6_install_desktop() {
 }
 stage7_finalize() {
     step_log "Finalizing System"; log "Enabling core services (OpenRC)..."; rc-update add dbus default; rc-update add elogind default; rc-update add display-manager default; rc-update add dhcpcd default; log "Configuring sudo for 'wheel' group..."; echo '%wheel ALL=(ALL:ALL) ALL' > /etc/sudoers.d/wheel
-    log "Set a password for the 'root' user:"; passwd root; log "Creating a new user..."; local new_user=""; while true; do read -r -p "Enter a username: " new_user; if [[ "$new_user" =~ ^[a-z_][a-z0-9_-]*[$]?$ ]]; then break; else err "Invalid username."; new_user=""; fi; done
-    useradd -m -G wheel,users,audio,video,usb -s /bin/bash "$new_user"; log "Set a password for user '$new_user':"; passwd "$new_user"; log "User '$new_user' created."; log "Installation complete."; log "Finalizing disk writes..."; sync; log "Run: exit -> umount -R ${GENTOO_MNT} -> reboot"
+    log "Set a password for the 'root' user:"; passwd root
+    log "Creating a new user..."; local new_user=""; while true; do read -r -p "Enter a username: " new_user; if [[ "$new_user" =~ ^[a-z_][a-z0-9_-]*[$]?$ ]]; then break; else err "Invalid username."; new_user=""; fi; done
+    useradd -m -G wheel,users,audio,video,usb -s /bin/bash "$new_user"; log "Set a password for user '$new_user':"; passwd "$new_user"; log "User '$new_user' created."
+    log "Installation complete."; log "Finalizing disk writes..."; sync; log "Run: exit -> umount -R ${GENTOO_MNT} -> reboot"
 }
 
 # ==============================================================================
