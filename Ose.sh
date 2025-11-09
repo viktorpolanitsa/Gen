@@ -2,10 +2,10 @@
 # shellcheck disable=SC1091,SC2016
 
 # The Ultimate Gentoo Autobuilder & Deployer
-# Version: 35.3 "Excavator"
+# Version: 35.4 "Bulldozer v4"
 #
-# This version is specifically optimized for AMD A-Series APUs (A10-9600P).
-# It sets the correct CPU architecture and enables hardware video acceleration.
+# This version corrects the -march flag for AMD A-Series APUs to 'bdver4',
+# which is compatible with modern GCC versions.
 # Checksum verification is skipped by default.
 
 set -euo pipefail
@@ -68,13 +68,12 @@ interactive_setup() {
     read -r -p "Enter timezone [Default: UTC]: " SYSTEM_TIMEZONE; [[ -z "$SYSTEM_TIMEZONE" ]] && SYSTEM_TIMEZONE="UTC"
     read -r -p "Enter locale [Default: en_US.UTF-8]: " SYSTEM_LOCALE; [[ -z "$SYSTEM_LOCALE" ]] && SYSTEM_LOCALE="en_US.UTF-8"
     read -r -p "Enter LINGUAS (space separated) [Default: en ru]: " SYSTEM_LINGUAS; [[ -z "$SYSTEM_LINGUAS" ]] && SYSTEM_LINGUAS="en ru"
-    ### ОПТИМИЗИРОВАНО ### Установлен правильный -march по умолчанию для A10-9600P
-    read -r -p "Enter CPU architecture (-march) [Default: excavator]: " CPU_MARCH; [[ -z "$CPU_MARCH" ]] && CPU_MARCH="excavator"
+    ### ИСПРАВЛЕНО ### Установлен правильный -march 'bdver4' для A10-9600P
+    read -r -p "Enter CPU architecture (-march) [Default: bdver4]: " CPU_MARCH; [[ -z "$CPU_MARCH" ]] && CPU_MARCH="bdver4"
     CPU_MARCH=$(echo "$CPU_MARCH" | sed -e 's/[^a-zA-Z0-9_.-]//g')
     log "Using sanitized CPU architecture: ${CPU_MARCH}"
     read -r -p "Enter hostname [Default: gentoo-desktop]: " SYSTEM_HOSTNAME; [[ -z "$SYSTEM_HOSTNAME" ]] && SYSTEM_HOSTNAME="gentoo-desktop"
     SYSTEM_HOSTNAME=$(echo "$SYSTEM_HOSTNAME" | sed -e 's/[^a-zA-Z0-9-]//g'); log "Using sanitized hostname: ${SYSTEM_HOSTNAME}"
-    ### ОПТИМИЗИРОВАНО ### Установлено оптимальное значение MAKEOPTS для 4-ядерного процессора
     local detected_cores; detected_cores=$(nproc --all 2>/dev/null || echo 4); local default_makeopts="-j${detected_cores} -l${detected_cores}"; read -r -p "Enter MAKEOPTS (For 4 cores, -j4 or -j5 is good) [Default: ${default_makeopts}]: " MAKEOPTS; [[ -z "$MAKEOPTS" ]] && MAKEOPTS="$default_makeopts"
     log "--- Configuration Summary ---"; log "  Target Device:   ${TARGET_DEVICE}, Boot Mode: ${BOOT_MODE}"; log "  Hostname:        ${SYSTEM_HOSTNAME}, MAKEOPTS: ${MAKEOPTS}"; if ! ask_confirm "Proceed with this configuration?"; then die "Installation cancelled."; fi
     { echo "TARGET_DEVICE='${TARGET_DEVICE}'"; echo "SYSTEM_HOSTNAME='${SYSTEM_HOSTNAME}'"; echo "SYSTEM_TIMEZONE='${SYSTEM_TIMEZONE}'"; echo "SYSTEM_LOCALE='${SYSTEM_LOCALE}'"; echo "SYSTEM_LINGUAS='${SYSTEM_LINGUAS}'"; echo "CPU_MARCH='${CPU_MARCH}'"; echo "MAKEOPTS='${MAKEOPTS}'"; echo "EMERGE_JOBS='${detected_cores}'"; } > "$CONFIG_FILE_TMP"
@@ -122,10 +121,8 @@ CFLAGS="\${COMMON_FLAGS}"
 CXXFLAGS="\${COMMON_FLAGS}"
 MAKEOPTS="${MAKEOPTS}"
 EMERGE_DEFAULT_OPTS="--jobs=${EMERGE_JOBS} --load-average=${EMERGE_JOBS} --quiet-build=y --autounmask-write=y --with-bdeps=y"
-### ОПТИМИЗИРОВАНО ### Правильные драйверы для Radeon R5
 VIDEO_CARDS="amdgpu radeonsi"
 INPUT_DEVICES="libinput synaptics"
-### ОПТИМИЗИРОВАНО ### Добавлены флаги для аппаратного ускорения видео и Vulkan
 USE="X elogind dbus policykit gtk udev udisks pulseaudio vaapi vdpau vulkan -gnome -kde -qt5 -systemd"
 ACCEPT_LICENSE="@FREE linux-firmware"
 GRUB_PLATFORMS="${grub_platforms}"
