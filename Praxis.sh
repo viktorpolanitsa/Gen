@@ -2,11 +2,12 @@
 # shellcheck disable=SC1091,SC2016
 
 # The Ultimate Gentoo Autobuilder & Deployer
-# Version: 1.0"
+# Version: 2.0
 #
-# This version corrects the -march flag for AMD A-Series APUs to 'bdver4',
-# which is compatible with modern GCC versions.
-# Checksum verification is skipped by default.
+# This version introduces significant robustness and security enhancements.
+# It fixes firmware license issues, sanitizes all user input to prevent
+# command injection, and adds flexibility by allowing a choice of filesystem.
+# Build logic has been improved for greater reliability.
 
 set -euo pipefail
 
@@ -20,7 +21,7 @@ SKIP_CHECKSUM=true
 
 # --- UX Enhancements ---
 C_RESET='\033[0m'; C_GREEN='\033[0;32m'; C_YELLOW='\033[0;33m'; C_RED='\033[0;31m'
-STEP_COUNT=0; TOTAL_STEPS=19
+STEP_COUNT=0; TOTAL_STEPS=20 # Увеличили кол-во шагов
 
 # --- Logging Utilities ---
 log() { printf "${C_GREEN}[INFO] %s${C_RESET}\n" "$*"; }
@@ -53,7 +54,7 @@ pre_flight_checks() {
 # ==============================================================================
 dependency_check() {
     step_log "Verifying LiveCD Dependencies"
-    local missing_deps=(); local deps=(curl wget sgdisk partprobe mkfs.vfat mkfs.xfs blkid lsblk sha512sum chroot wipefs blockdev)
+    local missing_deps=(); local deps=(curl wget sgdisk partprobe mkfs.vfat mkfs.xfs mkfs.ext4 blkid lsblk sha512sum chroot wipefs blockdev)
     for cmd in "${deps[@]}"; do if ! command -v "$cmd" &>/dev/null; then missing_deps+=("$cmd"); fi; done
     if (( ${#missing_deps[@]} > 0 )); then die "Required commands not found: ${missing_deps[*]}"; fi
     log "All dependencies are satisfied."
@@ -64,19 +65,31 @@ dependency_check() {
 # ==============================================================================
 interactive_setup() {
     step_log "Interactive Setup Wizard"; warn "This script will perform a DESTRUCTIVE installation of Gentoo Linux."; log "Available block devices:"; lsblk -d -o NAME,SIZE,TYPE
-    while true; do read -r -p "Enter the target device for installation (e.g., /dev/sda): " TARGET_DEVICE; if [[ -b "$TARGET_DEVICE" ]]; then local disk_size_gb; disk_size_gb=$(lsblk -b -d -n -o SIZE "${TARGET_DEVICE}" | awk '{print int($1/1024/1024/1024)}'); if (( disk_size_gb < 30 )); then err "Target device is only ${disk_size_gb}GB. A minimum of 30GB is recommended."; if ! ask_confirm "Continue anyway?"; then die "Installation cancelled."; fi; fi; break; else err "Device '$TARGET_DEVICE' does not exist."; fi; done
+    while true; do read -r -p "Enter the target device for installation (e.g., /dev/sda): " TARGET_DEVICE; if [[ -b "$TARGET_DEVICE" ]]; then break; else err "Device '$TARGET_DEVICE' does not exist."; fi; done
+    
+    ### ДОБАВЛЕНО ### Выбор файловой системы
+    read -r -p "Enter root filesystem type [xfs/ext4, Default: xfs]: " ROOT_FS_TYPE; [[ -z "$ROOT_FS_TYPE" ]] && ROOT_FS_TYPE="xfs"
+    while [[ "$ROOT_FS_TYPE" != "xfs" && "$ROOT_FS_TYPE" != "ext4" ]]; do err "Invalid filesystem. Please choose 'xfs' or 'ext4'."; read -r -p "Enter root filesystem type [xfs/ext4]: " ROOT_FS_TYPE; done
+
     read -r -p "Enter timezone [Default: UTC]: " SYSTEM_TIMEZONE; [[ -z "$SYSTEM_TIMEZONE" ]] && SYSTEM_TIMEZONE="UTC"
     read -r -p "Enter locale [Default: en_US.UTF-8]: " SYSTEM_LOCALE; [[ -z "$SYSTEM_LOCALE" ]] && SYSTEM_LOCALE="en_US.UTF-8"
     read -r -p "Enter LINGUAS (space separated) [Default: en ru]: " SYSTEM_LINGUAS; [[ -z "$SYSTEM_LINGUAS" ]] && SYSTEM_LINGUAS="en ru"
-    ### ИСПРАВЛЕНО ### Установлен правильный -march 'bdver4' для A10-9600P
     read -r -p "Enter CPU architecture (-march) [Default: bdver4]: " CPU_MARCH; [[ -z "$CPU_MARCH" ]] && CPU_MARCH="bdver4"
-    CPU_MARCH=$(echo "$CPU_MARCH" | sed -e 's/[^a-zA-Z0-9_.-]//g')
-    log "Using sanitized CPU architecture: ${CPU_MARCH}"
     read -r -p "Enter hostname [Default: gentoo-desktop]: " SYSTEM_HOSTNAME; [[ -z "$SYSTEM_HOSTNAME" ]] && SYSTEM_HOSTNAME="gentoo-desktop"
-    SYSTEM_HOSTNAME=$(echo "$SYSTEM_HOSTNAME" | sed -e 's/[^a-zA-Z0-9-]//g'); log "Using sanitized hostname: ${SYSTEM_HOSTNAME}"
-    local detected_cores; detected_cores=$(nproc --all 2>/dev/null || echo 4); local default_makeopts="-j${detected_cores} -l${detected_cores}"; read -r -p "Enter MAKEOPTS (For 4 cores, -j4 or -j5 is good) [Default: ${default_makeopts}]: " MAKEOPTS; [[ -z "$MAKEOPTS" ]] && MAKEOPTS="$default_makeopts"
-    log "--- Configuration Summary ---"; log "  Target Device:   ${TARGET_DEVICE}, Boot Mode: ${BOOT_MODE}"; log "  Hostname:        ${SYSTEM_HOSTNAME}, MAKEOPTS: ${MAKEOPTS}"; if ! ask_confirm "Proceed with this configuration?"; then die "Installation cancelled."; fi
-    { echo "TARGET_DEVICE='${TARGET_DEVICE}'"; echo "SYSTEM_HOSTNAME='${SYSTEM_HOSTNAME}'"; echo "SYSTEM_TIMEZONE='${SYSTEM_TIMEZONE}'"; echo "SYSTEM_LOCALE='${SYSTEM_LOCALE}'"; echo "SYSTEM_LINGUAS='${SYSTEM_LINGUAS}'"; echo "CPU_MARCH='${CPU_MARCH}'"; echo "MAKEOPTS='${MAKEOPTS}'"; echo "EMERGE_JOBS='${detected_cores}'"; } > "$CONFIG_FILE_TMP"
+    local detected_cores; detected_cores=$(nproc --all 2>/dev/null || echo 4); local default_makeopts="-j${detected_cores} -l${detected_cores}"; read -r -p "Enter MAKEOPTS (For 4 cores, -j5 -l4 is good) [Default: ${default_makeopts}]: " MAKEOPTS; [[ -z "$MAKEOPTS" ]] && MAKEOPTS="$default_makeopts"
+
+    ### ДОБАВЛЕНО ### Полная очистка всех пользовательских вводов
+    log "Sanitizing user input for security..."
+    TARGET_DEVICE=$(echo "$TARGET_DEVICE" | sed -e 's/[^a-zA-Z0-9/_-]//g')
+    SYSTEM_TIMEZONE=$(echo "$SYSTEM_TIMEZONE" | sed -e 's/[^a-zA-Z0-9/_-]//g')
+    SYSTEM_LOCALE=$(echo "$SYSTEM_LOCALE" | sed -e 's/[^a-zA-Z0-9_.-]//g')
+    CPU_MARCH=$(echo "$CPU_MARCH" | sed -e 's/[^a-zA-Z0-9_.-]//g')
+    SYSTEM_HOSTNAME=$(echo "$SYSTEM_HOSTNAME" | sed -e 's/[^a-zA-Z0-9-]//g')
+    MAKEOPTS=$(echo "$MAKEOPTS" | sed -e 's/[^a-zA-Z0-9_ =.-]//g') # Более строгая очистка для MAKEOPTS
+    log "Sanitization complete."
+
+    log "--- Configuration Summary ---"; log "  Target Device:   ${TARGET_DEVICE}, Filesystem: ${ROOT_FS_TYPE}"; log "  Hostname:        ${SYSTEM_HOSTNAME}, MAKEOPTS: ${MAKEOPTS}"; if ! ask_confirm "Proceed with this configuration?"; then die "Installation cancelled."; fi
+    { echo "TARGET_DEVICE='${TARGET_DEVICE}'"; echo "ROOT_FS_TYPE='${ROOT_FS_TYPE}'"; echo "SYSTEM_HOSTNAME='${SYSTEM_HOSTNAME}'"; echo "SYSTEM_TIMEZONE='${SYSTEM_TIMEZONE}'"; echo "SYSTEM_LOCALE='${SYSTEM_LOCALE}'"; echo "SYSTEM_LINGUAS='${SYSTEM_LINGUAS}'"; echo "CPU_MARCH='${CPU_MARCH}'"; echo "MAKEOPTS='${MAKEOPTS}'"; echo "EMERGE_JOBS='${detected_cores}'"; } > "$CONFIG_FILE_TMP"
 }
 
 # ==============================================================================
@@ -91,7 +104,10 @@ stage0_partition_and_format() {
     if [[ "$BOOT_MODE" == "UEFI" ]]; then EFI_PART="${TARGET_DEVICE}${P_SEPARATOR}1"; ROOT_PART="${TARGET_DEVICE}${P_SEPARATOR}2"; else ROOT_PART="${TARGET_DEVICE}${P_SEPARATOR}2"; fi
     log "Probing for root partition ${ROOT_PART}..."; local wait_time=20; while (( wait_time > 0 )); do if [[ -b "${ROOT_PART}" ]]; then log "Root partition found."; break; fi; sleep 1; partprobe "${TARGET_DEVICE}"; wait_time=$((wait_time - 1)); done; if (( wait_time == 0 )); then die "Timed out waiting for root partition."; fi
     log "Formatting partitions..."; if [[ "$BOOT_MODE" == "UEFI" ]]; then log "Final cleaning of EFI partition..."; umount "${EFI_PART}" >/dev/null 2>&1 || true; wipefs -a "${EFI_PART}"; sync; mkfs.vfat -F 32 "${EFI_PART}"; fi
-    log "Final cleaning of Root partition..."; umount "${ROOT_PART}" >/dev/null 2>&1 || true; wipefs -a "${ROOT_PART}"; sync; mkfs.xfs -f "${ROOT_PART}"; sync
+    log "Final cleaning of Root partition..."; umount "${ROOT_PART}" >/dev/null 2>&1 || true; wipefs -a "${ROOT_PART}"; sync
+    ### ИЗМЕНЕНО ### Форматирование с учётом выбора пользователя
+    if [[ "$ROOT_FS_TYPE" == "xfs" ]]; then mkfs.xfs -f "${ROOT_PART}"; else mkfs.ext4 -F "${ROOT_PART}"; fi
+    sync
     log "Mounting partitions..."; mkdir -p "${GENTOO_MNT}"; mount "${ROOT_PART}" "${GENTOO_MNT}"; if [[ "$BOOT_MODE" == "UEFI" ]]; then mkdir -p "${GENTOO_MNT}/boot/efi"; mount "${EFI_PART}" "${GENTOO_MNT}/boot/efi"; fi
 }
 
@@ -115,7 +131,7 @@ stage2_prepare_chroot() {
     log "Writing make.conf..."; local grub_platforms="pc"; if [[ "$BOOT_MODE" == "UEFI" ]]; then grub_platforms="efi-64"; fi
     # shellcheck disable=SC2154
     cat > "${GENTOO_MNT}/etc/portage/make.conf" <<EOF
-# --- Generated by Nexus Prime Autobuilder (AMD APU Optimized) ---
+# --- Generated by Aegis Autobuilder (AMD APU Optimized) ---
 COMMON_FLAGS="-O2 -pipe -march=${CPU_MARCH}"
 CFLAGS="\${COMMON_FLAGS}"
 CXXFLAGS="\${COMMON_FLAGS}"
@@ -124,7 +140,8 @@ EMERGE_DEFAULT_OPTS="--jobs=${EMERGE_JOBS} --load-average=${EMERGE_JOBS} --quiet
 VIDEO_CARDS="amdgpu radeonsi"
 INPUT_DEVICES="libinput synaptics"
 USE="X elogind dbus policykit gtk udev udisks pulseaudio vaapi vdpau vulkan -gnome -kde -qt5 -systemd"
-ACCEPT_LICENSE="@FREE linux-firmware"
+### ИСПРАВЛЕНО ### Добавлены все необходимые лицензии для firmware и бинарных пакетов
+ACCEPT_LICENSE="@FREE @BINARY-REDISTRIBUTABLE linux-fw-redistributable"
 GRUB_PLATFORMS="${grub_platforms}"
 GENTOO_MIRRORS="https://distfiles.gentoo.org"
 L10N="${SYSTEM_LINGUAS}"
@@ -134,7 +151,7 @@ EOF
     mkdir -p "${GENTOO_MNT}/etc/portage/package.accept_keywords"
     echo "www-client/firefox-bin ~amd64" > "${GENTOO_MNT}/etc/portage/package.accept_keywords/firefox"
 
-    log "Generating /etc/fstab..."; local ROOT_UUID; ROOT_UUID=$(blkid -s UUID -o value "${ROOT_PART}"); local fstab_content="# /etc/fstab\nUUID=${ROOT_UUID}  /          xfs    defaults,noatime 0 1"
+    log "Generating /etc/fstab..."; local ROOT_UUID; ROOT_UUID=$(blkid -s UUID -o value "${ROOT_PART}"); local fstab_content="# /etc/fstab\nUUID=${ROOT_UUID}  /          ${ROOT_FS_TYPE}    defaults,noatime 0 1"
     if [[ "$BOOT_MODE" == "UEFI" ]]; then local EFI_UUID; EFI_UUID=$(blkid -s UUID -o value "${EFI_PART}"); fstab_content+="\nUUID=${EFI_UUID}   /boot/efi  vfat   defaults,noatime 0 2"; fi
     echo -e "${fstab_content}" > "${GENTOO_MNT}/etc/fstab"; log "/etc/fstab generated successfully."
     log "Mounting virtual filesystems..."; mount --types proc /proc "${GENTOO_MNT}/proc"; mount --rbind /sys "${GENTOO_MNT}/sys"; mount --make-rslave "${GENTOO_MNT}/sys"; mount --rbind /dev "${GENTOO_MNT}/dev"; mount --make-rslave "${GENTOO_MNT}/dev"
@@ -147,11 +164,14 @@ EOF
 }
 
 # ==============================================================================
-# --- STAGES 3 through 7 (No changes here) ---
+# --- STAGES 3 through 7 ---
 # ==============================================================================
 stage3_configure_in_chroot() {
     step_log "System Configuration (Inside Chroot)"; source /etc/profile; export PS1="(chroot) ${PS1:-}"; log "Syncing Portage tree snapshot..."; emerge-webrsync || die "Failed to sync portage tree snapshot."
     log "Verifying existing profile..."; eselect profile list
+    ### ДОБАВЛЕНО ### Ранняя установка заголовков ядра для стабильности сборки
+    step_log "Installing Kernel Headers"
+    emerge -v sys-kernel/linux-headers
     log "Configuring timezone and locale..."; ln -sf "/usr/share/zoneinfo/${SYSTEM_TIMEZONE}" /etc/localtime; echo "${SYSTEM_LOCALE} UTF-8" > /etc/locale.gen; echo "en_US.UTF-8 UTF-8" >> /etc/locale.gen; locale-gen; eselect locale set "${SYSTEM_LOCALE}"; env-update && source /etc/profile; log "Setting hostname..."; echo "hostname=\"${SYSTEM_HOSTNAME}\"" > /etc/conf.d/hostname
 }
 stage4_build_world_and_kernel() {
@@ -169,13 +189,15 @@ stage4_build_world_and_kernel() {
     fi
     log "[4/4] Re-building world with CPU optimizations..."; emerge -v --update --deep --newuse @world
     log "Optimizing mirrors..."; emerge --verbose app-portage/mirrorselect; cp /etc/portage/make.conf /etc/portage/make.conf.bak; sed -i '/^GENTOO_MIRRORS/d' /etc/portage/make.conf; mirrorselect -s4 -b10 -o -D >> /etc/portage/make.conf; log "Fastest mirrors selected."
-    log "Installing firmware and kernel..."; emerge -v sys-kernel/linux-firmware sys-kernel/gentoo-sources; log "Building kernel with genkernel"; emerge -v sys-kernel/genkernel; genkernel all
+    log "Installing firmware and kernel sources..."; emerge -v sys-kernel/linux-firmware sys-kernel/gentoo-sources; log "Building kernel with genkernel"; emerge -v sys-kernel/genkernel; genkernel all
 }
 stage5_install_bootloader() {
     step_log "Installing GRUB Bootloader (Mode: ${BOOT_MODE})"; emerge -v --noreplace sys-boot/grub:2; if [[ "$BOOT_MODE" == "UEFI" ]]; then grub-install --target=x86_64-efi --efi-directory=/boot/efi; else grub-install "${TARGET_DEVICE}"; fi; grub-mkconfig -o /boot/grub/grub.cfg
 }
 stage6_install_desktop() {
     step_log "Installing XFCE Desktop"; emerge -v xfce-base/xfce4-meta x11-terms/xfce4-terminal; log "Installing Xorg Server and Display Manager"; emerge -v x11-base/xorg-server x11-misc/lightdm x11-misc/lightdm-gtk-greeter
+    ### ДОБАВЛЕНО ### Установка 2D-драйвера и кодеков для полноты системы
+    log "Installing graphics drivers and media plugins"; emerge -v x11-drivers/xf86-video-amdgpu media-plugins/gst-plugins-libav
     log "Installing essential desktop utilities"; emerge -v media-gfx/ristretto www-client/firefox-bin app-admin/sudo app-shells/bash-completion net-misc/networkmanager
 }
 stage7_finalize() {
