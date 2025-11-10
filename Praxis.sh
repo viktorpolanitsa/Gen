@@ -2,7 +2,7 @@
 # shellcheck disable=SC1091,SC2016
 
 # The Gentoo Genesis Engine
-# Version: 7.2 ("Aegis Unchained")
+# Version: 3.0
 #
 # This version enhances the GPU detection logic to provide informative feedback
 # for AMD and Intel hardware, while retaining the strategic choice for NVIDIA.
