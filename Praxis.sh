@@ -2,15 +2,17 @@
 # shellcheck disable=SC1091,SC2016
 
 # The Gentoo Genesis Engine
-# Version: 10.3 "The Unchained"
+# Version: 10.3.2 "The Adamantium"
 #
 # Changelog:
-# - v10.3: Reverted SKIP_CHECKSUM to 'true' by default per user request,
-#          restoring the original behavior of prioritizing speed while
-#          retaining the interactive security warning.
-# - v10.2: Major refactoring and bugfix release.
-# - v10.1: CRITICAL BUGFIX: Explicitly create the /usr/src/linux symlink.
-# - v10.0: Massive bugfix and robustness release.
+# - v10.3.2: Major robustness and security hardening release.
+#            - Added validation for all critical user inputs (timezone, locale, fs type).
+#            - Replaced fragile `sleep` with `udevadm settle` for reliable partitioning.
+#            - Hardened GRUB command line modification to work on non-empty configs.
+#            - Improved security by not saving LUKS passphrase to a temporary file.
+#            - Made umount operations safer and more explicit.
+# - v10.3.1: Fixed a syntax error in the interactive setup for NVIDIA driver selection.
+# - v10.3: Reverted SKIP_CHECKSUM to 'true' by default per user request.
 
 set -euo pipefail
 
@@ -26,9 +28,9 @@ BOOT_PART=""
 ROOT_PART=""
 HOME_PART=""
 SWAP_PART=""
+LUKS_PART="" # Добавлено для надёжности
 BOOT_MODE=""
 IS_LAPTOP=false
-### ИЗМЕНЕНО: ПРОВЕРКА КС ОТКЛЮЧЕНА ПО УМОЛЧАНИЮ ###
 SKIP_CHECKSUM=true
 CPU_VENDOR=""
 CPU_MODEL_NAME=""
@@ -63,8 +65,8 @@ self_check() { log "Performing script integrity self-check..."; local funcs=(pre
 # ==============================================================================
 # --- STAGES -2, -1, 0A: PRE-FLIGHT ---
 # ==============================================================================
-pre_flight_checks() { step_log "Performing Pre-flight System Checks"; log "Checking for internet connectivity..."; if ! ping -c 3 gentoo.org &>/dev/null; then die "No internet connection."; fi; log "Internet connection is OK."; log "Detecting boot mode..."; if [ -d /sys/firmware/efi ]; then BOOT_MODE="UEFI"; else BOOT_MODE="LEGACY"; fi; log "System booted in ${BOOT_MODE} mode."; if compgen -G "/sys/class/power_supply/BAT*" > /dev/null; then log "Laptop detected."; IS_LAPTOP=true; fi; }
-dependency_check() { step_log "Verifying LiveCD Dependencies"; local missing_deps=(); local deps=(curl wget sgdisk partprobe mkfs.vfat mkfs.xfs mkfs.ext4 mkfs.btrfs blkid lsblk sha512sum chroot wipefs blockdev cryptsetup pvcreate vgcreate lvcreate mkswap lscpu lspci gcc); for cmd in "${deps[@]}"; do if ! command -v "$cmd" &>/dev/null; then missing_deps+=("$cmd"); fi; done; if (( ${#missing_deps[@]} > 0 )); then die "Required commands not found: ${missing_deps[*]}"; fi; log "All dependencies are satisfied."; }
+pre_flight_checks() { step_log "Performing Pre-flight System Checks"; log "Checking for internet connectivity..."; if ! ping -c 3 8.8.8.8 &>/dev/null; then die "No internet connection."; fi; log "Internet connection is OK."; log "Detecting boot mode..."; if [ -d /sys/firmware/efi ]; then BOOT_MODE="UEFI"; else BOOT_MODE="LEGACY"; fi; log "System booted in ${BOOT_MODE} mode."; if compgen -G "/sys/class/power_supply/BAT*" > /dev/null; then log "Laptop detected."; IS_LAPTOP=true; fi; }
+dependency_check() { step_log "Verifying LiveCD Dependencies"; local missing_deps=(); local deps=(curl wget sgdisk partprobe mkfs.vfat mkfs.xfs mkfs.ext4 mkfs.btrfs blkid lsblk sha512sum chroot wipefs blockdev cryptsetup pvcreate vgcreate lvcreate mkswap lscpu lspci gcc udevadm); for cmd in "${deps[@]}"; do if ! command -v "$cmd" &>/dev/null; then missing_deps+=("$cmd"); fi; done; if (( ${#missing_deps[@]} > 0 )); then die "Required commands not found: ${missing_deps[*]}"; fi; log "All dependencies are satisfied."; }
 stage0_select_mirrors() { step_log "Selecting Fastest Mirrors"; if ask_confirm "Do you want to automatically select the fastest mirrors? (Recommended)"; then log "Syncing portage tree to get mirrorselect..."; emerge-webrsync >/dev/null; log "Installing mirrorselect..."; emerge -q app-portage/mirrorselect; log "Running mirrorselect, this may take a minute..."; FASTEST_MIRRORS=$(mirrorselect -s4 -b10 -o -D); log "Fastest mirrors selected."; else log "Skipping mirror selection. Default mirrors will be used."; fi; }
 
 # ==============================================================================
@@ -90,19 +92,20 @@ interactive_setup() {
     log "--- System Maintenance ---"; ENABLE_AUTO_UPDATE=false; if ask_confirm "Set up automatic weekly system updates? (Recommended for stable branch)"; then ENABLE_AUTO_UPDATE=true; fi
 
     log "--- Storage and System Configuration ---"; log "Available block devices:"; lsblk -d -o NAME,SIZE,TYPE; while true; do read -r -p "Enter the target device for installation (e.g., /dev/sda): " TARGET_DEVICE; if [[ -b "$TARGET_DEVICE" ]]; then break; else err "Device '$TARGET_DEVICE' does not exist."; fi; done
-    read -r -p "Enter root filesystem type [xfs/ext4/btrfs, Default: btrfs]: " ROOT_FS_TYPE; [[ -z "$ROOT_FS_TYPE" ]] && ROOT_FS_TYPE="btrfs"
+    while true; do read -r -p "Enter root filesystem type [xfs/ext4/btrfs, Default: btrfs]: " ROOT_FS_TYPE; [[ -z "$ROOT_FS_TYPE" ]] && ROOT_FS_TYPE="btrfs"; if [[ "$ROOT_FS_TYPE" =~ ^(xfs|ext4|btrfs)$ ]]; then break; else err "Invalid filesystem. Please choose xfs, ext4, or btrfs."; fi; done
     ENABLE_BOOT_ENVIRONMENTS=false; if [[ "$ROOT_FS_TYPE" == "btrfs" ]]; then if ask_confirm "Enable Boot Environments for atomic updates and rollbacks? (Requires Btrfs)"; then ENABLE_BOOT_ENVIRONMENTS=true; fi; else warn "Boot Environments feature is only available with Btrfs."; fi
     SWAP_TYPE="zram"; SWAP_SIZE_GB=0; log "--- Swap Configuration ---"; select choice in "zram (in-memory swap, recommended)" "partition (traditional on-disk swap)" "none"; do SWAP_TYPE="$choice"; break; done
     if [[ "$SWAP_TYPE" == "partition" ]]; then while true; do read -r -p "Enter SWAP size in GB (e.g., 8). [Default: 4]: " SWAP_SIZE_GB; if [[ "$SWAP_SIZE_GB" =~ ^[0-9]+$ ]]; then break; else err "Invalid input. Please enter a number."; fi; done; [[ -z "$SWAP_SIZE_GB" ]] && SWAP_SIZE_GB=4; fi
     USE_LUKS=false; ENCRYPT_BOOT=false; if ask_confirm "Use LUKS full-disk encryption for the root partition?"; then USE_LUKS=true; if [[ "$BOOT_MODE" == "UEFI" ]]; then if ask_confirm "Encrypt the /boot partition as well? (Maximum security)"; then ENCRYPT_BOOT=true; USE_LVM=true; warn "Encrypted /boot selected. LVM will be enabled automatically."; fi; else warn "Encrypted /boot is only supported in UEFI mode by this script."; fi; fi
-    if $USE_LUKS; then while true; do read -s -r -p "Enter LUKS passphrase: " LUKS_PASSPHRASE; echo; read -s -r -p "Confirm LUKS passphrase: " LUKS_PASSPHRASE_CONFIRM; echo; if [[ "$LUKS_PASSPHRASE" == "$LUKS_PASSPHRASE_CONFIRM" && -n "$LUKS_PASSPHRASE" ]]; then break; else err "Passphrases do not match or are empty. Please try again."; fi; done; fi
+    if $USE_LUKS; then while true; do read -s -r -p "Enter LUKS passphrase: " LUKS_PASSPHRASE; echo; read -s -r -p "Confirm LUKS passphrase: " LUKS_PASSPHRASE_CONFIRM; echo; if [[ "$LUKS_PASSPHRASE" == "$LUKS_PASSPHRASE_CONFIRM" && -n "$LUKS_PASSPHRASE" ]]; then export LUKS_PASSPHRASE; break; else err "Passphrases do not match or are empty. Please try again."; fi; done; fi
     if ! $ENCRYPT_BOOT; then USE_LVM=false; if ask_confirm "Use LVM to manage partitions?"; then USE_LVM=true; fi; fi
     USE_SEPARATE_HOME=false; HOME_SIZE_GB=0; if $USE_LVM; then if ask_confirm "Create a separate logical volume for /home?"; then USE_SEPARATE_HOME=true; while true; do read -r -p "Enter /home size in GB [Default: 20]: " HOME_SIZE_GB; if [[ "$HOME_SIZE_GB" =~ ^[0-9]+$ ]]; then break; else err "Invalid input. Please enter a number."; fi; done; [[ -z "$HOME_SIZE_GB" ]] && HOME_SIZE_GB=20; fi; else warn "A separate /home partition is only supported with LVM in this script."; fi
-    read -r -p "Enter timezone [Default: UTC]: " SYSTEM_TIMEZONE; [[ -z "$SYSTEM_TIMEZONE" ]] && SYSTEM_TIMEZONE="UTC"; read -r -p "Enter locale [Default: en_US.UTF-8]: " SYSTEM_LOCALE; [[ -z "$SYSTEM_LOCALE" ]] && SYSTEM_LOCALE="en_US.UTF-8"; read -r -p "Enter LINGUAS (space separated) [Default: en ru]: " SYSTEM_LINGUAS; [[ -z "$SYSTEM_LINGUAS" ]] && SYSTEM_LINGUAS="en ru"; read -r -p "Enter hostname [Default: gentoo-desktop]: " SYSTEM_HOSTNAME; [[ -z "$SYSTEM_HOSTNAME" ]] && SYSTEM_HOSTNAME="gentoo-desktop"; local detected_cores; detected_cores=$(nproc --all 2>/dev/null || echo 4); local default_makeopts="-j${detected_cores} -l${detected_cores}"; read -r -p "Enter MAKEOPTS [Default: ${default_makeopts}]: " MAKEOPTS; [[ -z "$MAKEOPTS" ]] && MAKEOPTS="$default_makeopts"
+    while true; do read -r -p "Enter timezone [Default: UTC]: " SYSTEM_TIMEZONE; [[ -z "$SYSTEM_TIMEZONE" ]] && SYSTEM_TIMEZONE="UTC"; if [[ -f "/usr/share/zoneinfo/${SYSTEM_TIMEZONE}" ]]; then break; else err "Invalid timezone. Please enter a valid path from /usr/share/zoneinfo/ (e.g., Europe/London)."; fi; done
+    while true; do read -r -p "Enter locale [Default: en_US.UTF-8]: " SYSTEM_LOCALE; [[ -z "$SYSTEM_LOCALE" ]] && SYSTEM_LOCALE="en_US.UTF-8"; if grep -q "^${SYSTEM_LOCALE}" /usr/share/i18n/SUPPORTED; then break; else err "Invalid locale. Check /usr/share/i18n/SUPPORTED for a list of valid locales."; fi; done
+    read -r -p "Enter LINGUAS (space separated) [Default: en ru]: " SYSTEM_LINGUAS; [[ -z "$SYSTEM_LINGUAS" ]] && SYSTEM_LINGUAS="en ru"; read -r -p "Enter hostname [Default: gentoo-desktop]: " SYSTEM_HOSTNAME; [[ -z "$SYSTEM_HOSTNAME" ]] && SYSTEM_HOSTNAME="gentoo-desktop"; local detected_cores; detected_cores=$(nproc --all 2>/dev/null || echo 4); local default_makeopts="-j${detected_cores} -l${detected_cores}"; read -r -p "Enter MAKEOPTS [Default: ${default_makeopts}]: " MAKEOPTS; [[ -z "$MAKEOPTS" ]] && MAKEOPTS="$default_makeopts"
     log "--- Post-Install Application Profiles ---"; INSTALL_APP_HOST=false; if ask_confirm "Install Universal App Host (Flatpak + Distrobox)?"; then INSTALL_APP_HOST=true; fi; INSTALL_CYBER_TERM=false; if ask_confirm "Install the 'Cybernetic Terminal' (zsh + starship)?"; then INSTALL_CYBER_TERM=true; fi; INSTALL_DEV_TOOLS=false; if ask_confirm "Install Developer Tools (git, vscode, docker)?"; then INSTALL_DEV_TOOLS=true; fi; INSTALL_OFFICE_GFX=false; if ask_confirm "Install Office/Graphics Suite (LibreOffice, GIMP, Inkscape)?"; then INSTALL_OFFICE_GFX=true; fi; INSTALL_GAMING=false; if ask_confirm "Install Gaming Essentials (Steam, Lutris, Wine)?"; then INSTALL_GAMING=true; fi
 
     { echo "TARGET_DEVICE='${TARGET_DEVICE}'"; echo "ROOT_FS_TYPE='${ROOT_FS_TYPE}'"; echo "SYSTEM_HOSTNAME='${SYSTEM_HOSTNAME}'"; echo "SYSTEM_TIMEZONE='${SYSTEM_TIMEZONE}'"; echo "SYSTEM_LOCALE='${SYSTEM_LOCALE}'"; echo "SYSTEM_LINGUAS='${SYSTEM_LINGUAS}'"; echo "CPU_MARCH='${CPU_MARCH}'"; echo "VIDEO_CARDS='${VIDEO_CARDS}'"; echo "MICROCODE_PACKAGE='${MICROCODE_PACKAGE}'"; echo "MAKEOPTS='${MAKEOPTS}'"; echo "EMERGE_JOBS='${detected_cores}'"; echo "USE_LVM=${USE_LVM}"; echo "USE_LUKS=${USE_LUKS}"; echo "INIT_SYSTEM='${INIT_SYSTEM}'"; echo "DESKTOP_ENV='${DESKTOP_ENV}'"; echo "KERNEL_METHOD='${KERNEL_METHOD}'"; echo "USE_CCACHE=${USE_CCACHE}"; echo "USE_BINPKGS=${USE_BINPKGS}"; echo "INSTALL_DEV_TOOLS=${INSTALL_DEV_TOOLS}"; echo "INSTALL_OFFICE_GFX=${INSTALL_OFFICE_GFX}"; echo "INSTALL_GAMING=${INSTALL_GAMING}"; echo "NVIDIA_DRIVER_CHOICE='${NVIDIA_DRIVER_CHOICE}'"; echo "USE_HARDENED_PROFILE=${USE_HARDENED_PROFILE}"; echo "LSM_CHOICE='${LSM_CHOICE}'"; echo "CPU_FLAGS_X86='${CPU_FLAGS_X86}'"; echo "USE_LTO=${USE_LTO}"; echo "USE_SEPARATE_HOME=${USE_SEPARATE_HOME}"; echo "HOME_SIZE_GB=${HOME_SIZE_GB}"; echo "USE_PIPEWIRE=${USE_PIPEWIRE}"; echo "ENCRYPT_BOOT=${ENCRYPT_BOOT}"; echo "ENABLE_AUTO_UPDATE=${ENABLE_AUTO_UPDATE}"; echo "ENABLE_BOOT_ENVIRONMENTS=${ENABLE_BOOT_ENVIRONMENTS}"; echo "INSTALL_APP_HOST=${INSTALL_APP_HOST}"; echo "SWAP_TYPE='${SWAP_TYPE}'"; echo "SWAP_SIZE_GB='${SWAP_SIZE_GB}'"; echo "ENABLE_FIREWALL=${ENABLE_FIREWALL}"; echo "ENABLE_CPU_GOVERNOR=${ENABLE_CPU_GOVERNOR}"; echo "INSTALL_STYLING=${INSTALL_STYLING}"; echo "INSTALL_CYBER_TERM=${INSTALL_CYBER_TERM}"; } > "$CONFIG_FILE_TMP"
-    if $USE_LUKS; then echo "LUKS_PASSPHRASE='${LUKS_PASSPHRASE}'" >> "$CONFIG_FILE_TMP"; fi
     log "Configuration complete. Review summary before proceeding."
 }
 
@@ -111,14 +114,17 @@ interactive_setup() {
 # ==============================================================================
 stage0_partition_and_format() {
     step_log "Disk Partitioning and Formatting (Mode: ${BOOT_MODE})"; warn "Final confirmation. ALL DATA ON ${TARGET_DEVICE} WILL BE PERMANENTLY DESTROYED!"; read -r -p "To confirm, type the full device name ('${TARGET_DEVICE}'): " confirmation; if [[ "$confirmation" != "${TARGET_DEVICE}" ]]; then die "Confirmation failed. Aborting."; fi
-    log "Initiating 'Absolute Zero' protocol..."; umount "${TARGET_DEVICE}"* >/dev/null 2>&1 || true; if command -v mdadm &>/dev/null; then mdadm --stop --scan >/dev/null 2>&1 || true; fi; if command -v dmraid &>/dev/null; then dmraid -an >/dev/null 2>&1 || true; fi; if command -v vgchange &>/dev/null; then vgchange -an >/dev/null 2>&1 || true; fi; if command -v cryptsetup &>/dev/null; then cryptsetup close /dev/mapper/* >/dev/null 2>&1 || true; fi; sync; blockdev --flushbufs "${TARGET_DEVICE}" >/dev/null 2>&1 || true; log "Device locks released."
+    log "Initiating 'Absolute Zero' protocol..."; 
+    # Улучшенная, более безопасная процедура размонтирования
+    mount | grep "^${TARGET_DEVICE}" | cut -d ' ' -f 3 | sort -r | xargs -r -n 1 umount -f
+    if command -v mdadm &>/dev/null; then mdadm --stop --scan >/dev/null 2>&1 || true; fi; if command -v dmraid &>/dev/null; then dmraid -an >/dev/null 2>&1 || true; fi; if command -v vgchange &>/dev/null; then vgchange -an >/dev/null 2>&1 || true; fi; if command -v cryptsetup &>/dev/null; then cryptsetup close /dev/mapper/* >/dev/null 2>&1 || true; fi; sync; blockdev --flushbufs "${TARGET_DEVICE}" >/dev/null 2>&1 || true; log "Device locks released."
     log "Wiping partition table on ${TARGET_DEVICE}..."; sgdisk --zap-all "${TARGET_DEVICE}"; sync; local P_SEPARATOR=""; if [[ "${TARGET_DEVICE}" == *nvme* || "${TARGET_DEVICE}" == *mmcblk* ]]; then P_SEPARATOR="p"; fi
     if $ENCRYPT_BOOT; then
-        log "Creating partitions for Encrypted /boot scheme (UEFI)..."; sgdisk -n 1:0:+512M -t 1:ef00 -c 1:"EFI System" "${TARGET_DEVICE}"; sgdisk -n 2:0:0 -t 2:8300 -c 2:"LUKS Container" "${TARGET_DEVICE}"; EFI_PART="${TARGET_DEVICE}${P_SEPARATOR}1"; local LUKS_PART="${TARGET_DEVICE}${P_SEPARATOR}2"; sync; partprobe "${TARGET_DEVICE}"; sleep 3; log "Formatting EFI partition..."; wipefs -a "${EFI_PART}"; mkfs.vfat -F 32 "${EFI_PART}"; log "Creating LUKS container on ${LUKS_PART}..."; echo -n "${LUKS_PASSPHRASE}" | cryptsetup luksFormat --type luks2 --cipher aes-xts-plain64 --key-size 512 --hash sha512 --iter-time 5000 --use-random "${LUKS_PART}" -; log "Opening LUKS container..."; echo -n "${LUKS_PASSPHRASE}" | cryptsetup open "${LUKS_PART}" gentoo_crypted -; local device_to_format="/dev/mapper/gentoo_crypted"; echo "LUKS_UUID=$(cryptsetup luksUUID "${LUKS_PART}")" >> "$CONFIG_FILE_TMP"; log "Setting up LVM on ${device_to_format}..."; pvcreate "${device_to_format}"; vgcreate gentoo_vg "${device_to_format}"; log "Creating Boot logical volume..."; lvcreate -L 1G -n boot gentoo_vg; BOOT_PART="/dev/gentoo_vg/boot"; if [[ "$SWAP_TYPE" == "partition" && "$SWAP_SIZE_GB" -gt 0 ]]; then log "Creating SWAP logical volume..."; lvcreate -L "${SWAP_SIZE_GB}G" -n swap gentoo_vg; SWAP_PART="/dev/gentoo_vg/swap"; mkswap "${SWAP_PART}"; fi; if $USE_SEPARATE_HOME; then log "Creating Home logical volume..."; lvcreate -L "${HOME_SIZE_GB}G" -n home gentoo_vg; HOME_PART="/dev/gentoo_vg/home"; fi; log "Creating Root logical volume..."; lvcreate -l 100%FREE -n root gentoo_vg; ROOT_PART="/dev/gentoo_vg/root"; log "Formatting logical volumes..."; wipefs -a "${BOOT_PART}"; mkfs.ext4 -F "${BOOT_PART}"
+        log "Creating partitions for Encrypted /boot scheme (UEFI)..."; sgdisk -n 1:0:+512M -t 1:ef00 -c 1:"EFI System" "${TARGET_DEVICE}"; sgdisk -n 2:0:0 -t 2:8300 -c 2:"LUKS Container" "${TARGET_DEVICE}"; EFI_PART="${TARGET_DEVICE}${P_SEPARATOR}1"; LUKS_PART="${TARGET_DEVICE}${P_SEPARATOR}2"; sync; partprobe "${TARGET_DEVICE}"; udevadm settle; log "Formatting EFI partition..."; wipefs -a "${EFI_PART}"; mkfs.vfat -F 32 "${EFI_PART}"; log "Creating LUKS container on ${LUKS_PART}..."; echo -n "${LUKS_PASSPHRASE}" | cryptsetup luksFormat --type luks2 --cipher aes-xts-plain64 --key-size 512 --hash sha512 --iter-time 5000 --use-random "${LUKS_PART}" -; log "Opening LUKS container..."; echo -n "${LUKS_PASSPHRASE}" | cryptsetup open "${LUKS_PART}" gentoo_crypted -; local device_to_format="/dev/mapper/gentoo_crypted"; echo "LUKS_UUID=$(cryptsetup luksUUID "${LUKS_PART}")" >> "$CONFIG_FILE_TMP"; log "Setting up LVM on ${device_to_format}..."; pvcreate "${device_to_format}"; vgcreate gentoo_vg "${device_to_format}"; log "Creating Boot logical volume..."; lvcreate -L 1G -n boot gentoo_vg; BOOT_PART="/dev/gentoo_vg/boot"; if [[ "$SWAP_TYPE" == "partition" && "$SWAP_SIZE_GB" -gt 0 ]]; then log "Creating SWAP logical volume..."; lvcreate -L "${SWAP_SIZE_GB}G" -n swap gentoo_vg; SWAP_PART="/dev/gentoo_vg/swap"; mkswap "${SWAP_PART}"; fi; if $USE_SEPARATE_HOME; then log "Creating Home logical volume..."; lvcreate -L "${HOME_SIZE_GB}G" -n home gentoo_vg; HOME_PART="/dev/gentoo_vg/home"; fi; log "Creating Root logical volume..."; lvcreate -l 100%FREE -n root gentoo_vg; ROOT_PART="/dev/gentoo_vg/root"; log "Formatting logical volumes..."; wipefs -a "${BOOT_PART}"; mkfs.ext4 -F "${BOOT_PART}"
     else
         local BOOT_PART_NUM=1; local MAIN_PART_NUM=2; local SWAP_PART_NUM=3; if [[ "$BOOT_MODE" == "UEFI" ]]; then log "Creating GPT partitions for UEFI..."; sgdisk -n ${BOOT_PART_NUM}:0:+512M -t ${BOOT_PART_NUM}:ef00 -c ${BOOT_PART_NUM}:"EFI System" "${TARGET_DEVICE}"; EFI_PART="${TARGET_DEVICE}${P_SEPARATOR}${BOOT_PART_NUM}"; BOOT_PART="${EFI_PART}"; else log "Creating GPT partitions for Legacy BIOS..."; sgdisk -n ${BOOT_PART_NUM}:0:+2M -t ${BOOT_PART_NUM}:ef02 -c ${BOOT_PART_NUM}:"BIOS Boot" "${TARGET_DEVICE}"; BOOT_PART="${TARGET_DEVICE}${P_SEPARATOR}${BOOT_PART_NUM}"; fi
         if [[ "$SWAP_TYPE" == "partition" && "$SWAP_SIZE_GB" -gt 0 && "$USE_LVM" = false ]]; then log "Creating dedicated SWAP partition..."; sgdisk -n ${SWAP_PART_NUM}:0:+${SWAP_SIZE_GB}G -t ${SWAP_PART_NUM}:8200 -c ${SWAP_PART_NUM}:"Linux Swap" "${TARGET_DEVICE}"; SWAP_PART="${TARGET_DEVICE}${P_SEPARATOR}${SWAP_PART_NUM}"; fi
-        log "Creating main Linux partition..."; sgdisk -n ${MAIN_PART_NUM}:0:0 -t ${MAIN_PART_NUM}:8300 -c ${MAIN_PART_NUM}:"Gentoo Root" "${TARGET_DEVICE}"; local MAIN_PART="${TARGET_DEVICE}${P_SEPARATOR}${MAIN_PART_NUM}"; sync; partprobe "${TARGET_DEVICE}"; sleep 3; if [[ "$BOOT_MODE" == "UEFI" ]]; then log "Formatting EFI partition..."; wipefs -a "${EFI_PART}"; mkfs.vfat -F 32 "${EFI_PART}"; fi; if [[ -n "$SWAP_PART" ]]; then log "Formatting SWAP partition..."; wipefs -a "${SWAP_PART}"; mkswap "${SWAP_PART}"; fi; local device_to_format="${MAIN_PART}"; if $USE_LUKS; then log "Creating LUKS container on ${MAIN_PART}..."; echo -n "${LUKS_PASSPHRASE}" | cryptsetup luksFormat --type luks2 --cipher aes-xts-plain64 --key-size 512 --hash sha512 --iter-time 5000 --use-random "${MAIN_PART}" -; log "Opening LUKS container..."; echo -n "${LUKS_PASSPHRASE}" | cryptsetup open "${MAIN_PART}" gentoo_crypted -; device_to_format="/dev/mapper/gentoo_crypted"; echo "LUKS_UUID=$(cryptsetup luksUUID "${MAIN_PART}")" >> "$CONFIG_FILE_TMP"; fi; if $USE_LVM; then log "Setting up LVM on ${device_to_format}..."; pvcreate "${device_to_format}"; vgcreate gentoo_vg "${device_to_format}"; if [[ "$SWAP_TYPE" == "partition" && "$SWAP_SIZE_GB" -gt 0 ]]; then log "Creating SWAP logical volume..."; lvcreate -L "${SWAP_SIZE_GB}G" -n swap gentoo_vg; SWAP_PART="/dev/gentoo_vg/swap"; mkswap "${SWAP_PART}"; fi; if $USE_SEPARATE_HOME; then log "Creating Home logical volume..."; lvcreate -L "${HOME_SIZE_GB}G" -n home gentoo_vg; HOME_PART="/dev/gentoo_vg/home"; fi; log "Creating Root logical volume..."; lvcreate -l 100%FREE -n root gentoo_vg; ROOT_PART="/dev/gentoo_vg/root"; else ROOT_PART="${device_to_format}"; fi
+        log "Creating main Linux partition..."; sgdisk -n ${MAIN_PART_NUM}:0:0 -t ${MAIN_PART_NUM}:8300 -c ${MAIN_PART_NUM}:"Gentoo Root" "${TARGET_DEVICE}"; local MAIN_PART="${TARGET_DEVICE}${P_SEPARATOR}${MAIN_PART_NUM}"; sync; partprobe "${TARGET_DEVICE}"; udevadm settle; if [[ "$BOOT_MODE" == "UEFI" ]]; then log "Formatting EFI partition..."; wipefs -a "${EFI_PART}"; mkfs.vfat -F 32 "${EFI_PART}"; fi; if [[ -n "$SWAP_PART" ]]; then log "Formatting SWAP partition..."; wipefs -a "${SWAP_PART}"; mkswap "${SWAP_PART}"; fi; local device_to_format="${MAIN_PART}"; if $USE_LUKS; then LUKS_PART="${MAIN_PART}"; log "Creating LUKS container on ${LUKS_PART}..."; echo -n "${LUKS_PASSPHRASE}" | cryptsetup luksFormat --type luks2 --cipher aes-xts-plain64 --key-size 512 --hash sha512 --iter-time 5000 --use-random "${LUKS_PART}" -; log "Opening LUKS container..."; echo -n "${LUKS_PASSPHRASE}" | cryptsetup open "${LUKS_PART}" gentoo_crypted -; device_to_format="/dev/mapper/gentoo_crypted"; echo "LUKS_UUID=$(cryptsetup luksUUID "${LUKS_PART}")" >> "$CONFIG_FILE_TMP"; fi; if $USE_LVM; then log "Setting up LVM on ${device_to_format}..."; pvcreate "${device_to_format}"; vgcreate gentoo_vg "${device_to_format}"; if [[ "$SWAP_TYPE" == "partition" && "$SWAP_SIZE_GB" -gt 0 ]]; then log "Creating SWAP logical volume..."; lvcreate -L "${SWAP_SIZE_GB}G" -n swap gentoo_vg; SWAP_PART="/dev/gentoo_vg/swap"; mkswap "${SWAP_PART}"; fi; if $USE_SEPARATE_HOME; then log "Creating Home logical volume..."; lvcreate -L "${HOME_SIZE_GB}G" -n home gentoo_vg; HOME_PART="/dev/gentoo_vg/home"; fi; log "Creating Root logical volume..."; lvcreate -l 100%FREE -n root gentoo_vg; ROOT_PART="/dev/gentoo_vg/root"; else ROOT_PART="${device_to_format}"; fi
     fi
     log "Formatting root/home filesystems..."; wipefs -a "${ROOT_PART}"; if [[ -n "$HOME_PART" ]]; then wipefs -a "${HOME_PART}"; fi; case "$ROOT_FS_TYPE" in "xfs") mkfs.xfs -f "${ROOT_PART}"; if [[ -n "$HOME_PART" ]]; then mkfs.xfs -f "${HOME_PART}"; fi ;; "ext4") mkfs.ext4 -F "${ROOT_PART}"; if [[ -n "$HOME_PART" ]]; then mkfs.ext4 -F "${HOME_PART}"; fi ;; "btrfs") mkfs.btrfs -f "${ROOT_PART}"; if [[ -n "$HOME_PART" ]]; then mkfs.btrfs -f "${HOME_PART}"; fi;; esac; sync
     log "Mounting partitions..."; local BTRFS_TMP_MNT; if [[ "$ROOT_FS_TYPE" == "btrfs" ]]; then BTRFS_TMP_MNT=$(mktemp -d); mount "${ROOT_PART}" "${BTRFS_TMP_MNT}"; log "Creating Btrfs subvolumes..."; btrfs subvolume create "${BTRFS_TMP_MNT}/@"; btrfs subvolume create "${BTRFS_TMP_MNT}/@home"; if [[ "$ENABLE_BOOT_ENVIRONMENTS" = true ]]; then btrfs subvolume create "${BTRFS_TMP_MNT}/@snapshots"; fi; umount "${BTRFS_TMP_MNT}"; rmdir "${BTRFS_TMP_MNT}"; fi
@@ -126,8 +132,10 @@ stage0_partition_and_format() {
     if [[ -n "$HOME_PART" ]]; then mkdir -p "${GENTOO_MNT}/home"; if [[ "$ROOT_FS_TYPE" == "btrfs" ]]; then mount -o subvol=@home,compress=zstd "${ROOT_PART}" "${GENTOO_MNT}/home"; else mount "${HOME_PART}" "${GENTOO_MNT}/home"; fi; fi
     if $ENCRYPT_BOOT; then mkdir -p "${GENTOO_MNT}/boot"; mount "${BOOT_PART}" "${GENTOO_MNT}/boot"; mkdir -p "${GENTOO_MNT}/boot/efi"; mount "${EFI_PART}" "${GENTOO_MNT}/boot/efi"; elif [[ "$BOOT_MODE" == "UEFI" ]]; then mkdir -p "${GENTOO_MNT}/boot/efi"; mount "${EFI_PART}" "${GENTOO_MNT}/boot/efi"; fi
     if [[ -n "$SWAP_PART" ]]; then swapon "${SWAP_PART}"; fi
+    echo "LUKS_PART='${LUKS_PART}'" >> "$CONFIG_FILE_TMP" # Сохраняем путь к LUKS разделу
 }
 
+# ... (stage1_deploy_base_system и stage2_prepare_chroot остаются без изменений) ...
 # ==============================================================================
 # --- STAGE 1: BASE SYSTEM DEPLOYMENT ---
 # ==============================================================================
@@ -186,8 +194,43 @@ stage4_build_world_and_kernel() {
     esac
 }
 
-stage5_install_bootloader() { step_log "Installing GRUB Bootloader (Mode: ${BOOT_MODE})"; local grub_cmdline=""; if [[ "$USE_LUKS" = true && ! "$ENCRYPT_BOOT" = true ]]; then log "Configuring GRUB for LUKS (standard)..."; local P_SEPARATOR=""; if [[ "${TARGET_DEVICE}" == *nvme* || "${TARGET_DEVICE}" == *mmcblk* ]]; then P_SEPARATOR="p"; fi; local MAIN_PART_NUM=2; local MAIN_PART="${TARGET_DEVICE}${P_SEPARATOR}${MAIN_PART_NUM}"; local LUKS_DEVICE_UUID; LUKS_DEVICE_UUID=$(blkid -s UUID -o value "${MAIN_PART}"); local ROOT_DEVICE_PATH="/dev/mapper/gentoo_crypted"; if [[ "$USE_LVM" = true ]]; then ROOT_DEVICE_PATH="/dev/gentoo_vg/root"; fi; grub_cmdline+="crypt_device=UUID=${LUKS_DEVICE_UUID}:gentoo_crypted root=${ROOT_DEVICE_PATH}"; fi; if [[ "$LSM_CHOICE" == "AppArmor" ]]; then grub_cmdline+=" apparmor=1 security=apparmor"; fi; if [[ "$LSM_CHOICE" == "SELinux" ]]; then grub_cmdline+=" selinux=1 security=selinux"; fi; if [[ -n "$grub_cmdline" ]]; then log "Adding kernel parameters: ${grub_cmdline}"; sed -i "s/GRUB_CMDLINE_LINUX=\"\"/GRUB_CMDLINE_LINUX=\"${grub_cmdline}\"/" /etc/default/grub; fi; if [[ "$USE_LUKS" = true ]]; then log "Enabling GRUB cryptodisk feature..."; echo 'GRUB_ENABLE_CRYPTODISK=y' >> /etc/default/grub; fi; emerge_safely --noreplace sys-boot/grub:2; if [[ "$BOOT_MODE" == "UEFI" ]]; then grub-install --target=x86_64-efi --efi-directory=/boot/efi; else grub-install "${TARGET_DEVICE}"; fi; grub-mkconfig -o /boot/grub/grub.cfg; }
+stage5_install_bootloader() {
+    step_log "Installing GRUB Bootloader (Mode: ${BOOT_MODE})"
+    local grub_cmdline_additions=""
+    if [[ "$USE_LUKS" = true && ! "$ENCRYPT_BOOT" = true ]]; then
+        log "Configuring GRUB for LUKS (standard)..."
+        local LUKS_DEVICE_UUID; LUKS_DEVICE_UUID=$(blkid -s UUID -o value "${LUKS_PART}")
+        local ROOT_DEVICE_PATH="/dev/mapper/gentoo_crypted"
+        if [[ "$USE_LVM" = true ]]; then
+            ROOT_DEVICE_PATH="/dev/gentoo_vg/root"
+        fi
+        grub_cmdline_additions+=" crypt_device=UUID=${LUKS_DEVICE_UUID}:gentoo_crypted root=${ROOT_DEVICE_PATH}"
+    fi
 
+    if [[ "$LSM_CHOICE" == "AppArmor" ]]; then grub_cmdline_additions+=" apparmor=1 security=apparmor"; fi
+    if [[ "$LSM_CHOICE" == "SELinux" ]]; then grub_cmdline_additions+=" selinux=1 security=selinux"; fi
+
+    if [[ -n "$grub_cmdline_additions" ]]; then
+        log "Adding kernel parameters: ${grub_cmdline_additions}"
+        # Улучшенный, более надёжный sed
+        sed -i "s/^\(GRUB_CMDLINE_LINUX=.*\)\"$/\1${grub_cmdline_additions}\"/" /etc/default/grub
+    fi
+
+    if [[ "$USE_LUKS" = true ]]; then
+        log "Enabling GRUB cryptodisk feature..."
+        echo 'GRUB_ENABLE_CRYPTODISK=y' >> /etc/default/grub
+    fi
+
+    emerge_safely --noreplace sys-boot/grub:2
+    if [[ "$BOOT_MODE" == "UEFI" ]]; then
+        grub-install --target=x86_64-efi --efi-directory=/boot/efi
+    else
+        grub-install "${TARGET_DEVICE}"
+    fi
+    grub-mkconfig -o /boot/grub/grub.cfg
+}
+
+# ... (stage6_install_software и stage7_finalize остаются без изменений) ...
 stage6_install_software() {
     step_log "Installing Desktop Environment and Application Profiles"; local display_manager=""; case "$DESKTOP_ENV" in "XFCE") log "Installing XFCE..."; emerge_safely xfce-base/xfce4-meta x11-terms/xfce4-terminal; display_manager="x11-misc/lightdm" ;; "KDE-Plasma") log "Installing KDE Plasma..."; emerge_safely kde-plasma/plasma-meta; display_manager="x11-misc/sddm" ;; "GNOME") log "Installing GNOME..."; emerge_safely gnome-base/gnome-desktop; display_manager="gnome-base/gdm" ;; "i3-WM") log "Installing i3 Window Manager..."; emerge_safely x11-wm/i3 x11-terms/alacritty x11-misc/dmenu; display_manager="x11-misc/lightdm" ;; "Server (No GUI)") log "Skipping GUI installation for server profile." ;; esac; if [[ -n "$display_manager" ]]; then log "Installing Xorg Server and Display Manager..."; emerge_safely x11-base/xorg-server "${display_manager}"; fi
     if [[ "$USE_PIPEWIRE" = true ]]; then log "Installing PipeWire..."; emerge_safely media-video/pipewire media-video/wireplumber media-sound/pipewire-pulse; fi
@@ -247,8 +290,12 @@ if [[ "${INSTALL_STYLING}" = true ]]; then
     echo ">>> Applying base styling..."
     case "${DESKTOP_ENV}" in
         "XFCE")
-            xfconf-query -c xsettings -p /Net/IconThemeName -s Papirus
-            xfconf-query -c xfce4-terminal -p /font-name -s 'FiraCode Nerd Font Mono 10'
+            # Wait for the session to be available before trying to change settings
+            sleep 10 
+            if command -v xfconf-query &>/dev/null && [[ -n "\$DBUS_SESSION_BUS_ADDRESS" ]]; then
+                xfconf-query -c xsettings -p /Net/IconThemeName -s Papirus
+                xfconf-query -c xfce4-terminal -p /font-name -s 'FiraCode Nerd Font Mono 10'
+            fi
             ;;
         *)
             echo ">>> Please manually select 'Papirus' icon theme and 'FiraCode Nerd Font' in your DE settings."
@@ -292,7 +339,14 @@ main() {
         local initial_stages=(self_check pre_flight_checks dependency_check stage0_select_mirrors detect_cpu_architecture detect_cpu_flags detect_gpu_hardware interactive_setup stage0_partition_and_format stage1_deploy_base_system)
         local stage_num=-9
         if (( START_STAGE == 0 )); then for stage_func in "${initial_stages[@]}"; do "$stage_func"; done; fi
-        if (( START_STAGE <= 2 )); then source "$CONFIG_FILE_TMP"; echo "BOOT_MODE='${BOOT_MODE}'" >> "$CONFIG_FILE_TMP"; stage2_prepare_chroot; save_checkpoint 2; fi
+        if (( START_STAGE <= 2 )); then 
+            source "$CONFIG_FILE_TMP"
+            # Pass LUKS passphrase via exported variable, not file
+            if [[ -v LUKS_PASSPHRASE ]]; then export LUKS_PASSPHRASE; fi
+            echo "BOOT_MODE='${BOOT_MODE}'" >> "$CONFIG_FILE_TMP"
+            stage2_prepare_chroot
+            save_checkpoint 2
+        fi
     fi
 }
 
@@ -308,4 +362,3 @@ if [[ "${1:-}" != "--chrooted" ]]; then
 else
     main "$@"
 fi
-````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````-`-`````-`-
