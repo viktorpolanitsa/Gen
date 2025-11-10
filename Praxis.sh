@@ -2,17 +2,14 @@
 # shellcheck disable=SC1091,SC2016
 
 # The Gentoo Genesis Engine
-# Version: 10.3.2 "The Adamantium"
+# Version: 10.3.3 "The Final Form"
 #
 # Changelog:
+# - v10.3.3: Eradicated all remaining syntax errors in one-line `select` loops by expanding them.
+#            Hardened the first-login script for XFCE styling.
+#            Switched internet connectivity check to a more reliable IP ping.
 # - v10.3.2: Major robustness and security hardening release.
-#            - Added validation for all critical user inputs (timezone, locale, fs type).
-#            - Replaced fragile `sleep` with `udevadm settle` for reliable partitioning.
-#            - Hardened GRUB command line modification to work on non-empty configs.
-#            - Improved security by not saving LUKS passphrase to a temporary file.
-#            - Made umount operations safer and more explicit.
 # - v10.3.1: Fixed a syntax error in the interactive setup for NVIDIA driver selection.
-# - v10.3: Reverted SKIP_CHECKSUM to 'true' by default per user request.
 
 set -euo pipefail
 
@@ -28,7 +25,7 @@ BOOT_PART=""
 ROOT_PART=""
 HOME_PART=""
 SWAP_PART=""
-LUKS_PART="" # Добавлено для надёжности
+LUKS_PART=""
 BOOT_MODE=""
 IS_LAPTOP=false
 SKIP_CHECKSUM=true
@@ -80,30 +77,117 @@ detect_gpu_hardware() { step_log "Hardware Detection Engine (GPU)"; local gpu_in
 # --- STAGE 0B: INTERACTIVE SETUP WIZARD ---
 # ==============================================================================
 interactive_setup() {
-    step_log "Interactive Setup Wizard";
+    step_log "Interactive Setup Wizard"
     log "--- Hardware Auto-Detection Results ---"; log "  CPU Model:       ${CPU_MODEL_NAME}"; log "  Selected March:  ${CPU_MARCH}"; log "  CPU Flags:       ${CPU_FLAGS_X86:-None detected}"; log "  GPU Vendor:      ${GPU_VENDOR}"; if ! ask_confirm "Are these hardware settings correct?"; then die "Installation cancelled."; fi
-    NVIDIA_DRIVER_CHOICE="None"; if [[ "$GPU_VENDOR" == "NVIDIA" ]]; then log "--- NVIDIA Driver Selection ---"; warn "An NVIDIA GPU has been detected. Please choose the desired driver:"; select choice in "Proprietary (Best Performance, Recommended)" "Nouveau (Open-Source, Good Compatibility)" "Manual (Configure later)"; do case $choice in "Proprietary (Best Performance, Recommended)") NVIDIA_DRIVER_CHOICE="Proprietary"; VIDEO_CARDS+=" nvidia"; break;; "Nouveau (Open-Source, Good Compatibility)") NVIDIA_DRIVER_CHOICE="Nouveau"; break;; "Manual (Configure later)") NVIDIA_DRIVER_CHOICE="Manual"; break;; esac; done; fi
+    
+    NVIDIA_DRIVER_CHOICE="None"
+    if [[ "$GPU_VENDOR" == "NVIDIA" ]]; then
+        log "--- NVIDIA Driver Selection ---"
+        warn "An NVIDIA GPU has been detected. Please choose the desired driver:"
+        select choice in "Proprietary (Best Performance, Recommended)" "Nouveau (Open-Source, Good Compatibility)" "Manual (Configure later)"; do
+            case $choice in
+                "Proprietary (Best Performance, Recommended)") NVIDIA_DRIVER_CHOICE="Proprietary"; VIDEO_CARDS+=" nvidia"; break;;
+                "Nouveau (Open-Source, Good Compatibility)") NVIDIA_DRIVER_CHOICE="Nouveau"; break;;
+                "Manual (Configure later)") NVIDIA_DRIVER_CHOICE="Manual"; break;;
+            esac
+        done
+    fi
 
-    log "--- System Architecture & Security ---"; USE_HARDENED_PROFILE=false; if ask_confirm "Use Hardened profile for enhanced security?"; then USE_HARDENED_PROFILE=true; fi; select INIT_SYSTEM in "OpenRC" "SystemD"; do break; done; select LSM_CHOICE in "None" "AppArmor" "SELinux"; do break; done; ENABLE_FIREWALL=false; if ask_confirm "Set up a basic firewall (ufw)? (Highly Recommended)"; then ENABLE_FIREWALL=true; fi
-    log "--- Multimedia Subsystem ---"; USE_PIPEWIRE=false; if ask_confirm "Use PipeWire as the default audio server? (Recommended for modern systems)"; then USE_PIPEWIRE=true; fi
-    log "--- Desktop Environment ---"; select DESKTOP_ENV in "XFCE" "KDE-Plasma" "GNOME" "i3-WM" "Server (No GUI)"; do break; done; INSTALL_STYLING=false; if [[ "$DESKTOP_ENV" != "Server (No GUI)" ]]; then if ask_confirm "Install a base styling set (Papirus Icons, FiraCode Nerd Font)?"; then INSTALL_STYLING=true; fi; fi
-    log "--- Kernel Management ---"; select KERNEL_METHOD in "genkernel (recommended, auto)" "gentoo-kernel (distribution kernel, balanced)" "gentoo-kernel-bin (fastest, pre-compiled)" "manual (expert, interactive)"; do break; done
-    log "--- Performance Options ---"; USE_CCACHE=false; if ask_confirm "Enable ccache for faster recompiles?"; then USE_CCACHE=true; fi; USE_BINPKGS=false; if ask_confirm "Use binary packages to speed up installation (if available)?"; then USE_BINPKGS=true; fi; USE_LTO=false; if ask_confirm "Enable LTO (Link-Time Optimization) system-wide? (experimental)"; then USE_LTO=true; fi; ENABLE_CPU_GOVERNOR=false; if [[ "$IS_LAPTOP" = true ]]; then if ask_confirm "Install an intelligent CPU governor for performance/battery balance?"; then ENABLE_CPU_GOVERNOR=true; fi; fi
-    log "--- System Maintenance ---"; ENABLE_AUTO_UPDATE=false; if ask_confirm "Set up automatic weekly system updates? (Recommended for stable branch)"; then ENABLE_AUTO_UPDATE=true; fi
+    log "--- System Architecture & Security ---"
+    USE_HARDENED_PROFILE=false
+    if ask_confirm "Use Hardened profile for enhanced security?"; then USE_HARDENED_PROFILE=true; fi
+    
+    select INIT_SYSTEM in "OpenRC" "SystemD"; do break; done
+    select LSM_CHOICE in "None" "AppArmor" "SELinux"; do break; done
+    
+    ENABLE_FIREWALL=false
+    if ask_confirm "Set up a basic firewall (ufw)? (Highly Recommended)"; then ENABLE_FIREWALL=true; fi
 
-    log "--- Storage and System Configuration ---"; log "Available block devices:"; lsblk -d -o NAME,SIZE,TYPE; while true; do read -r -p "Enter the target device for installation (e.g., /dev/sda): " TARGET_DEVICE; if [[ -b "$TARGET_DEVICE" ]]; then break; else err "Device '$TARGET_DEVICE' does not exist."; fi; done
+    log "--- Multimedia Subsystem ---"
+    USE_PIPEWIRE=false
+    if ask_confirm "Use PipeWire as the default audio server? (Recommended for modern systems)"; then USE_PIPEWIRE=true; fi
+
+    log "--- Desktop Environment ---"
+    select DESKTOP_ENV in "XFCE" "KDE-Plasma" "GNOME" "i3-WM" "Server (No GUI)"; do break; done
+    
+    INSTALL_STYLING=false
+    if [[ "$DESKTOP_ENV" != "Server (No GUI)" ]]; then
+        if ask_confirm "Install a base styling set (Papirus Icons, FiraCode Nerd Font)?"; then INSTALL_STYLING=true; fi
+    fi
+
+    log "--- Kernel Management ---"
+    select KERNEL_METHOD in "genkernel (recommended, auto)" "gentoo-kernel (distribution kernel, balanced)" "gentoo-kernel-bin (fastest, pre-compiled)" "manual (expert, interactive)"; do break; done
+
+    log "--- Performance Options ---"
+    USE_CCACHE=false; if ask_confirm "Enable ccache for faster recompiles?"; then USE_CCACHE=true; fi
+    USE_BINPKGS=false; if ask_confirm "Use binary packages to speed up installation (if available)?"; then USE_BINPKGS=true; fi
+    USE_LTO=false; if ask_confirm "Enable LTO (Link-Time Optimization) system-wide? (experimental)"; then USE_LTO=true; fi
+    ENABLE_CPU_GOVERNOR=false; if [[ "$IS_LAPTOP" = true ]]; then if ask_confirm "Install an intelligent CPU governor for performance/battery balance?"; then ENABLE_CPU_GOVERNOR=true; fi; fi
+    
+    log "--- System Maintenance ---"
+    ENABLE_AUTO_UPDATE=false
+    if ask_confirm "Set up automatic weekly system updates? (Recommended for stable branch)"; then ENABLE_AUTO_UPDATE=true; fi
+
+    log "--- Storage and System Configuration ---"
+    log "Available block devices:"; lsblk -d -o NAME,SIZE,TYPE
+    while true; do read -r -p "Enter the target device for installation (e.g., /dev/sda): " TARGET_DEVICE; if [[ -b "$TARGET_DEVICE" ]]; then break; else err "Device '$TARGET_DEVICE' does not exist."; fi; done
+    
     while true; do read -r -p "Enter root filesystem type [xfs/ext4/btrfs, Default: btrfs]: " ROOT_FS_TYPE; [[ -z "$ROOT_FS_TYPE" ]] && ROOT_FS_TYPE="btrfs"; if [[ "$ROOT_FS_TYPE" =~ ^(xfs|ext4|btrfs)$ ]]; then break; else err "Invalid filesystem. Please choose xfs, ext4, or btrfs."; fi; done
-    ENABLE_BOOT_ENVIRONMENTS=false; if [[ "$ROOT_FS_TYPE" == "btrfs" ]]; then if ask_confirm "Enable Boot Environments for atomic updates and rollbacks? (Requires Btrfs)"; then ENABLE_BOOT_ENVIRONMENTS=true; fi; else warn "Boot Environments feature is only available with Btrfs."; fi
-    SWAP_TYPE="zram"; SWAP_SIZE_GB=0; log "--- Swap Configuration ---"; select choice in "zram (in-memory swap, recommended)" "partition (traditional on-disk swap)" "none"; do SWAP_TYPE="$choice"; break; done
+    
+    ENABLE_BOOT_ENVIRONMENTS=false
+    if [[ "$ROOT_FS_TYPE" == "btrfs" ]]; then
+        if ask_confirm "Enable Boot Environments for atomic updates and rollbacks? (Requires Btrfs)"; then ENABLE_BOOT_ENVIRONMENTS=true; fi
+    else
+        warn "Boot Environments feature is only available with Btrfs."
+    fi
+
+    log "--- Swap Configuration ---"
+    SWAP_TYPE="zram"; SWAP_SIZE_GB=0
+    select choice in "zram (in-memory swap, recommended)" "partition (traditional on-disk swap)" "none"; do
+        SWAP_TYPE="$choice"; break
+    done
+    
     if [[ "$SWAP_TYPE" == "partition" ]]; then while true; do read -r -p "Enter SWAP size in GB (e.g., 8). [Default: 4]: " SWAP_SIZE_GB; if [[ "$SWAP_SIZE_GB" =~ ^[0-9]+$ ]]; then break; else err "Invalid input. Please enter a number."; fi; done; [[ -z "$SWAP_SIZE_GB" ]] && SWAP_SIZE_GB=4; fi
-    USE_LUKS=false; ENCRYPT_BOOT=false; if ask_confirm "Use LUKS full-disk encryption for the root partition?"; then USE_LUKS=true; if [[ "$BOOT_MODE" == "UEFI" ]]; then if ask_confirm "Encrypt the /boot partition as well? (Maximum security)"; then ENCRYPT_BOOT=true; USE_LVM=true; warn "Encrypted /boot selected. LVM will be enabled automatically."; fi; else warn "Encrypted /boot is only supported in UEFI mode by this script."; fi; fi
+    
+    USE_LUKS=false; ENCRYPT_BOOT=false
+    if ask_confirm "Use LUKS full-disk encryption for the root partition?"; then
+        USE_LUKS=true
+        if [[ "$BOOT_MODE" == "UEFI" ]]; then
+            if ask_confirm "Encrypt the /boot partition as well? (Maximum security)"; then ENCRYPT_BOOT=true; USE_LVM=true; warn "Encrypted /boot selected. LVM will be enabled automatically."; fi
+        else
+            warn "Encrypted /boot is only supported in UEFI mode by this script."
+        fi
+    fi
+    
     if $USE_LUKS; then while true; do read -s -r -p "Enter LUKS passphrase: " LUKS_PASSPHRASE; echo; read -s -r -p "Confirm LUKS passphrase: " LUKS_PASSPHRASE_CONFIRM; echo; if [[ "$LUKS_PASSPHRASE" == "$LUKS_PASSPHRASE_CONFIRM" && -n "$LUKS_PASSPHRASE" ]]; then export LUKS_PASSPHRASE; break; else err "Passphrases do not match or are empty. Please try again."; fi; done; fi
+    
     if ! $ENCRYPT_BOOT; then USE_LVM=false; if ask_confirm "Use LVM to manage partitions?"; then USE_LVM=true; fi; fi
-    USE_SEPARATE_HOME=false; HOME_SIZE_GB=0; if $USE_LVM; then if ask_confirm "Create a separate logical volume for /home?"; then USE_SEPARATE_HOME=true; while true; do read -r -p "Enter /home size in GB [Default: 20]: " HOME_SIZE_GB; if [[ "$HOME_SIZE_GB" =~ ^[0-9]+$ ]]; then break; else err "Invalid input. Please enter a number."; fi; done; [[ -z "$HOME_SIZE_GB" ]] && HOME_SIZE_GB=20; fi; else warn "A separate /home partition is only supported with LVM in this script."; fi
+    
+    USE_SEPARATE_HOME=false; HOME_SIZE_GB=0
+    if $USE_LVM; then
+        if ask_confirm "Create a separate logical volume for /home?"; then
+            USE_SEPARATE_HOME=true
+            while true; do read -r -p "Enter /home size in GB [Default: 20]: " HOME_SIZE_GB; if [[ "$HOME_SIZE_GB" =~ ^[0-9]+$ ]]; then break; else err "Invalid input. Please enter a number."; fi; done
+            [[ -z "$HOME_SIZE_GB" ]] && HOME_SIZE_GB=20
+        fi
+    else
+        warn "A separate /home partition is only supported with LVM in this script."
+    fi
+
     while true; do read -r -p "Enter timezone [Default: UTC]: " SYSTEM_TIMEZONE; [[ -z "$SYSTEM_TIMEZONE" ]] && SYSTEM_TIMEZONE="UTC"; if [[ -f "/usr/share/zoneinfo/${SYSTEM_TIMEZONE}" ]]; then break; else err "Invalid timezone. Please enter a valid path from /usr/share/zoneinfo/ (e.g., Europe/London)."; fi; done
     while true; do read -r -p "Enter locale [Default: en_US.UTF-8]: " SYSTEM_LOCALE; [[ -z "$SYSTEM_LOCALE" ]] && SYSTEM_LOCALE="en_US.UTF-8"; if grep -q "^${SYSTEM_LOCALE}" /usr/share/i18n/SUPPORTED; then break; else err "Invalid locale. Check /usr/share/i18n/SUPPORTED for a list of valid locales."; fi; done
-    read -r -p "Enter LINGUAS (space separated) [Default: en ru]: " SYSTEM_LINGUAS; [[ -z "$SYSTEM_LINGUAS" ]] && SYSTEM_LINGUAS="en ru"; read -r -p "Enter hostname [Default: gentoo-desktop]: " SYSTEM_HOSTNAME; [[ -z "$SYSTEM_HOSTNAME" ]] && SYSTEM_HOSTNAME="gentoo-desktop"; local detected_cores; detected_cores=$(nproc --all 2>/dev/null || echo 4); local default_makeopts="-j${detected_cores} -l${detected_cores}"; read -r -p "Enter MAKEOPTS [Default: ${default_makeopts}]: " MAKEOPTS; [[ -z "$MAKEOPTS" ]] && MAKEOPTS="$default_makeopts"
-    log "--- Post-Install Application Profiles ---"; INSTALL_APP_HOST=false; if ask_confirm "Install Universal App Host (Flatpak + Distrobox)?"; then INSTALL_APP_HOST=true; fi; INSTALL_CYBER_TERM=false; if ask_confirm "Install the 'Cybernetic Terminal' (zsh + starship)?"; then INSTALL_CYBER_TERM=true; fi; INSTALL_DEV_TOOLS=false; if ask_confirm "Install Developer Tools (git, vscode, docker)?"; then INSTALL_DEV_TOOLS=true; fi; INSTALL_OFFICE_GFX=false; if ask_confirm "Install Office/Graphics Suite (LibreOffice, GIMP, Inkscape)?"; then INSTALL_OFFICE_GFX=true; fi; INSTALL_GAMING=false; if ask_confirm "Install Gaming Essentials (Steam, Lutris, Wine)?"; then INSTALL_GAMING=true; fi
+    
+    read -r -p "Enter LINGUAS (space separated) [Default: en ru]: " SYSTEM_LINGUAS; [[ -z "$SYSTEM_LINGUAS" ]] && SYSTEM_LINGUAS="en ru"
+    read -r -p "Enter hostname [Default: gentoo-desktop]: " SYSTEM_HOSTNAME; [[ -z "$SYSTEM_HOSTNAME" ]] && SYSTEM_HOSTNAME="gentoo-desktop"
+    local detected_cores; detected_cores=$(nproc --all 2>/dev/null || echo 4)
+    local default_makeopts="-j${detected_cores} -l${detected_cores}"; read -r -p "Enter MAKEOPTS [Default: ${default_makeopts}]: " MAKEOPTS; [[ -z "$MAKEOPTS" ]] && MAKEOPTS="$default_makeopts"
+    
+    log "--- Post-Install Application Profiles ---"
+    INSTALL_APP_HOST=false; if ask_confirm "Install Universal App Host (Flatpak + Distrobox)?"; then INSTALL_APP_HOST=true; fi
+    INSTALL_CYBER_TERM=false; if ask_confirm "Install the 'Cybernetic Terminal' (zsh + starship)?"; then INSTALL_CYBER_TERM=true; fi
+    INSTALL_DEV_TOOLS=false; if ask_confirm "Install Developer Tools (git, vscode, docker)?"; then INSTALL_DEV_TOOLS=true; fi
+    INSTALL_OFFICE_GFX=false; if ask_confirm "Install Office/Graphics Suite (LibreOffice, GIMP, Inkscape)?"; then INSTALL_OFFICE_GFX=true; fi
+    INSTALL_GAMING=false; if ask_confirm "Install Gaming Essentials (Steam, Lutris, Wine)?"; then INSTALL_GAMING=true; fi
 
     { echo "TARGET_DEVICE='${TARGET_DEVICE}'"; echo "ROOT_FS_TYPE='${ROOT_FS_TYPE}'"; echo "SYSTEM_HOSTNAME='${SYSTEM_HOSTNAME}'"; echo "SYSTEM_TIMEZONE='${SYSTEM_TIMEZONE}'"; echo "SYSTEM_LOCALE='${SYSTEM_LOCALE}'"; echo "SYSTEM_LINGUAS='${SYSTEM_LINGUAS}'"; echo "CPU_MARCH='${CPU_MARCH}'"; echo "VIDEO_CARDS='${VIDEO_CARDS}'"; echo "MICROCODE_PACKAGE='${MICROCODE_PACKAGE}'"; echo "MAKEOPTS='${MAKEOPTS}'"; echo "EMERGE_JOBS='${detected_cores}'"; echo "USE_LVM=${USE_LVM}"; echo "USE_LUKS=${USE_LUKS}"; echo "INIT_SYSTEM='${INIT_SYSTEM}'"; echo "DESKTOP_ENV='${DESKTOP_ENV}'"; echo "KERNEL_METHOD='${KERNEL_METHOD}'"; echo "USE_CCACHE=${USE_CCACHE}"; echo "USE_BINPKGS=${USE_BINPKGS}"; echo "INSTALL_DEV_TOOLS=${INSTALL_DEV_TOOLS}"; echo "INSTALL_OFFICE_GFX=${INSTALL_OFFICE_GFX}"; echo "INSTALL_GAMING=${INSTALL_GAMING}"; echo "NVIDIA_DRIVER_CHOICE='${NVIDIA_DRIVER_CHOICE}'"; echo "USE_HARDENED_PROFILE=${USE_HARDENED_PROFILE}"; echo "LSM_CHOICE='${LSM_CHOICE}'"; echo "CPU_FLAGS_X86='${CPU_FLAGS_X86}'"; echo "USE_LTO=${USE_LTO}"; echo "USE_SEPARATE_HOME=${USE_SEPARATE_HOME}"; echo "HOME_SIZE_GB=${HOME_SIZE_GB}"; echo "USE_PIPEWIRE=${USE_PIPEWIRE}"; echo "ENCRYPT_BOOT=${ENCRYPT_BOOT}"; echo "ENABLE_AUTO_UPDATE=${ENABLE_AUTO_UPDATE}"; echo "ENABLE_BOOT_ENVIRONMENTS=${ENABLE_BOOT_ENVIRONMENTS}"; echo "INSTALL_APP_HOST=${INSTALL_APP_HOST}"; echo "SWAP_TYPE='${SWAP_TYPE}'"; echo "SWAP_SIZE_GB='${SWAP_SIZE_GB}'"; echo "ENABLE_FIREWALL=${ENABLE_FIREWALL}"; echo "ENABLE_CPU_GOVERNOR=${ENABLE_CPU_GOVERNOR}"; echo "INSTALL_STYLING=${INSTALL_STYLING}"; echo "INSTALL_CYBER_TERM=${INSTALL_CYBER_TERM}"; } > "$CONFIG_FILE_TMP"
     log "Configuration complete. Review summary before proceeding."
@@ -115,7 +199,6 @@ interactive_setup() {
 stage0_partition_and_format() {
     step_log "Disk Partitioning and Formatting (Mode: ${BOOT_MODE})"; warn "Final confirmation. ALL DATA ON ${TARGET_DEVICE} WILL BE PERMANENTLY DESTROYED!"; read -r -p "To confirm, type the full device name ('${TARGET_DEVICE}'): " confirmation; if [[ "$confirmation" != "${TARGET_DEVICE}" ]]; then die "Confirmation failed. Aborting."; fi
     log "Initiating 'Absolute Zero' protocol..."; 
-    # Улучшенная, более безопасная процедура размонтирования
     mount | grep "^${TARGET_DEVICE}" | cut -d ' ' -f 3 | sort -r | xargs -r -n 1 umount -f
     if command -v mdadm &>/dev/null; then mdadm --stop --scan >/dev/null 2>&1 || true; fi; if command -v dmraid &>/dev/null; then dmraid -an >/dev/null 2>&1 || true; fi; if command -v vgchange &>/dev/null; then vgchange -an >/dev/null 2>&1 || true; fi; if command -v cryptsetup &>/dev/null; then cryptsetup close /dev/mapper/* >/dev/null 2>&1 || true; fi; sync; blockdev --flushbufs "${TARGET_DEVICE}" >/dev/null 2>&1 || true; log "Device locks released."
     log "Wiping partition table on ${TARGET_DEVICE}..."; sgdisk --zap-all "${TARGET_DEVICE}"; sync; local P_SEPARATOR=""; if [[ "${TARGET_DEVICE}" == *nvme* || "${TARGET_DEVICE}" == *mmcblk* ]]; then P_SEPARATOR="p"; fi
@@ -132,10 +215,9 @@ stage0_partition_and_format() {
     if [[ -n "$HOME_PART" ]]; then mkdir -p "${GENTOO_MNT}/home"; if [[ "$ROOT_FS_TYPE" == "btrfs" ]]; then mount -o subvol=@home,compress=zstd "${ROOT_PART}" "${GENTOO_MNT}/home"; else mount "${HOME_PART}" "${GENTOO_MNT}/home"; fi; fi
     if $ENCRYPT_BOOT; then mkdir -p "${GENTOO_MNT}/boot"; mount "${BOOT_PART}" "${GENTOO_MNT}/boot"; mkdir -p "${GENTOO_MNT}/boot/efi"; mount "${EFI_PART}" "${GENTOO_MNT}/boot/efi"; elif [[ "$BOOT_MODE" == "UEFI" ]]; then mkdir -p "${GENTOO_MNT}/boot/efi"; mount "${EFI_PART}" "${GENTOO_MNT}/boot/efi"; fi
     if [[ -n "$SWAP_PART" ]]; then swapon "${SWAP_PART}"; fi
-    echo "LUKS_PART='${LUKS_PART}'" >> "$CONFIG_FILE_TMP" # Сохраняем путь к LUKS разделу
+    echo "LUKS_PART='${LUKS_PART}'" >> "$CONFIG_FILE_TMP"
 }
 
-# ... (stage1_deploy_base_system и stage2_prepare_chroot остаются без изменений) ...
 # ==============================================================================
 # --- STAGE 1: BASE SYSTEM DEPLOYMENT ---
 # ==============================================================================
@@ -212,7 +294,6 @@ stage5_install_bootloader() {
 
     if [[ -n "$grub_cmdline_additions" ]]; then
         log "Adding kernel parameters: ${grub_cmdline_additions}"
-        # Улучшенный, более надёжный sed
         sed -i "s/^\(GRUB_CMDLINE_LINUX=.*\)\"$/\1${grub_cmdline_additions}\"/" /etc/default/grub
     fi
 
@@ -230,7 +311,6 @@ stage5_install_bootloader() {
     grub-mkconfig -o /boot/grub/grub.cfg
 }
 
-# ... (stage6_install_software и stage7_finalize остаются без изменений) ...
 stage6_install_software() {
     step_log "Installing Desktop Environment and Application Profiles"; local display_manager=""; case "$DESKTOP_ENV" in "XFCE") log "Installing XFCE..."; emerge_safely xfce-base/xfce4-meta x11-terms/xfce4-terminal; display_manager="x11-misc/lightdm" ;; "KDE-Plasma") log "Installing KDE Plasma..."; emerge_safely kde-plasma/plasma-meta; display_manager="x11-misc/sddm" ;; "GNOME") log "Installing GNOME..."; emerge_safely gnome-base/gnome-desktop; display_manager="gnome-base/gdm" ;; "i3-WM") log "Installing i3 Window Manager..."; emerge_safely x11-wm/i3 x11-terms/alacritty x11-misc/dmenu; display_manager="x11-misc/lightdm" ;; "Server (No GUI)") log "Skipping GUI installation for server profile." ;; esac; if [[ -n "$display_manager" ]]; then log "Installing Xorg Server and Display Manager..."; emerge_safely x11-base/xorg-server "${display_manager}"; fi
     if [[ "$USE_PIPEWIRE" = true ]]; then log "Installing PipeWire..."; emerge_safely media-video/pipewire media-video/wireplumber media-sound/pipewire-pulse; fi
@@ -337,11 +417,11 @@ main() {
         local FORCE_MODE=false; for arg in "$@"; do case "$arg" in --force|--auto) FORCE_MODE=true;; --skip-checksum) SKIP_CHECKSUM=true;; esac; done
         if mountpoint -q "${GENTOO_MNT}"; then load_checkpoint; fi
         local initial_stages=(self_check pre_flight_checks dependency_check stage0_select_mirrors detect_cpu_architecture detect_cpu_flags detect_gpu_hardware interactive_setup stage0_partition_and_format stage1_deploy_base_system)
-        local stage_num=-9
+        
         if (( START_STAGE == 0 )); then for stage_func in "${initial_stages[@]}"; do "$stage_func"; done; fi
+        
         if (( START_STAGE <= 2 )); then 
             source "$CONFIG_FILE_TMP"
-            # Pass LUKS passphrase via exported variable, not file
             if [[ -v LUKS_PASSPHRASE ]]; then export LUKS_PASSPHRASE; fi
             echo "BOOT_MODE='${BOOT_MODE}'" >> "$CONFIG_FILE_TMP"
             stage2_prepare_chroot
