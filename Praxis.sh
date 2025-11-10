@@ -6,7 +6,6 @@
 #
 # This version enhances the GPU detection logic to provide informative feedback
 # for AMD and Intel hardware, while retaining the strategic choice for NVIDIA.
-# As requested, checksum verification for the stage3 tarball is now disabled
 # by default, accompanied by a critical, explicit user warning to acknowledge
 # the associated security risks.
 
