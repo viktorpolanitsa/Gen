@@ -2,19 +2,14 @@
 # shellcheck disable=SC1091,SC2016
 
 # The Gentoo Genesis Engine
-# Version: 4.0 "The Chimera Slayer"
+# Version: 10.1 "The Unblinking Eye"
 #
 # Changelog:
-# - v10.0: MASSIVE BUGFIX AND ROBUSTNESS RELEASE.
-#          - FIXED: Fatal Btrfs subvolume mounting logic.
-#          - FIXED: Non-functional atomic update script (now uses a proper chroot).
-#          - FIXED: GPU detection logic for hybrid graphics systems.
-#          - FIXED: Race conditions and environment errors for Distrobox and Theming
-#            by using a robust first-login script.
-#          - FIXED: Added validation for all numeric user inputs.
-#          - CHANGED: Checksum verification is now ENABLED by default.
+# - v10.1: CRITICAL BUGFIX: Explicitly create the /usr/src/linux symlink after
+#          installing kernel sources to prevent the "kernel source directory not found"
+#          error with genkernel and manual compilation.
+# - v10.0: Massive bugfix and robustness release.
 # - v9.0: Added Cybernetic Terminal, Intelligent Governor, Theming, and Firewall.
-# - v8.0: Added zram and seamless Distrobox integration.
 
 set -euo pipefail
 
@@ -32,7 +27,6 @@ HOME_PART=""
 SWAP_PART=""
 BOOT_MODE=""
 IS_LAPTOP=false
-### ИЗМЕНЕНО: ПРОВЕРКА КС ВКЛЮЧЕНА ПО УМОЛЧАНИЮ ###
 SKIP_CHECKSUM=false
 CPU_VENDOR=""
 CPU_MODEL_NAME=""
@@ -76,30 +70,7 @@ stage0_select_mirrors() { step_log "Selecting Fastest Mirrors"; if ask_confirm "
 # ==============================================================================
 detect_cpu_architecture() { step_log "Hardware Detection Engine (CPU)"; if ! command -v lscpu >/dev/null; then warn "lscpu command not found. Falling back to generic settings."; CPU_VENDOR="Generic"; CPU_MODEL_NAME="Unknown"; CPU_MARCH="x86-64"; MICROCODE_PACKAGE=""; VIDEO_CARDS="vesa fbdev"; return; fi; CPU_MODEL_NAME=$(lscpu | grep "Model name" | sed -e 's/Model name:[[:space:]]*//'); local vendor_id; vendor_id=$(lscpu | grep "Vendor ID" | awk '{print $3}'); log "Detected CPU Model: ${CPU_MODEL_NAME}"; case "$vendor_id" in "GenuineIntel") CPU_VENDOR="Intel"; MICROCODE_PACKAGE="sys-firmware/intel-microcode"; case "$CPU_MODEL_NAME" in *14th*Gen*|*13th*Gen*|*12th*Gen*) CPU_MARCH="alderlake" ;; *11th*Gen*) CPU_MARCH="tigerlake" ;; *10th*Gen*) CPU_MARCH="icelake-client" ;; *9th*Gen*|*8th*Gen*|*7th*Gen*|*6th*Gen*) CPU_MARCH="skylake" ;; *Core*2*) CPU_MARCH="core2" ;; *) warn "Unrecognized Intel CPU. Attempting to detect native march with GCC."; if command -v gcc &>/dev/null; then local native_march; native_march=$(gcc -march=native -Q --help=target | grep -- '-march=' | awk '{print $2}'); if [[ -n "$native_march" ]]; then CPU_MARCH="$native_march"; log "Successfully detected native GCC march: ${CPU_MARCH}"; else warn "GCC native march detection failed. Falling back to generic x86-64."; CPU_MARCH="x86-64"; fi; else warn "GCC not found. Falling back to a generic but safe architecture."; CPU_MARCH="x86-64"; fi ;; esac ;; "AuthenticAMD") CPU_VENDOR="AMD"; MICROCODE_PACKAGE="sys-firmware/amd-microcode"; case "$CPU_MODEL_NAME" in *Ryzen*9*7*|*Ryzen*7*7*|*Ryzen*5*7*) CPU_MARCH="znver4" ;; *Ryzen*9*5*|*Ryzen*7*5*|*Ryzen*5*5*) CPU_MARCH="znver3" ;; *Ryzen*9*3*|*Ryzen*7*3*|*Ryzen*5*3*) CPU_MARCH="znver2" ;; *Ryzen*7*2*|*Ryzen*5*2*|*Ryzen*7*1*|*Ryzen*5*1*) CPU_MARCH="znver1" ;; *FX*) CPU_MARCH="bdver4" ;; *) warn "Unrecognized AMD CPU. Attempting to detect native march with GCC."; if command -v gcc &>/dev/null; then local native_march; native_march=$(gcc -march=native -Q --help=target | grep -- '-march=' | awk '{print $2}'); if [[ -n "$native_march" ]]; then CPU_MARCH="$native_march"; log "Successfully detected native GCC march: ${CPU_MARCH}"; else warn "GCC native march detection failed. Falling back to generic x86-64."; CPU_MARCH="x86-64"; fi; else warn "GCC not found. Falling back to a generic but safe architecture."; CPU_MARCH="x86-64"; fi ;; esac ;; *) die "Unsupported CPU Vendor: ${vendor_id}. This script is for x86_64 systems." ;; esac; log "Auto-selected -march=${CPU_MARCH} for your ${CPU_VENDOR} CPU."; }
 detect_cpu_flags() { log "Hardware Detection Engine (CPU Flags)"; if command -v emerge &>/dev/null && ! command -v cpuid2cpuflags &>/dev/null; then if ask_confirm "Utility 'cpuid2cpuflags' not found. Install it to detect optimal CPU USE flags?"; then emerge -q app-portage/cpuid2cpuflags; fi; fi; if command -v cpuid2cpuflags &>/dev/null; then log "Detecting CPU-specific USE flags..."; CPU_FLAGS_X86=$(cpuid2cpuflags | cut -d' ' -f2-); log "Detected CPU_FLAGS_X86: ${CPU_FLAGS_X86}"; else warn "Skipping CPU flag detection."; fi; }
-### ИСПРАВЛЕНО: Логика для гибридной графики ###
-detect_gpu_hardware() {
-    step_log "Hardware Detection Engine (GPU)"
-    local gpu_info; gpu_info=$(lspci | grep -i 'vga\|3d\|2d')
-    log "Detected GPUs:\n${gpu_info}"
-    VIDEO_CARDS="vesa fbdev" # Start with fallbacks
-    if echo "$gpu_info" | grep -iq "intel"; then
-        log "Intel GPU detected. Adding 'intel i965' drivers."
-        VIDEO_CARDS+=" intel i965"
-        GPU_VENDOR="Intel" # Set as default, may be overridden
-    fi
-    if echo "$gpu_info" | grep -iq "amd\|ati"; then
-        log "AMD/ATI GPU detected. Adding 'amdgpu radeonsi' drivers."
-        VIDEO_CARDS+=" amdgpu radeonsi"
-        GPU_VENDOR="AMD" # Override if AMD is present
-    fi
-    if echo "$gpu_info" | grep -iq "nvidia"; then
-        log "NVIDIA GPU detected. Adding 'nouveau' driver for kernel support."
-        VIDEO_CARDS+=" nouveau"
-        GPU_VENDOR="NVIDIA" # NVIDIA gets highest priority for user interaction
-    fi
-    log "Final VIDEO_CARDS for make.conf: ${VIDEO_CARDS}"
-    log "Primary GPU vendor for user interaction: ${GPU_VENDOR}"
-}
+detect_gpu_hardware() { step_log "Hardware Detection Engine (GPU)"; local gpu_info; gpu_info=$(lspci | grep -i 'vga\|3d\|2d'); log "Detected GPUs:\n${gpu_info}"; VIDEO_CARDS="vesa fbdev"; if echo "$gpu_info" | grep -iq "intel"; then log "Intel GPU detected. Adding 'intel i965' drivers."; VIDEO_CARDS+=" intel i965"; GPU_VENDOR="Intel"; fi; if echo "$gpu_info" | grep -iq "amd\|ati"; then log "AMD/ATI GPU detected. Adding 'amdgpu radeonsi' drivers."; VIDEO_CARDS+=" amdgpu radeonsi"; GPU_VENDOR="AMD"; fi; if echo "$gpu_info" | grep -iq "nvidia"; then log "NVIDIA GPU detected. Adding 'nouveau' driver for kernel support."; VIDEO_CARDS+=" nouveau"; GPU_VENDOR="NVIDIA"; fi; log "Final VIDEO_CARDS for make.conf: ${VIDEO_CARDS}"; log "Primary GPU vendor for user interaction: ${GPU_VENDOR}"; }
 
 # ==============================================================================
 # --- STAGE 0B: INTERACTIVE SETUP WIZARD ---
@@ -148,8 +119,6 @@ stage0_partition_and_format() {
         log "Creating main Linux partition..."; sgdisk -n ${MAIN_PART_NUM}:0:0 -t ${MAIN_PART_NUM}:8300 -c ${MAIN_PART_NUM}:"Gentoo Root" "${TARGET_DEVICE}"; local MAIN_PART="${TARGET_DEVICE}${P_SEPARATOR}${MAIN_PART_NUM}"; sync; partprobe "${TARGET_DEVICE}"; sleep 3; if [[ "$BOOT_MODE" == "UEFI" ]]; then log "Formatting EFI partition..."; wipefs -a "${EFI_PART}"; mkfs.vfat -F 32 "${EFI_PART}"; fi; if [[ -n "$SWAP_PART" ]]; then log "Formatting SWAP partition..."; wipefs -a "${SWAP_PART}"; mkswap "${SWAP_PART}"; fi; local device_to_format="${MAIN_PART}"; if $USE_LUKS; then log "Creating LUKS container on ${MAIN_PART}..."; echo -n "${LUKS_PASSPHRASE}" | cryptsetup luksFormat --type luks2 --cipher aes-xts-plain64 --key-size 512 --hash sha512 --iter-time 5000 --use-random "${MAIN_PART}" -; log "Opening LUKS container..."; echo -n "${LUKS_PASSPHRASE}" | cryptsetup open "${MAIN_PART}" gentoo_crypted -; device_to_format="/dev/mapper/gentoo_crypted"; echo "LUKS_UUID=$(cryptsetup luksUUID "${MAIN_PART}")" >> "$CONFIG_FILE_TMP"; fi; if $USE_LVM; then log "Setting up LVM on ${device_to_format}..."; pvcreate "${device_to_format}"; vgcreate gentoo_vg "${device_to_format}"; if [[ "$SWAP_TYPE" == "partition" && "$SWAP_SIZE_GB" -gt 0 ]]; then log "Creating SWAP logical volume..."; lvcreate -L "${SWAP_SIZE_GB}G" -n swap gentoo_vg; SWAP_PART="/dev/gentoo_vg/swap"; mkswap "${SWAP_PART}"; fi; if $USE_SEPARATE_HOME; then log "Creating Home logical volume..."; lvcreate -L "${HOME_SIZE_GB}G" -n home gentoo_vg; HOME_PART="/dev/gentoo_vg/home"; fi; log "Creating Root logical volume..."; lvcreate -l 100%FREE -n root gentoo_vg; ROOT_PART="/dev/gentoo_vg/root"; else ROOT_PART="${device_to_format}"; fi
     fi
     log "Formatting root/home filesystems..."; wipefs -a "${ROOT_PART}"; if [[ -n "$HOME_PART" ]]; then wipefs -a "${HOME_PART}"; fi; case "$ROOT_FS_TYPE" in "xfs") mkfs.xfs -f "${ROOT_PART}"; if [[ -n "$HOME_PART" ]]; then mkfs.xfs -f "${HOME_PART}"; fi ;; "ext4") mkfs.ext4 -F "${ROOT_PART}"; if [[ -n "$HOME_PART" ]]; then mkfs.ext4 -F "${HOME_PART}"; fi ;; "btrfs") mkfs.btrfs -f "${ROOT_PART}"; if [[ -n "$HOME_PART" ]]; then mkfs.btrfs -f "${HOME_PART}"; fi;; esac; sync
-    
-    ### ИСПРАВЛЕНО: Логика монтирования Btrfs ###
     log "Mounting partitions..."; local BTRFS_TMP_MNT; if [[ "$ROOT_FS_TYPE" == "btrfs" ]]; then BTRFS_TMP_MNT=$(mktemp -d); mount "${ROOT_PART}" "${BTRFS_TMP_MNT}"; log "Creating Btrfs subvolumes..."; btrfs subvolume create "${BTRFS_TMP_MNT}/@"; btrfs subvolume create "${BTRFS_TMP_MNT}/@home"; if [[ "$ENABLE_BOOT_ENVIRONMENTS" = true ]]; then btrfs subvolume create "${BTRFS_TMP_MNT}/@snapshots"; fi; umount "${BTRFS_TMP_MNT}"; rmdir "${BTRFS_TMP_MNT}"; fi
     mkdir -p "${GENTOO_MNT}"; if [[ "$ROOT_FS_TYPE" == "btrfs" ]]; then mount -o subvol=@,compress=zstd,noatime "${ROOT_PART}" "${GENTOO_MNT}"; else mount "${ROOT_PART}" "${GENTOO_MNT}"; fi
     if [[ -n "$HOME_PART" ]]; then mkdir -p "${GENTOO_MNT}/home"; if [[ "$ROOT_FS_TYPE" == "btrfs" ]]; then mount -o subvol=@home,compress=zstd "${ROOT_PART}" "${GENTOO_MNT}/home"; else mount "${HOME_PART}" "${GENTOO_MNT}/home"; fi; fi
@@ -198,7 +167,34 @@ EOF
 # ==============================================================================
 stage3_configure_in_chroot() { step_log "System Configuration (Inside Chroot)"; source /etc/profile; export PS1="(chroot) ${PS1:-}"; log "Syncing Portage tree snapshot..."; emerge_safely -q --sync; local profile_base="default/linux/amd64/17.1"; if [[ "$USE_HARDENED_PROFILE" = true ]]; then profile_base+="/hardened"; fi; local profile_desktop=""; if [[ "$DESKTOP_ENV" == "KDE-Plasma" ]]; then profile_desktop="/desktop/plasma"; fi; if [[ "$DESKTOP_ENV" == "GNOME" ]]; then profile_desktop="/desktop/gnome"; fi; if [[ "$DESKTOP_ENV" != "Server (No GUI)" && -z "$profile_desktop" ]]; then profile_desktop="/desktop"; fi; local profile_init=""; if [[ "$INIT_SYSTEM" == "SystemD" ]]; then profile_init="/systemd"; fi; local GENTOO_PROFILE="${profile_base}${profile_desktop}${profile_init}"; log "Setting system profile to: ${GENTOO_PROFILE}"; eselect profile set "${GENTOO_PROFILE}"; if [[ "$USE_CCACHE" = true ]]; then log "Setting up ccache..."; emerge_safely app-misc/ccache; ccache -M 50G; fi; step_log "Installing Kernel Headers and Core System Utilities"; emerge_safely sys-kernel/linux-headers; if [[ "$USE_LVM" = true ]]; then emerge_safely sys-fs/lvm2; fi; if [[ "$USE_LUKS" = true ]]; then emerge_safely sys-fs/cryptsetup; fi; if [[ "$LSM_CHOICE" == "AppArmor" ]]; then emerge_safely sys-apps/apparmor; fi; if [[ "$LSM_CHOICE" == "SELinux" ]]; then emerge_safely sys-libs/libselinux sys-apps/policycoreutils; fi; if [[ -n "$MICROCODE_PACKAGE" ]]; then log "Installing CPU microcode package: ${MICROCODE_PACKAGE}"; emerge_safely "${MICROCODE_PACKAGE}"; else warn "No specific microcode package to install."; fi; log "Configuring timezone and locale..."; ln -sf "/usr/share/zoneinfo/${SYSTEM_TIMEZONE}" /etc/localtime; echo "${SYSTEM_LOCALE} UTF-8" > /etc/locale.gen; echo "en_US.UTF-8 UTF-8" >> /etc/locale.gen; locale-gen; eselect locale set "${SYSTEM_LOCALE}"; env-update && source /etc/profile; log "Setting hostname..."; echo "hostname=\"${SYSTEM_HOSTNAME}\"" > /etc/conf.d/hostname; }
 
-stage4_build_world_and_kernel() { step_log "Updating @world set and Building Kernel"; log "Building @world set..."; emerge_safely --update --deep --newuse @world; log "Installing firmware..."; emerge_safely sys-kernel/linux-firmware; case "$KERNEL_METHOD" in "genkernel (recommended, auto)") log "Installing kernel sources..."; emerge_safely sys-kernel/gentoo-sources; log "Building kernel with genkernel"; emerge_safely sys-kernel/genkernel; local genkernel_opts="--install"; if [[ "$USE_LVM" = true ]]; then genkernel_opts+=" --lvm"; fi; if [[ "$USE_LUKS" = true ]]; then genkernel_opts+=" --luks"; fi; log "Running genkernel with options: ${genkernel_opts}"; genkernel "${genkernel_opts}" all ;; "gentoo-kernel (distribution kernel, balanced)") log "Installing distribution kernel..."; emerge_safely sys-kernel/gentoo-kernel ;; "gentoo-kernel-bin (fastest, pre-compiled)") log "Installing pre-compiled binary kernel..."; emerge_safely sys-kernel/gentoo-kernel-bin ;; "manual (expert, interactive)") log "Installing kernel sources..."; emerge_safely sys-kernel/gentoo-sources; log "Starting manual kernel configuration..."; cd /usr/src/linux; warn "INTERACTIVE STEP REQUIRED: Please configure your kernel now."; if [[ "$LSM_CHOICE" != "None" ]]; then warn "Don't forget to enable ${LSM_CHOICE} support in the kernel security settings!"; fi; if [[ "$NVIDIA_DRIVER_CHOICE" == "Proprietary" ]]; then warn "NVIDIA proprietary drivers selected. You MUST DISABLE the Nouveau driver in the kernel:"; warn "-> Device Drivers -> Graphics support -> Nouveau driver [ ]"; fi; make menuconfig; log "Compiling and installing kernel..."; make && make modules_install && make install ;; esac; }
+### ИСПРАВЛЕНО: Критическая ошибка сборки ядра ###
+stage4_build_world_and_kernel() {
+    step_log "Updating @world set and Building Kernel"
+    log "Building @world set..."; emerge_safely --update --deep --newuse @world
+    log "Installing firmware..."; emerge_safely sys-kernel/linux-firmware
+    case "$KERNEL_METHOD" in
+        "genkernel (recommended, auto)")
+            log "Installing kernel sources..."; emerge_safely sys-kernel/gentoo-sources
+            log "Setting the default kernel symlink..."; eselect kernel set 1
+            log "Building kernel with genkernel"; emerge_safely sys-kernel/genkernel
+            local genkernel_opts="--install"; if [[ "$USE_LVM" = true ]]; then genkernel_opts+=" --lvm"; fi; if [[ "$USE_LUKS" = true ]]; then genkernel_opts+=" --luks"; fi
+            log "Running genkernel with options: ${genkernel_opts}"; genkernel "${genkernel_opts}" all
+            ;;
+        "gentoo-kernel (distribution kernel, balanced)")
+            log "Installing distribution kernel..."; emerge_safely sys-kernel/gentoo-kernel
+            ;;
+        "gentoo-kernel-bin (fastest, pre-compiled)")
+            log "Installing pre-compiled binary kernel..."; emerge_safely sys-kernel/gentoo-kernel-bin
+            ;;
+        "manual (expert, interactive)")
+            log "Installing kernel sources..."; emerge_safely sys-kernel/gentoo-sources
+            log "Setting the default kernel symlink..."; eselect kernel set 1
+            log "Starting manual kernel configuration..."; cd /usr/src/linux
+            warn "INTERACTIVE STEP REQUIRED: Please configure your kernel now."; if [[ "$LSM_CHOICE" != "None" ]]; then warn "Don't forget to enable ${LSM_CHOICE} support in the kernel security settings!"; fi; if [[ "$NVIDIA_DRIVER_CHOICE" == "Proprietary" ]]; then warn "NVIDIA proprietary drivers selected. You MUST DISABLE the Nouveau driver in the kernel:"; warn "-> Device Drivers -> Graphics support -> Nouveau driver [ ]"; fi
+            make menuconfig; log "Compiling and installing kernel..."; make && make modules_install && make install
+            ;;
+    esac
+}
 
 stage5_install_bootloader() { step_log "Installing GRUB Bootloader (Mode: ${BOOT_MODE})"; local grub_cmdline=""; if [[ "$USE_LUKS" = true && ! "$ENCRYPT_BOOT" = true ]]; then log "Configuring GRUB for LUKS (standard)..."; local P_SEPARATOR=""; if [[ "${TARGET_DEVICE}" == *nvme* || "${TARGET_DEVICE}" == *mmcblk* ]]; then P_SEPARATOR="p"; fi; local MAIN_PART_NUM=2; local MAIN_PART="${TARGET_DEVICE}${P_SEPARATOR}${MAIN_PART_NUM}"; local LUKS_DEVICE_UUID; LUKS_DEVICE_UUID=$(blkid -s UUID -o value "${MAIN_PART}"); local ROOT_DEVICE_PATH="/dev/mapper/gentoo_crypted"; if [[ "$USE_LVM" = true ]]; then ROOT_DEVICE_PATH="/dev/gentoo_vg/root"; fi; grub_cmdline+="crypt_device=UUID=${LUKS_DEVICE_UUID}:gentoo_crypted root=${ROOT_DEVICE_PATH}"; fi; if [[ "$LSM_CHOICE" == "AppArmor" ]]; then grub_cmdline+=" apparmor=1 security=apparmor"; fi; if [[ "$LSM_CHOICE" == "SELinux" ]]; then grub_cmdline+=" selinux=1 security=selinux"; fi; if [[ -n "$grub_cmdline" ]]; then log "Adding kernel parameters: ${grub_cmdline}"; sed -i "s/GRUB_CMDLINE_LINUX=\"\"/GRUB_CMDLINE_LINUX=\"${grub_cmdline}\"/" /etc/default/grub; fi; if [[ "$USE_LUKS" = true ]]; then log "Enabling GRUB cryptodisk feature..."; echo 'GRUB_ENABLE_CRYPTODISK=y' >> /etc/default/grub; fi; emerge_safely --noreplace sys-boot/grub:2; if [[ "$BOOT_MODE" == "UEFI" ]]; then grub-install --target=x86_64-efi --efi-directory=/boot/efi; else grub-install "${TARGET_DEVICE}"; fi; grub-mkconfig -o /boot/grub/grub.cfg; }
 
@@ -211,45 +207,34 @@ stage6_install_software() {
 }
 
 stage7_finalize() {
-    step_log "Finalizing System"
-    log "Enabling system-wide services..."; if [[ "$ENABLE_FIREWALL" = true ]]; then log "Configuring and enabling firewall..."; ufw default deny incoming; ufw default allow outgoing; ufw enable; if [[ "$INIT_SYSTEM" == "OpenRC" ]]; then rc-update add ufw default; else systemctl enable ufw.service; fi; fi; if [[ "$ENABLE_CPU_GOVERNOR" = true ]]; then log "Enabling intelligent CPU governor..."; if [[ "$INIT_SYSTEM" == "OpenRC" ]]; then rc-update add auto-cpufreq default; else systemctl enable auto-cpufreq.service; fi; fi; if [[ "$SWAP_TYPE" == "zram" ]]; then log "Configuring zram..."; local ram_size_mb; ram_size_mb=$(free -m | awk '/^Mem:/{print $2}'); local zram_size; zram_size=$((ram_size_mb / 2)); cat > /etc/conf.d/zram-init <<EOF
+    step_log "Finalizing System"; log "Enabling system-wide services..."; if [[ "$ENABLE_FIREWALL" = true ]]; then log "Configuring and enabling firewall..."; ufw default deny incoming; ufw default allow outgoing; ufw enable; if [[ "$INIT_SYSTEM" == "OpenRC" ]]; then rc-update add ufw default; else systemctl enable ufw.service; fi; fi; if [[ "$ENABLE_CPU_GOVERNOR" = true ]]; then log "Enabling intelligent CPU governor..."; if [[ "$INIT_SYSTEM" == "OpenRC" ]]; then rc-update add auto-cpufreq default; else systemctl enable auto-cpufreq.service; fi; fi; if [[ "$SWAP_TYPE" == "zram" ]]; then log "Configuring zram..."; local ram_size_mb; ram_size_mb=$(free -m | awk '/^Mem:/{print $2}'); local zram_size; zram_size=$((ram_size_mb / 2)); cat > /etc/conf.d/zram-init <<EOF
 ZRAM_SIZE=${zram_size}\nZRAM_COMP_ALGORITHM=zstd
 EOF
 ; if [[ "$INIT_SYSTEM" == "OpenRC" ]]; then rc-update add zram-init default; else systemctl enable zram-init.service; fi; fi
     log "Enabling core services (${INIT_SYSTEM})..."; if [[ "$INIT_SYSTEM" == "OpenRC" ]]; then if [[ "$USE_LVM" = true ]]; then rc-update add lvm default; fi; rc-update add dbus default; if [[ "$DESKTOP_ENV" != "Server (No GUI)" ]]; then rc-update add display-manager default; fi; rc-update add NetworkManager default; else if [[ "$USE_LVM" = true ]]; then systemctl enable lvm2-monitor.service; fi; if [[ "$DESKTOP_ENV" != "Server (No GUI)" ]]; then systemctl enable display-manager.service; fi; systemctl enable NetworkManager.service; fi
     if [[ "$ENABLE_AUTO_UPDATE" = true ]]; then
         log "Setting up automatic weekly updates..."; local update_script_path="/usr/local/bin/gentoo-update.sh"
-        ### ИСПРАВЛЕНО: Рабочий скрипт обновления для Btrfs BE ###
         if [[ "$ENABLE_BOOT_ENVIRONMENTS" = true ]]; then
             cat > "$update_script_path" <<'EOF'
 #!/bin/bash
-# Automated Gentoo Update Script with Boot Environments
 set -euo pipefail
 TIMESTAMP=$(date +"%Y-%m-%d_%H-%M-%S")
 CURRENT_ROOT_SUBVOL_PATH=$(findmnt -n -o SOURCE / | awk -F, '{for(i=1;i<=NF;i++)if($i~/^subvol=/)print $i}' | sed 's/subvol=//')
-SNAPSHOT_PATH="/.snapshots/update_${TIMESTAMP}" # Relative to the real FS root
+SNAPSHOT_PATH="/.snapshots/update_${TIMESTAMP}"
 log() { echo ">>> $*"; }
 cleanup() {
-    umount -R "${SNAPSHOT_PATH}/proc" || true
-    umount -R "${SNAPSHOT_PATH}/dev" || true
-    umount -R "${SNAPSHOT_PATH}/sys" || true
+    umount -R "${SNAPSHOT_PATH}/proc" 2>/dev/null || true
+    umount -R "${SNAPSHOT_PATH}/dev" 2>/dev/null || true
+    umount -R "${SNAPSHOT_PATH}/sys" 2>/dev/null || true
 }
 trap cleanup EXIT
-
 log "Creating new read-write snapshot: ${SNAPSHOT_PATH}"
 btrfs subvolume snapshot "${CURRENT_ROOT_SUBVOL_PATH}" "${SNAPSHOT_PATH}"
-
 log "Preparing chroot environment for the new snapshot..."
-mount --rbind /proc "${SNAPSHOT_PATH}/proc"
-mount --rbind /dev "${SNAPSHOT_PATH}/dev"
-mount --rbind /sys "${SNAPSHOT_PATH}/sys"
-cp /etc/resolv.conf "${SNAPSHOT_PATH}/etc/"
-
+mount --rbind /proc "${SNAPSHOT_PATH}/proc"; mount --rbind /dev "${SNAPSHOT_PATH}/dev"; mount --rbind /sys "${SNAPSHOT_PATH}/sys"; cp /etc/resolv.conf "${SNAPSHOT_PATH}/etc/"
 log "Starting update inside the chroot..."
 chroot "${SNAPSHOT_PATH}" /bin/bash -c "source /etc/profile; emerge --update --deep --newuse --keep-going -q @world && emerge --depclean -q"
-
-log "Update complete. Updating GRUB to detect the new environment..."
-grub-mkconfig -o /boot/grub/grub.cfg
+log "Update complete. Updating GRUB to detect the new environment..."; grub-mkconfig -o /boot/grub/grub.cfg
 log "SUCCESS! Reboot and select the new snapshot from the GRUB menu."
 EOF
         else
@@ -270,13 +255,11 @@ EOF
 
     log "Configuring sudo for 'wheel' group..."; echo '%wheel ALL=(ALL:ALL) ALL' > /etc/sudoers.d/wheel; log "Set a password for the 'root' user:"; passwd root; log "Creating a new user..."; local new_user=""; while true; do read -r -p "Enter a username: " new_user; if [[ "$new_user" =~ ^[a-z_][a-z0-9_-]*[$]?$ ]]; then break; else err "Invalid username."; new_user=""; fi; done; useradd -m -G wheel,users,audio,video,usb -s /bin/bash "$new_user"; if [[ "$INSTALL_APP_HOST" = true ]]; then usermod -aG podman "$new_user"; fi; log "Set a password for user '$new_user':"; passwd "$new_user"; log "User '$new_user' created."
 
-    ### ИСПРАВЛЕНО: Надежная настройка через скрипт первого входа ###
-    log "Creating first-login setup script for user '${new_user}'..."
-    local first_login_script_path="/home/${new_user}/.first_login.sh"
+    log "Creating first-login setup script for user '${new_user}'..."; local first_login_script_path="/home/${new_user}/.first_login.sh"
     cat > "$first_login_script_path" <<EOF
 #!/bin/bash
 echo ">>> Performing one-time user setup..."
-
+(
 if [[ "${INSTALL_STYLING}" = true ]]; then
     echo ">>> Applying base styling..."
     case "${DESKTOP_ENV}" in
@@ -289,39 +272,26 @@ if [[ "${INSTALL_STYLING}" = true ]]; then
             ;;
     esac
 fi
-
 if [[ "${INSTALL_APP_HOST}" = true ]]; then
     echo ">>> Creating Distrobox container (this may take a few minutes)..."
     distrobox-create --name ubuntu --image ubuntu:latest --yes
 fi
-
+) &> /home/${new_user}/.first_login.log
 echo ">>> Setup complete. This script will now self-destruct."
 rm -- "\$0"
 EOF
-    chmod +x "$first_login_script_path"
-    chown "${new_user}:${new_user}" "$first_login_script_path"
-
-    local shell_profile_path="/home/${new_user}/.profile"
+    chmod +x "$first_login_script_path"; chown "${new_user}:${new_user}" "$first_login_script_path"
+    local shell_profile_path="/home/${new_user}/.profile"; local shell_rc_path="/home/${new_user}/.bashrc"
     if [[ "$INSTALL_CYBER_TERM" = true ]]; then
-        log "Setting up Cybernetic Terminal for user '${new_user}'..."
-        chsh -s /bin/zsh "${new_user}"
-        local zshrc_path="/home/${new_user}/.zshrc"
-        echo 'eval "$(starship init zsh)"' > "$zshrc_path"
-        if [[ "$INSTALL_APP_HOST" = true ]]; then cat >> "$zshrc_path" <<'EOF'
-if command -v distrobox-enter &> /dev/null; then alias apt="distrobox-enter ubuntu -- sudo apt"; fi
-EOF
-        fi
-        chown "${new_user}:${new_user}" "$zshrc_path"
-        shell_profile_path="/home/${new_user}/.zprofile"
-    elif [[ "$INSTALL_APP_HOST" = true ]]; then
-        local bashrc_path="/home/${new_user}/.bashrc"
-        cat >> "$bashrc_path" <<'EOF'
+        log "Setting up Cybernetic Terminal for user '${new_user}'..."; chsh -s /bin/zsh "${new_user}"; shell_rc_path="/home/${new_user}/.zshrc"; shell_profile_path="/home/${new_user}/.zprofile"
+        echo 'eval "$(starship init zsh)"' > "$shell_rc_path"; chown "${new_user}:${new_user}" "$shell_rc_path"
+    fi
+    if [[ "$INSTALL_APP_HOST" = true ]]; then
+        log "Adding Distrobox aliases to ${shell_rc_path}..."; cat >> "$shell_rc_path" <<'EOF'
 if command -v distrobox-enter &> /dev/null; then alias apt="distrobox-enter ubuntu -- sudo apt"; fi
 EOF
     fi
-    
-    echo "if [ -f \"\$HOME/.first_login.sh\" ]; then . \"\$HOME/.first_login.sh\"; fi" >> "$shell_profile_path"
-    chown "${new_user}:${new_user}" "$shell_profile_path"
+    echo "if [ -f \"\$HOME/.first_login.sh\" ]; then . \"\$HOME/.first_login.sh\"; fi" >> "$shell_profile_path"; chown "${new_user}:${new_user}" "$shell_profile_path"
 
     log "Installation complete."; log "Finalizing disk writes..."; sync; log "Run: exit -> umount -R ${GENTOO_MNT} -> reboot"
 }
