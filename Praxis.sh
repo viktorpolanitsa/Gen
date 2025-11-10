@@ -2,14 +2,15 @@
 # shellcheck disable=SC1091,SC2016
 
 # The Gentoo Genesis Engine
-# Version: 10.1 "The Unblinking Eye"
+# Version: 10.3 "The Unchained"
 #
 # Changelog:
-# - v10.1: CRITICAL BUGFIX: Explicitly create the /usr/src/linux symlink after
-#          installing kernel sources to prevent the "kernel source directory not found"
-#          error with genkernel and manual compilation.
+# - v10.3: Reverted SKIP_CHECKSUM to 'true' by default per user request,
+#          restoring the original behavior of prioritizing speed while
+#          retaining the interactive security warning.
+# - v10.2: Major refactoring and bugfix release.
+# - v10.1: CRITICAL BUGFIX: Explicitly create the /usr/src/linux symlink.
 # - v10.0: Massive bugfix and robustness release.
-# - v9.0: Added Cybernetic Terminal, Intelligent Governor, Theming, and Firewall.
 
 set -euo pipefail
 
@@ -27,7 +28,8 @@ HOME_PART=""
 SWAP_PART=""
 BOOT_MODE=""
 IS_LAPTOP=false
-SKIP_CHECKSUM=false
+### ИЗМЕНЕНО: ПРОВЕРКА КС ОТКЛЮЧЕНА ПО УМОЛЧАНИЮ ###
+SKIP_CHECKSUM=true
 CPU_VENDOR=""
 CPU_MODEL_NAME=""
 CPU_MARCH=""
@@ -167,32 +169,20 @@ EOF
 # ==============================================================================
 stage3_configure_in_chroot() { step_log "System Configuration (Inside Chroot)"; source /etc/profile; export PS1="(chroot) ${PS1:-}"; log "Syncing Portage tree snapshot..."; emerge_safely -q --sync; local profile_base="default/linux/amd64/17.1"; if [[ "$USE_HARDENED_PROFILE" = true ]]; then profile_base+="/hardened"; fi; local profile_desktop=""; if [[ "$DESKTOP_ENV" == "KDE-Plasma" ]]; then profile_desktop="/desktop/plasma"; fi; if [[ "$DESKTOP_ENV" == "GNOME" ]]; then profile_desktop="/desktop/gnome"; fi; if [[ "$DESKTOP_ENV" != "Server (No GUI)" && -z "$profile_desktop" ]]; then profile_desktop="/desktop"; fi; local profile_init=""; if [[ "$INIT_SYSTEM" == "SystemD" ]]; then profile_init="/systemd"; fi; local GENTOO_PROFILE="${profile_base}${profile_desktop}${profile_init}"; log "Setting system profile to: ${GENTOO_PROFILE}"; eselect profile set "${GENTOO_PROFILE}"; if [[ "$USE_CCACHE" = true ]]; then log "Setting up ccache..."; emerge_safely app-misc/ccache; ccache -M 50G; fi; step_log "Installing Kernel Headers and Core System Utilities"; emerge_safely sys-kernel/linux-headers; if [[ "$USE_LVM" = true ]]; then emerge_safely sys-fs/lvm2; fi; if [[ "$USE_LUKS" = true ]]; then emerge_safely sys-fs/cryptsetup; fi; if [[ "$LSM_CHOICE" == "AppArmor" ]]; then emerge_safely sys-apps/apparmor; fi; if [[ "$LSM_CHOICE" == "SELinux" ]]; then emerge_safely sys-libs/libselinux sys-apps/policycoreutils; fi; if [[ -n "$MICROCODE_PACKAGE" ]]; then log "Installing CPU microcode package: ${MICROCODE_PACKAGE}"; emerge_safely "${MICROCODE_PACKAGE}"; else warn "No specific microcode package to install."; fi; log "Configuring timezone and locale..."; ln -sf "/usr/share/zoneinfo/${SYSTEM_TIMEZONE}" /etc/localtime; echo "${SYSTEM_LOCALE} UTF-8" > /etc/locale.gen; echo "en_US.UTF-8 UTF-8" >> /etc/locale.gen; locale-gen; eselect locale set "${SYSTEM_LOCALE}"; env-update && source /etc/profile; log "Setting hostname..."; echo "hostname=\"${SYSTEM_HOSTNAME}\"" > /etc/conf.d/hostname; }
 
-### ИСПРАВЛЕНО: Критическая ошибка сборки ядра ###
 stage4_build_world_and_kernel() {
-    step_log "Updating @world set and Building Kernel"
-    log "Building @world set..."; emerge_safely --update --deep --newuse @world
-    log "Installing firmware..."; emerge_safely sys-kernel/linux-firmware
+    step_log "Updating @world set and Building Kernel"; log "Building @world set..."; emerge_safely --update --deep --newuse @world; log "Installing firmware..."; emerge_safely sys-kernel/linux-firmware
     case "$KERNEL_METHOD" in
-        "genkernel (recommended, auto)")
+        "genkernel (recommended, auto)"|"manual (expert, interactive)")
             log "Installing kernel sources..."; emerge_safely sys-kernel/gentoo-sources
             log "Setting the default kernel symlink..."; eselect kernel set 1
-            log "Building kernel with genkernel"; emerge_safely sys-kernel/genkernel
-            local genkernel_opts="--install"; if [[ "$USE_LVM" = true ]]; then genkernel_opts+=" --lvm"; fi; if [[ "$USE_LUKS" = true ]]; then genkernel_opts+=" --luks"; fi
-            log "Running genkernel with options: ${genkernel_opts}"; genkernel "${genkernel_opts}" all
+            if [[ "$KERNEL_METHOD" == "genkernel (recommended, auto)" ]]; then
+                log "Building kernel with genkernel"; emerge_safely sys-kernel/genkernel; local genkernel_opts="--install"; if [[ "$USE_LVM" = true ]]; then genkernel_opts+=" --lvm"; fi; if [[ "$USE_LUKS" = true ]]; then genkernel_opts+=" --luks"; fi; log "Running genkernel with options: ${genkernel_opts}"; genkernel "${genkernel_opts}" all
+            else
+                log "Starting manual kernel configuration..."; cd /usr/src/linux; warn "INTERACTIVE STEP REQUIRED: Please configure your kernel now."; if [[ "$LSM_CHOICE" != "None" ]]; then warn "Don't forget to enable ${LSM_CHOICE} support in the kernel security settings!"; fi; if [[ "$NVIDIA_DRIVER_CHOICE" == "Proprietary" ]]; then warn "NVIDIA proprietary drivers selected. You MUST DISABLE the Nouveau driver in the kernel:"; warn "-> Device Drivers -> Graphics support -> Nouveau driver [ ]"; fi; make menuconfig; log "Compiling and installing kernel..."; make && make modules_install && make install
+            fi
             ;;
-        "gentoo-kernel (distribution kernel, balanced)")
-            log "Installing distribution kernel..."; emerge_safely sys-kernel/gentoo-kernel
-            ;;
-        "gentoo-kernel-bin (fastest, pre-compiled)")
-            log "Installing pre-compiled binary kernel..."; emerge_safely sys-kernel/gentoo-kernel-bin
-            ;;
-        "manual (expert, interactive)")
-            log "Installing kernel sources..."; emerge_safely sys-kernel/gentoo-sources
-            log "Setting the default kernel symlink..."; eselect kernel set 1
-            log "Starting manual kernel configuration..."; cd /usr/src/linux
-            warn "INTERACTIVE STEP REQUIRED: Please configure your kernel now."; if [[ "$LSM_CHOICE" != "None" ]]; then warn "Don't forget to enable ${LSM_CHOICE} support in the kernel security settings!"; fi; if [[ "$NVIDIA_DRIVER_CHOICE" == "Proprietary" ]]; then warn "NVIDIA proprietary drivers selected. You MUST DISABLE the Nouveau driver in the kernel:"; warn "-> Device Drivers -> Graphics support -> Nouveau driver [ ]"; fi
-            make menuconfig; log "Compiling and installing kernel..."; make && make modules_install && make install
-            ;;
+        "gentoo-kernel (distribution kernel, balanced)") log "Installing distribution kernel..."; emerge_safely sys-kernel/gentoo-kernel ;;
+        "gentoo-kernel-bin (fastest, pre-compiled)") log "Installing pre-compiled binary kernel..."; emerge_safely sys-kernel/gentoo-kernel-bin ;;
     esac
 }
 
@@ -222,18 +212,11 @@ TIMESTAMP=$(date +"%Y-%m-%d_%H-%M-%S")
 CURRENT_ROOT_SUBVOL_PATH=$(findmnt -n -o SOURCE / | awk -F, '{for(i=1;i<=NF;i++)if($i~/^subvol=/)print $i}' | sed 's/subvol=//')
 SNAPSHOT_PATH="/.snapshots/update_${TIMESTAMP}"
 log() { echo ">>> $*"; }
-cleanup() {
-    umount -R "${SNAPSHOT_PATH}/proc" 2>/dev/null || true
-    umount -R "${SNAPSHOT_PATH}/dev" 2>/dev/null || true
-    umount -R "${SNAPSHOT_PATH}/sys" 2>/dev/null || true
-}
+cleanup() { umount -R "${SNAPSHOT_PATH}/proc" 2>/dev/null || true; umount -R "${SNAPSHOT_PATH}/dev" 2>/dev/null || true; umount -R "${SNAPSHOT_PATH}/sys" 2>/dev/null || true; }
 trap cleanup EXIT
-log "Creating new read-write snapshot: ${SNAPSHOT_PATH}"
-btrfs subvolume snapshot "${CURRENT_ROOT_SUBVOL_PATH}" "${SNAPSHOT_PATH}"
-log "Preparing chroot environment for the new snapshot..."
-mount --rbind /proc "${SNAPSHOT_PATH}/proc"; mount --rbind /dev "${SNAPSHOT_PATH}/dev"; mount --rbind /sys "${SNAPSHOT_PATH}/sys"; cp /etc/resolv.conf "${SNAPSHOT_PATH}/etc/"
-log "Starting update inside the chroot..."
-chroot "${SNAPSHOT_PATH}" /bin/bash -c "source /etc/profile; emerge --update --deep --newuse --keep-going -q @world && emerge --depclean -q"
+log "Creating new read-write snapshot: ${SNAPSHOT_PATH}"; btrfs subvolume snapshot "${CURRENT_ROOT_SUBVOL_PATH}" "${SNAPSHOT_PATH}"
+log "Preparing chroot environment for the new snapshot..."; mount --rbind /proc "${SNAPSHOT_PATH}/proc"; mount --rbind /dev "${SNAPSHOT_PATH}/dev"; mount --rbind /sys "${SNAPSHOT_PATH}/sys"; cp /etc/resolv.conf "${SNAPSHOT_PATH}/etc/"
+log "Starting update inside the chroot..."; chroot "${SNAPSHOT_PATH}" /bin/bash -c "source /etc/profile; emerge --update --deep --newuse --keep-going -q @world && emerge --depclean -q"
 log "Update complete. Updating GRUB to detect the new environment..."; grub-mkconfig -o /boot/grub/grub.cfg
 log "SUCCESS! Reboot and select the new snapshot from the GRUB menu."
 EOF
@@ -325,3 +308,4 @@ if [[ "${1:-}" != "--chrooted" ]]; then
 else
     main "$@"
 fi
+````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````-`-`````-`-
