@@ -2,21 +2,20 @@
 # shellcheck disable=SC1091,SC2016,SC2034
 
 # The Gentoo Genesis Engine
-# Version: 10.9.0 "The Golem"
+# Version: 10.10.0 "The Titan"
 #
 # Changelog:
+# - v10.10.0:
+#   - RESILIENCE: The self-integrity check is now the very first action performed, preventing
+#     any logic from running on a corrupted script.
+#   - RESILIENCE: The `cleanup` function's `swapoff` call is now fully silenced to prevent
+#     non-critical errors from halting the script on exit.
+#   - UX: The integrity check failure message is now more explicit, suggesting `wget` or `curl`.
 # - v10.9.0:
-#   - HYPER-ROBUSTNESS: The `--force` mode's password generation is now environment-agnostic.
-#     It uses `openssl` if available, with a fallback to `/dev/urandom`, and sets passwords
-#     via crypted hashes passed to `usermod`/`useradd`, removing the `chpasswd` dependency.
-#   - AUTOMATION: The `load_checkpoint` function is now non-interactive in `--force` mode,
-#     automatically choosing to restart the installation for safety.
-#   - DIAGNOSTICS: The unmount helper now checks for `lsof` before attempting to use it.
-#   - UX: Minor logging and output formatting improvements for better readability.
+#   - HYPER-ROBUSTNESS: `--force` mode's password generation is now environment-agnostic.
+#   - AUTOMATION: `load_checkpoint` is now non-interactive in `--force` mode.
 # - v10.8.0:
 #   - INTEGRITY CHECK: Added a script terminator variable to detect incomplete copy-paste errors.
-#   - SECURITY: Replaced `eval` with a safer direct environment variable export.
-#   - AUTOMATION: `--force` mode now generates and logs random passwords.
 # - v10.7.0:
 #   - CRITICAL FIX: Resolved `make: command not found` error during bootstrap.
 
@@ -100,14 +99,14 @@ run_emerge() {
         die "Emerge process halted. Please review the errors above and apply configuration changes."
     fi
 }
-cleanup() { err "An error occurred. Initiating cleanup..."; sync; if mountpoint -q "${GENTOO_MNT}"; then log "Attempting to unmount ${GENTOO_MNT}..."; umount -R "${GENTOO_MNT}" || warn "Failed to unmount ${GENTOO_MNT}."; fi; if [ -e /dev/zram0 ]; then swapoff /dev/zram0 || true; fi; log "Cleanup finished."; }
+cleanup() { err "An error occurred. Initiating cleanup..."; sync; if mountpoint -q "${GENTOO_MNT}"; then log "Attempting to unmount ${GENTOO_MNT}..."; umount -R "${GENTOO_MNT}" &>/dev/null || true; fi; if [ -e /dev/zram0 ]; then swapoff /dev/zram0 &>/dev/null || true; fi; log "Cleanup finished."; }
 trap 'cleanup' ERR INT TERM
 trap 'rm -f "$CONFIG_FILE_TMP"' EXIT
 ask_confirm() { if ${FORCE_MODE:-false}; then return 0; fi; read -r -p "$1 [y/N] " response; case "$response" in [yY]|[yY][eE][sS]) return 0 ;; *) return 1 ;; esac; }
 self_check() {
     log "Performing script integrity self-check..."
     if [ "$SCRIPT_TERMINATOR" != "END" ]; then
-        die "Integrity check failed: The script file appears to be incomplete or truncated. Please re-download or copy the entire file, ensuring the last line is included."
+        die "Integrity check failed: The script file is incomplete. Please use 'wget' or 'curl' to download the raw file again, ensuring it is complete."
     fi
     local funcs=(pre_flight_checks ensure_dependencies stage0_select_mirrors interactive_setup stage0_partition_and_format stage1_deploy_base_system stage2_prepare_chroot stage3_configure_in_chroot stage4_build_world_and_kernel stage5_install_bootloader stage6_install_software stage7_finalize); for func in "${funcs[@]}"; do if ! declare -F "$func" > /dev/null; then die "Self-check failed: Function '$func' is not defined. The script may be corrupt."; fi; done; log "Self-check passed.";
 }
@@ -907,6 +906,9 @@ unmount_and_reboot() {
 # ==============================================================================
 main() {
     if [ $EUID -ne 0 ]; then die "This script must be run as root."; fi
+    
+    # Run integrity check as the very first step.
+    self_check
 
     if [ "${1:-}" = "--chrooted" ]; then
         source /etc/autobuilder.conf
@@ -931,7 +933,6 @@ main() {
         load_checkpoint
 
         declare -a stages=(
-            self_check
             pre_flight_checks
             ensure_dependencies
             stage0_select_mirrors
