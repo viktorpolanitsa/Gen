@@ -27,34 +27,6 @@
 #   - INTEGRITY CHECK: Added a script terminator variable to detect incomplete copy-paste errors.
 # - v10.7.0:
 #   - CRITICAL FIX: Resolved `make: command not found` error during bootstrap.
-# --- Self-Awareness Check ---
-SCRIPT_TERMINATOR="" # This will be set to "END" on the very last line of the script.
-
-# Validate script has been completely downloaded before proceeding
-if ! command -v head &>/dev/null || ! command -v tail &>/dev/null || ! command -v wc &>/dev/null; then
-    echo "Error: Essential utilities (head, tail, wc) are missing. Cannot perform integrity check." >&2
-    echo "This script requires a proper Gentoo LiveCD environment. Please ensure you're using the latest Gentoo Minimal Install CD." >&2
-    exit 1
-fi
-
-# Verify the script is not truncated by checking for the terminator at the end
-if [ "$(tail -n 1 "$0" | grep -c 'SCRIPT_TERMINATOR="END"')" -eq 0 ]; then
-    echo "Error: Script appears to be truncated or incomplete." >&2
-    echo "Please download the complete script using wget or curl:" >&2
-    echo "  wget https://raw.githubusercontent.com/.../script.sh" >&2
-    echo "  curl -O https://raw.githubusercontent.com/.../script.sh" >&2
-    exit 1
-fi
-
-if [ -z "$BASH_VERSION" ]; then
-    echo "Error: This script must be run with bash, not sh or dash." >&2
-    echo "Please run as: bash ${0}" >&2
-    exit 1
-fi
-
-# Set strict error handling early
-set -euo pipefail
-
 # --- Configuration and Globals ---
 GENTOO_MNT="/mnt/gentoo"
 CONFIG_FILE_TMP=""
@@ -146,7 +118,7 @@ get_blkid_uuid() {
         else
             warn "Could not get UUID for device $device using standard blkid methods."
             warn "Trying fallback method using udevadm..."
-            if command -v udevadm >/dev/null 2>&1; then
+            if command -v udevadm >/dev/null; then
                 udevadm info --query=property --name="$device" | grep -i "ID_FS_UUID=" | cut -d'=' -f2
             else
                 die "Could not get UUID for device $device. blkid command failed and udevadm is not available."
@@ -378,11 +350,6 @@ trap 'trap_handler $? EXIT' EXIT
 
 self_check() {
     log "Performing script integrity self-check..."
-    
-    # Check if script terminator is properly set
-    if [ "$SCRIPT_TERMINATOR" != "END" ]; then
-        die "Integrity check failed: The script file is incomplete. Please use 'wget' or 'curl' to download the raw file again, ensuring it is complete."
-    fi
     
     # Check required functions
     local funcs=(pre_flight_checks ensure_dependencies stage0_select_mirrors interactive_setup stage0_partition_and_format stage1_deploy_base_system stage2_prepare_chroot stage3_configure_in_chroot stage4_build_world_and_kernel stage5_install_bootloader stage6_install_software stage7_finalize unmount_and_reboot)
@@ -1637,20 +1604,20 @@ stage1_deploy_base_system() {
     log "Fetching list of recent stage3 builds from ${latest_info_url}..."
     local build_list
     local attempt_count=0
-    local max_attempts=3
+    local max_retries=3
     
-    while [ $attempt_count -lt $max_attempts ]; do
+    while [ $attempt_count -lt $max_retries ]; do
         if build_list=$(curl --fail -L -s --connect-timeout 15 "$latest_info_url" 2>/dev/null | grep -E '\.tar\.xz' | awk '{print $1}'); then
             break
         else
             attempt_count=$((attempt_count + 1))
-            warn "Attempt $attempt_count/$max_attempts to fetch stage3 list failed. Retrying in 5 seconds..."
+            warn "Attempt $attempt_count/$max_retries to fetch stage3 list failed. Retrying in 5 seconds..."
             sleep 5
         fi
     done
     
-    if [ -z "$build_list" ] || [ $attempt_count -eq $max_attempts ]; then
-        die "Could not fetch stage3 build list from ${latest_info_url} after $max_attempts attempts."
+    if [ -z "$build_list" ] || [ $attempt_count -eq $max_retries ]; then
+        die "Could not fetch stage3 build list from ${latest_info_url} after $max_retries attempts."
     fi
     
     attempt_count=0
@@ -2971,5 +2938,3 @@ else
     # In chroot, just run main
     main "$@"
 fi
-
-SCRIPT_TERMINATOR="END"
