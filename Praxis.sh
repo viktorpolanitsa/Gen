@@ -1,5 +1,5 @@
 #!/bin/bash
-# shellcheck disable=SC1091,SC2016,SC2034
+# shellcheck disable=SC1091,SC2016,SC2034,SC2154
 # The Gentoo Genesis Engine
 # Version: 10.10.1 "The Titan (Fixed & Enhanced)"
 #
@@ -817,7 +817,7 @@ interactive_setup() {
     
     if [ "$ENCRYPT_BOOT" != true ]; then
         USE_LVM=false
-        if ask_confirm "Use LVM to manage partitions? (Recommended for flexibility)"; then
+        if ask_confirm "Use LVM to manage partitions?"; then
             USE_LVM=true
         fi
     fi
