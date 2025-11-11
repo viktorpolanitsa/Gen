@@ -2,14 +2,24 @@
 # shellcheck disable=SC1091,SC2016,SC2034
 
 # The Gentoo Genesis Engine
-# Version: 10.3.15 "The Resetter"
+# Version: 10.6.0 "The Adamant"
 #
 # Changelog:
-# - v10.3.15:
-#   - CRITICAL FIX: Fixed `Device or resource busy` error when setting up ZRAM on LiveCDs
-#     that pre-configure zram devices. The script now explicitly resets the zram device
-#     before configuration, ensuring a clean state.
-# - v10.3.14: Implemented future-proofing for hardware detection and GRUB configuration.
+# - v10.6.0:
+#   - RESILIENCE: Portage sync now attempts `emerge --sync` first, falling back to `emerge-webrsync`
+#     for improved speed and reliability.
+#   - FUTURE-PROOFING: Stage3 checksum verification is now adaptive. It prefers the stronger
+#     BLAKE2b hash (`b2sum`) if available, falling back to SHA512.
+#   - UX: GRUB configuration now proactively sets a high-resolution graphics mode for better
+#     readability on modern displays.
+#   - UX: The user's first-login script now shows live output in the terminal while also logging
+#     to a file, improving transparency.
+#   - COMPLETENESS: Added the 'input' group to the new user by default to prevent potential
+#     issues with input device management.
+# - v10.5.0:
+#   - CRITICAL FIX: Resolved 'OpenMP not supported' error during LiveCD dependency installation.
+#   - ROBUSTNESS: Added `udevadm settle` to prevent fstab generation race conditions.
+#   - ROBUSTNESS: Replaced fragile `sed` for GRUB config with a more reliable method.
 
 # --- Self-Awareness Check ---
 if [ -z "$BASH_VERSION" ]; then
@@ -60,7 +70,19 @@ die() { err "$*"; exit 1; }
 # ==============================================================================
 save_checkpoint() { log "--- Checkpoint reached: Stage $1 completed. ---"; echo "$1" > "${CHECKPOINT_FILE}"; }
 load_checkpoint() { if [ -f "${CHECKPOINT_FILE}" ]; then local last_stage; last_stage=$(cat "${CHECKPOINT_FILE}"); warn "Previous installation was interrupted after Stage ${last_stage}."; read -r -p "Choose action: [C]ontinue, [R]estart from scratch, [A]bort: " choice; case "$choice" in [cC]) START_STAGE=$((last_stage + 1)); log "Resuming installation from Stage ${START_STAGE}." ;; [rR]) log "Restarting installation from scratch."; rm -f "${CHECKPOINT_FILE}" ;; *) die "Installation aborted by user." ;; esac; fi; }
-run_emerge() { log "Emerging packages: $*"; if emerge --autounmask-write=y --with-bdeps=y -v "$@"; then log "Emerge successful for: $*"; else etc-update --automode -5; die "Emerge failed for packages: '$*'. Please review the errors above. Configuration changes have been saved."; fi; }
+run_emerge() {
+    log "Emerging packages: $*"
+    if emerge --autounmask-write=y --with-bdeps=y -v "$@"; then
+        log "Emerge successful for: $*"
+    else
+        err "Emerge failed for packages: '$*'."
+        warn "This is often due to Portage needing configuration changes (USE flags, keywords, etc.)."
+        warn "The required changes have likely been written to /etc/portage."
+        warn "ACTION REQUIRED: After the script exits, run 'etc-update --automode -5' (or dispatch-conf) to apply them,"
+        warn "then restart the installation to continue."
+        die "Emerge process halted. Please review the errors above and apply configuration changes."
+    fi
+}
 cleanup() { err "An error occurred. Initiating cleanup..."; sync; if mountpoint -q "${GENTOO_MNT}"; then log "Attempting to unmount ${GENTOO_MNT}..."; umount -R "${GENTOO_MNT}" || warn "Failed to unmount ${GENTOO_MNT}."; fi; if [ -e /dev/zram0 ]; then swapoff /dev/zram0 || true; fi; log "Cleanup finished."; }
 trap 'cleanup' ERR INT TERM
 trap 'rm -f "$CONFIG_FILE_TMP"' EXIT
@@ -72,6 +94,20 @@ self_check() { log "Performing script integrity self-check..."; local funcs=(pre
 # ==============================================================================
 pre_flight_checks() { step_log "Performing Pre-flight System Checks"; log "Checking for internet connectivity..."; if ! ping -c 3 8.8.8.8 &>/dev/null; then die "No internet connection."; fi; log "Internet connection is OK."; log "Detecting boot mode..."; if [ -d /sys/firmware/efi ]; then BOOT_MODE="UEFI"; else BOOT_MODE="LEGACY"; fi; log "System booted in ${BOOT_MODE} mode."; if compgen -G "/sys/class/power_supply/BAT*" > /dev/null; then log "Laptop detected."; IS_LAPTOP=true; fi; }
 
+sync_portage_tree() {
+    log "Syncing Portage tree..."
+    if emerge --sync; then
+        log "Portage sync via git successful."
+    else
+        warn "Git sync failed, falling back to emerge-webrsync."
+        if emerge-webrsync; then
+            log "Portage sync via webrsync successful."
+        else
+            die "Failed to sync Portage tree with both git and webrsync methods."
+        fi
+    fi
+}
+
 ensure_dependencies() {
     step_log "Ensuring LiveCD Dependencies"
     if ! grep -q swap /proc/swaps; then
@@ -81,13 +117,7 @@ ensure_dependencies() {
             if modprobe zram; then
                 local total_mem_kb; total_mem_kb=$(grep MemTotal /proc/meminfo | awk '{print $2}')
                 local zram_size_kb=$(( total_mem_kb / 2 )); if [ "$zram_size_kb" -gt 2097152 ]; then zram_size_kb=2097152; fi
-                
-                ### --- КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ --- ###
-                # Принудительно сбрасываем устройство zram0 перед настройкой.
-                # Это решает проблему "Device or resource busy" на LiveCD, которые уже используют zram.
                 echo 1 > /sys/block/zram0/reset
-                ### --- КОНЕЦ ИСПРАВЛЕНИЯ --- ###
-
                 echo $(( zram_size_kb * 1024 )) > /sys/block/zram0/disksize
                 mkswap /dev/zram0; swapon /dev/zram0 -p 10; log "ZRAM swap activated successfully."
             else
@@ -99,8 +129,8 @@ ensure_dependencies() {
     fi
 
     local compiler_pkgs=""; local other_pkgs=""
-    local all_deps="curl wget sgdisk partprobe mkfs.vfat mkfs.xfs mkfs.ext4 mkfs.btrfs blkid lsblk sha512sum chroot wipefs blockdev cryptsetup pvcreate vgcreate lvcreate mkswap lscpu lspci udevadm gcc"
-    get_pkg_for_cmd() { case "$1" in curl) echo "net-misc/curl" ;; wget) echo "net-misc/wget" ;; sgdisk) echo "sys-apps/gptfdisk" ;; partprobe) echo "sys-apps/parted" ;; mkfs.vfat) echo "sys-fs/dosfstools" ;; mkfs.xfs) echo "sys-fs/xfsprogs" ;; mkfs.ext4) echo "sys-fs/e2fsprogs" ;; mkfs.btrfs) echo "sys-fs/btrfs-progs" ;; sha512sum|chroot) echo "sys-apps/coreutils" ;; lspci) echo "sys-apps/pciutils" ;; gcc) echo "sys-devel/gcc" ;; cryptsetup) echo "sys-fs/cryptsetup" ;; pvcreate|vgcreate|lvcreate) echo "sys-fs/lvm2" ;; udevadm) echo "sys-fs/udev" ;; *) echo "sys-fs/util-linux" ;; esac; }
+    local all_deps="curl wget sgdisk partprobe mkfs.vfat mkfs.xfs mkfs.ext4 mkfs.btrfs blkid lsblk sha512sum b2sum chroot wipefs blockdev cryptsetup pvcreate vgcreate lvcreate mkswap lscpu lspci udevadm gcc"
+    get_pkg_for_cmd() { case "$1" in curl) echo "net-misc/curl" ;; wget) echo "net-misc/wget" ;; sgdisk) echo "sys-apps/gptfdisk" ;; partprobe) echo "sys-apps/parted" ;; mkfs.vfat) echo "sys-fs/dosfstools" ;; mkfs.xfs) echo "sys-fs/xfsprogs" ;; mkfs.ext4) echo "sys-fs/e2fsprogs" ;; mkfs.btrfs) echo "sys-fs/btrfs-progs" ;; sha512sum|chroot) echo "sys-apps/coreutils" ;; b2sum) echo "sys-apps/coreutils" ;; lspci) echo "sys-apps/pciutils" ;; gcc) echo "sys-devel/gcc" ;; cryptsetup) echo "sys-fs/cryptsetup" ;; pvcreate|vgcreate|lvcreate) echo "sys-fs/lvm2" ;; udevadm) echo "sys-fs/udev" ;; *) echo "sys-fs/util-linux" ;; esac; }
 
     log "Checking for required tools..."
     for cmd in $all_deps; do
@@ -117,18 +147,20 @@ ensure_dependencies() {
     if [ -n "$compiler_pkgs" ] || [ -n "$other_pkgs" ]; then
         warn "Some required packages are missing. Preparing for installation."
         if ask_confirm "Do you want to proceed with automatic installation?"; then
-            log "Preparing LiveCD environment..."; emerge-webrsync || die "Failed to sync Portage tree."
+            sync_portage_tree
             local emerge_opts="-q --jobs=1 --load-average=1 --noreplace"
+            local emerge_prefix="USE=\"-openmp\""
+
             if [ -n "$compiler_pkgs" ]; then
                 log "Installing the compiler first...${compiler_pkgs}";
                 # shellcheck disable=SC2086
-                if ! emerge $emerge_opts $compiler_pkgs; then die "Failed to install the compiler (gcc)."; fi
+                if ! eval "$emerge_prefix emerge $emerge_opts $compiler_pkgs"; then die "Failed to install the compiler (gcc)."; fi
                 log "Compiler installed successfully."
             fi
             if [ -n "$other_pkgs" ]; then
                 log "Installing other required tools...${other_pkgs}";
                 # shellcheck disable=SC2086
-                if ! emerge $emerge_opts $other_pkgs; then die "Failed to install required dependencies."; fi
+                if ! eval "$emerge_prefix emerge $emerge_opts $other_pkgs"; then die "Failed to install required dependencies."; fi
                 log "Other tools installed successfully."
             fi
         else
@@ -139,7 +171,7 @@ ensure_dependencies() {
     fi
 }
 
-stage0_select_mirrors() { step_log "Selecting Fastest Mirrors"; if ask_confirm "Do you want to automatically select the fastest mirrors? (Recommended)"; then log "Syncing portage tree to get mirrorselect..."; emerge-webrsync >/dev/null; log "Installing mirrorselect..."; emerge -q app-portage/mirrorselect; log "Running mirrorselect, this may take a minute..."; FASTEST_MIRRORS=$(mirrorselect -s4 -b10 -o -D); log "Fastest mirrors selected."; else log "Skipping mirror selection. Default mirrors will be used."; fi; }
+stage0_select_mirrors() { step_log "Selecting Fastest Mirrors"; if ask_confirm "Do you want to automatically select the fastest mirrors? (Recommended)"; then log "Syncing portage tree to get mirrorselect..."; sync_portage_tree; log "Installing mirrorselect..."; emerge -q app-portage/mirrorselect; log "Running mirrorselect, this may take a minute..."; FASTEST_MIRRORS=$(mirrorselect -s4 -b10 -o -D); log "Fastest mirrors selected."; else log "Skipping mirror selection. Default mirrors will be used."; fi; }
 
 # ==============================================================================
 # --- HARDWARE DETECTION ENGINE ---
@@ -376,6 +408,9 @@ stage0_partition_and_format() {
         if [ "$USE_LVM" = true ]; then log "Setting up LVM on ${device_to_format}..."; pvcreate "${device_to_format}"; vgcreate gentoo_vg "${device_to_format}"; if [ "$SWAP_TYPE" = "partition" -a "$SWAP_SIZE_GB" -gt 0 ]; then log "Creating SWAP logical volume..."; lvcreate -L "${SWAP_SIZE_GB}G" -n swap gentoo_vg; SWAP_PART="/dev/gentoo_vg/swap"; mkswap "${SWAP_PART}"; fi; if [ "$USE_SEPARATE_HOME" = true ]; then log "Creating Home logical volume..."; lvcreate -L "${HOME_SIZE_GB}G" -n home gentoo_vg; HOME_PART="/dev/gentoo_vg/home"; fi; log "Creating Root logical volume..."; lvcreate -l 100%FREE -n root gentoo_vg; ROOT_PART="/dev/gentoo_vg/root"; else ROOT_PART="${device_to_format}"; fi
     fi
     log "Formatting root/home filesystems..."; wipefs -a "${ROOT_PART}"; if [ -n "$HOME_PART" ]; then wipefs -a "${HOME_PART}"; fi; case "$ROOT_FS_TYPE" in "xfs") mkfs.xfs -f "${ROOT_PART}"; if [ -n "$HOME_PART" ]; then mkfs.xfs -f "${HOME_PART}"; fi ;; "ext4") mkfs.ext4 -F "${ROOT_PART}"; if [ -n "$HOME_PART" ]; then mkfs.ext4 -F "${HOME_PART}"; fi ;; "btrfs") mkfs.btrfs -f "${ROOT_PART}"; if [ -n "$HOME_PART" ]; then mkfs.btrfs -f "${HOME_PART}"; fi;; esac; sync
+    
+    log "Waiting for udev to process new partition information..."; udevadm settle
+
     log "Mounting partitions..."; local BTRFS_TMP_MNT; if [ "$ROOT_FS_TYPE" = "btrfs" ]; then BTRFS_TMP_MNT=$(mktemp -d); mount "${ROOT_PART}" "${BTRFS_TMP_MNT}"; log "Creating Btrfs subvolumes..."; btrfs subvolume create "${BTRFS_TMP_MNT}/@"; btrfs subvolume create "${BTRFS_TMP_MNT}/@home"; if [ "$ENABLE_BOOT_ENVIRONMENTS" = true ]; then btrfs subvolume create "${BTRFS_TMP_MNT}/@snapshots"; fi; umount "${BTRFS_TMP_MNT}"; rmdir "${BTRFS_TMP_MNT}"; fi
     mkdir -p "${GENTOO_MNT}"; if [ "$ROOT_FS_TYPE" = "btrfs" ]; then mount -o subvol=@,compress=zstd,noatime "${ROOT_PART}" "${GENTOO_MNT}"; else mount "${ROOT_PART}" "${GENTOO_MNT}"; fi
     if [ -n "$HOME_PART" ]; then mkdir -p "${GENTOO_MNT}/home"; if [ "$ROOT_FS_TYPE" = "btrfs" ]; then mount -o subvol=@home,compress=zstd "${ROOT_PART}" "${GENTOO_MNT}/home"; else mount "${HOME_PART}" "${GENTOO_MNT}/home"; fi; fi
@@ -394,7 +429,65 @@ stage0_partition_and_format() {
     fi
 }
 
-stage1_deploy_base_system() { step_log "Base System Deployment"; local stage3_variant="openrc"; if [ "$INIT_SYSTEM" = "SystemD" ]; then stage3_variant="systemd"; fi; log "Selecting '${stage3_variant}' stage3 build based on user choice."; local success=false; local base_url="https://distfiles.gentoo.org/releases/amd64/autobuilds/"; local latest_info_url="${base_url}latest-stage3-amd64-${stage3_variant}.txt"; log "Fetching list of recent stage3 builds from ${latest_info_url}..."; local build_list; build_list=$(curl --fail -L -s --connect-timeout 15 "$latest_info_url" | grep '\.tar\.xz' | awk '{print $1}') || die "Could not fetch stage3 build list from ${latest_info_url}"; local attempt_count=0; for build_path in $build_list; do attempt_count=$((attempt_count + 1)); log "--- [Attempt ${attempt_count}] Trying build: ${build_path} ---"; local tarball_name; tarball_name=$(basename "$build_path"); local tarball_url="${base_url}${build_path}"; local local_tarball_path="${GENTOO_MNT}/${tarball_name}"; log "Downloading stage3: ${tarball_name}"; wget --tries=3 --timeout=45 -c -O "${local_tarball_path}" "$tarball_url"; if ! [ -s "${local_tarball_path}" ]; then warn "Stage3 download failed. Trying next build..."; continue; fi; local digests_url="${tarball_url}.DIGESTS"; local local_digests_path="${GENTOO_MNT}/${tarball_name}.DIGESTS"; log "Downloading digests file..."; wget --tries=3 -c -O "${local_digests_path}" "$digests_url"; if ! [ -s "${local_digests_path}" ]; then warn "Digests download failed. Trying next build..."; rm -f "${local_tarball_path}"; continue; fi; if [ "$SKIP_CHECKSUM" = true ]; then warn "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"; err "  DANGER: CHECKSUM VERIFICATION IS DISABLED!"; err "  This is a significant security risk. You are installing a"; err "  base system without verifying its integrity. Proceed only"; err "  if you understand and accept this risk."; warn "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"; read -r -p "Press ENTER to acknowledge this risk and continue..."; success=true; break; fi; log "Verifying tarball integrity with SHA512..."; pushd "${GENTOO_MNT}" >/dev/null; if grep -E "\s+${tarball_name}$" "$(basename "${local_digests_path}")" | sha512sum --strict -c -; then popd >/dev/null; log "Checksum OK. Found a valid stage3 build."; success=true; break; else popd >/dev/null; warn "Checksum FAILED for this build. Trying next."; rm -f "${local_tarball_path}" "${local_digests_path}"; fi; done; if [ "$success" = false ]; then die "Failed to find a verifiable stage3 build after trying ${attempt_count} options."; fi; log "Unpacking stage3 tarball..."; tar xpvf "${local_tarball_path}" --xattrs-include='*.*' --numeric-owner -C "${GENTOO_MNT}"; log "Base system deployed successfully."; }
+stage1_deploy_base_system() {
+    step_log "Base System Deployment"
+    local stage3_variant="openrc"; if [ "$INIT_SYSTEM" = "SystemD" ]; then stage3_variant="systemd"; fi
+    log "Selecting '${stage3_variant}' stage3 build based on user choice."
+    local success=false
+    local base_url="https://distfiles.gentoo.org/releases/amd64/autobuilds/"
+    local latest_info_url="${base_url}latest-stage3-amd64-${stage3_variant}.txt"
+    log "Fetching list of recent stage3 builds from ${latest_info_url}..."
+    local build_list; build_list=$(curl --fail -L -s --connect-timeout 15 "$latest_info_url" | grep '\.tar\.xz' | awk '{print $1}') || die "Could not fetch stage3 build list from ${latest_info_url}"
+    local attempt_count=0
+    for build_path in $build_list; do
+        attempt_count=$((attempt_count + 1))
+        log "--- [Attempt ${attempt_count}] Trying build: ${build_path} ---"
+        local tarball_name; tarball_name=$(basename "$build_path")
+        local tarball_url="${base_url}${build_path}"
+        local local_tarball_path="${GENTOO_MNT}/${tarball_name}"
+        log "Downloading stage3: ${tarball_name}"
+        wget --tries=3 --timeout=45 -c -O "${local_tarball_path}" "$tarball_url"
+        if ! [ -s "${local_tarball_path}" ]; then warn "Stage3 download failed. Trying next build..."; continue; fi
+        local digests_url="${tarball_url}.DIGESTS"
+        local local_digests_path="${GENTOO_MNT}/${tarball_name}.DIGESTS"
+        log "Downloading digests file..."
+        wget --tries=3 -c -O "${local_digests_path}" "$digests_url"
+        if ! [ -s "${local_digests_path}" ]; then warn "Digests download failed. Trying next build..."; rm -f "${local_tarball_path}"; continue; fi
+        
+        if [ "$SKIP_CHECKSUM" = true ]; then
+            warn "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"; err "  DANGER: CHECKSUM VERIFICATION IS DISABLED!"; err "  This is a significant security risk. Proceed only if you"; err "  understand and accept this risk."; warn "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"; read -r -p "Press ENTER to acknowledge this risk and continue...";
+            success=true; break
+        fi
+
+        ### --- АДАПТИВНАЯ ПРОВЕРКА ХЕША --- ###
+        local checksum_verified=false
+        for hash_cmd in b2sum sha512sum; do
+            if command -v "$hash_cmd" >/dev/null; then
+                log "Verifying tarball integrity with ${hash_cmd}...";
+                pushd "${GENTOO_MNT}" >/dev/null
+                if grep -E "\s+${tarball_name}$" "$(basename "${local_digests_path}")" | $hash_cmd --strict -c -; then
+                    popd >/dev/null
+                    log "Checksum OK with ${hash_cmd}. Found a valid stage3 build."
+                    checksum_verified=true; break
+                else
+                    popd >/dev/null
+                    warn "Checksum FAILED with ${hash_cmd} for this build."
+                fi
+            fi
+        done
+        ### --- КОНЕЦ АДАПТИВНОЙ ПРОВЕРКИ --- ###
+
+        if [ "$checksum_verified" = true ]; then
+            success=true; break
+        else
+            warn "All available checksum methods failed. Trying next build."
+            rm -f "${local_tarball_path}" "${local_digests_path}"
+        fi
+    done
+    if [ "$success" = false ]; then die "Failed to find a verifiable stage3 build after trying ${attempt_count} options."; fi
+    log "Unpacking stage3 tarball..."; tar xpvf "${local_tarball_path}" --xattrs-include='*.*' --numeric-owner -C "${GENTOO_MNT}"
+    log "Base system deployed successfully."
+}
 
 stage2_prepare_chroot() {
     step_log "Chroot Preparation"; log "Configuring Portage..."; mkdir -p "${GENTOO_MNT}/etc/portage/repos.conf"; cp "${GENTOO_MNT}/usr/share/portage/config/repos.conf" "${GENTOO_MNT}/etc/portage/repos.conf/gentoo.conf"
@@ -427,7 +520,7 @@ EOF
 # ==============================================================================
 # --- STAGES 3-7: CHROOTED OPERATIONS ---
 # ==============================================================================
-stage3_configure_in_chroot() { step_log "System Configuration (Inside Chroot)"; source /etc/profile; export PS1="(chroot) ${PS1:-}"; log "Syncing Portage tree snapshot..."; run_emerge -q --sync; local profile_base="default/linux/amd64/17.1"; if [ "$USE_HARDENED_PROFILE" = true ]; then profile_base+="/hardened"; fi; local profile_desktop=""; if [ "$DESKTOP_ENV" = "KDE-Plasma" ]; then profile_desktop="/desktop/plasma"; fi; if [ "$DESKTOP_ENV" = "GNOME" ]; then profile_desktop="/desktop/gnome"; fi; if [ "$DESKTOP_ENV" != "Server (No GUI)" -a -z "$profile_desktop" ]; then profile_desktop="/desktop"; fi; local profile_init=""; if [ "$INIT_SYSTEM" = "SystemD" ]; then profile_init="/systemd"; fi; local GENTOO_PROFILE="${profile_base}${profile_desktop}${profile_init}"; log "Setting system profile to: ${GENTOO_PROFILE}"; eselect profile set "${GENTOO_PROFILE}"; if [ "$USE_CCACHE" = true ]; then log "Setting up ccache..."; run_emerge app-misc/ccache; ccache -M 50G; fi; step_log "Installing Kernel Headers and Core System Utilities"; run_emerge sys-kernel/linux-headers; if [ "$USE_LVM" = true ]; then run_emerge sys-fs/lvm2; fi; if [ "$USE_LUKS" = true ]; then run_emerge sys-fs/cryptsetup; fi; if [ "$LSM_CHOICE" = "AppArmor" ]; then run_emerge sys-apps/apparmor; fi; if [ "$LSM_CHOICE" = "SELinux" ]; then run_emerge sys-libs/libselinux sys-apps/policycoreutils; fi; if [ -n "$MICROCODE_PACKAGE" ]; then log "Installing CPU microcode package: ${MICROCODE_PACKAGE}"; run_emerge "${MICROCODE_PACKAGE}"; else warn "No specific microcode package to install."; fi; log "Configuring timezone and locale..."; ln -sf "/usr/share/zoneinfo/${SYSTEM_TIMEZONE}" /etc/localtime; echo "${SYSTEM_LOCALE} UTF-8" > /etc/locale.gen; echo "en_US.UTF-8 UTF-8" >> /etc/locale.gen; locale-gen; eselect locale set "${SYSTEM_LOCALE}"; env-update && source /etc/profile; log "Setting hostname..."; echo "hostname=\"${SYSTEM_HOSTNAME}\"" > /etc/conf.d/hostname; }
+stage3_configure_in_chroot() { step_log "System Configuration (Inside Chroot)"; source /etc/profile; export PS1="(chroot) ${PS1:-}"; sync_portage_tree; local profile_base="default/linux/amd64/17.1"; if [ "$USE_HARDENED_PROFILE" = true ]; then profile_base+="/hardened"; fi; local profile_desktop=""; if [ "$DESKTOP_ENV" = "KDE-Plasma" ]; then profile_desktop="/desktop/plasma"; fi; if [ "$DESKTOP_ENV" = "GNOME" ]; then profile_desktop="/desktop/gnome"; fi; if [ "$DESKTOP_ENV" != "Server (No GUI)" -a -z "$profile_desktop" ]; then profile_desktop="/desktop"; fi; local profile_init=""; if [ "$INIT_SYSTEM" = "SystemD" ]; then profile_init="/systemd"; fi; local GENTOO_PROFILE="${profile_base}${profile_desktop}${profile_init}"; log "Setting system profile to: ${GENTOO_PROFILE}"; eselect profile set "${GENTOO_PROFILE}"; if [ "$USE_CCACHE" = true ]; then log "Setting up ccache..."; run_emerge app-misc/ccache; ccache -M 50G; fi; step_log "Installing Kernel Headers and Core System Utilities"; run_emerge sys-kernel/linux-headers; if [ "$USE_LVM" = true ]; then run_emerge sys-fs/lvm2; fi; if [ "$USE_LUKS" = true ]; then run_emerge sys-fs/cryptsetup; fi; if [ "$LSM_CHOICE" = "AppArmor" ]; then run_emerge sys-apps/apparmor; fi; if [ "$LSM_CHOICE" = "SELinux" ]; then run_emerge sys-libs/libselinux sys-apps/policycoreutils; fi; if [ -n "$MICROCODE_PACKAGE" ]; then log "Installing CPU microcode package: ${MICROCODE_PACKAGE}"; run_emerge "${MICROCODE_PACKAGE}"; else warn "No specific microcode package to install."; fi; log "Configuring timezone and locale..."; ln -sf "/usr/share/zoneinfo/${SYSTEM_TIMEZONE}" /etc/localtime; echo "${SYSTEM_LOCALE} UTF-8" > /etc/locale.gen; echo "en_US.UTF-8 UTF-8" >> /etc/locale.gen; locale-gen; eselect locale set "${SYSTEM_LOCALE}"; env-update && source /etc/profile; log "Setting hostname..."; echo "hostname=\"${SYSTEM_HOSTNAME}\"" > /etc/conf.d/hostname; }
 stage4_build_world_and_kernel() {
     step_log "Updating @world set and Building Kernel"; log "Building @world set..."; run_emerge --update --deep --newuse @world; log "Installing firmware..."; run_emerge sys-kernel/linux-firmware
     case "$KERNEL_METHOD" in
@@ -437,7 +530,17 @@ stage4_build_world_and_kernel() {
             if [ "$KERNEL_METHOD" = "genkernel (recommended, auto)" ]; then
                 log "Building kernel with genkernel"; run_emerge sys-kernel/genkernel; local genkernel_opts="--install"; if [ "$USE_LVM" = true ]; then genkernel_opts+=" --lvm"; fi; if [ "$USE_LUKS" = true ]; then genkernel_opts+=" --luks"; fi; log "Running genkernel with options: ${genkernel_opts}"; genkernel "${genkernel_opts}" all
             else
-                log "Starting manual kernel configuration..."; cd /usr/src/linux; warn "INTERACTIVE STEP REQUIRED: Please configure your kernel now."; if [ "$LSM_CHOICE" != "None" ]; then warn "Don't forget to enable ${LSM_CHOICE} support in the kernel security settings!"; fi; if [ "$NVIDIA_DRIVER_CHOICE" = "Proprietary" ]; then warn "NVIDIA proprietary drivers selected. You MUST DISABLE the Nouveau driver in the kernel:"; warn "-> Device Drivers -> Graphics support -> Nouveau driver [ ]"; fi; make menuconfig; log "Compiling and installing kernel..."; make && make modules_install && make install
+                log "Preparing for manual kernel configuration..."
+                cd /usr/src/linux
+                warn "--- MANUAL INTERVENTION REQUIRED ---"
+                warn "The script is about to launch the interactive kernel configuration menu ('make menuconfig')."
+                warn "You will need to configure your kernel manually."
+                if [ "$LSM_CHOICE" != "None" ]; then warn "-> REMINDER: Enable ${LSM_CHOICE} support in 'Security options'."; fi
+                if [ "$NVIDIA_DRIVER_CHOICE" = "Proprietary" ]; then warn "-> CRITICAL: You MUST DISABLE the Nouveau driver: 'Device Drivers -> Graphics support -> Nouveau driver' (set to [N])."; fi
+                warn "Once you save your configuration and exit, the script will automatically continue with compilation."
+                read -r -p "Press ENTER to launch the kernel configuration menu..."
+                make menuconfig
+                log "Compiling and installing kernel..."; make && make modules_install && make install
             fi
             ;;
         "gentoo-kernel (distribution kernel, balanced)") log "Installing distribution kernel..."; run_emerge sys-kernel/gentoo-kernel ;;
@@ -446,6 +549,7 @@ stage4_build_world_and_kernel() {
 }
 stage5_install_bootloader() {
     step_log "Installing GRUB Bootloader (Mode: ${BOOT_MODE})"
+    local grub_conf="/etc/default/grub"
     local grub_cmdline_additions=""
     if [ "$USE_LUKS" = true -a ! "$ENCRYPT_BOOT" = true ]; then
         log "Configuring GRUB for LUKS (standard)..."
@@ -460,18 +564,35 @@ stage5_install_bootloader() {
 
     if [ -n "$grub_cmdline_additions" ]; then
         log "Adding kernel parameters: ${grub_cmdline_additions}"
-        sed -i "s/^\(GRUB_CMDLINE_LINUX=.*\)\"$/\1${grub_cmdline_additions}\"/" /etc/default/grub
-        
-        if ! grep -q "crypt_device" /etc/default/grub && [ "$USE_LUKS" = true ]; then
-            warn "sed command failed to add kernel parameters. Using fallback method."
-            echo "GRUB_CMDLINE_LINUX+=\"${grub_cmdline_additions}\"" >> /etc/default/grub
+        local temp_grub_conf; temp_grub_conf=$(mktemp)
+        awk -v params="${grub_cmdline_additions}" '
+            /^GRUB_CMDLINE_LINUX=/ {
+                match($0, /"(.*)"/);
+                current_params = substr($0, RSTART + 1, RLENGTH - 2);
+                print "GRUB_CMDLINE_LINUX=\"" current_params params "\"";
+                next;
+            }
+            { print }
+        ' "$grub_conf" > "$temp_grub_conf"
+        if grep -q "GRUB_CMDLINE_LINUX=" "$temp_grub_conf"; then
+            mv "$temp_grub_conf" "$grub_conf"
+        else
+            warn "Advanced GRUB config update failed. Using fallback method."; rm -f "$temp_grub_conf"
+            echo "GRUB_CMDLINE_LINUX+=\"${grub_cmdline_additions}\"" >> "$grub_conf"
         fi
     fi
 
     if [ "$USE_LUKS" = true ]; then
         log "Enabling GRUB cryptodisk feature..."
-        echo 'GRUB_ENABLE_CRYPTODISK=y' >> /etc/default/grub
+        echo 'GRUB_ENABLE_CRYPTODISK=y' >> "$grub_conf"
     fi
+    
+    ### --- УЛУЧШЕНИЕ ЧИТАЕМОСТИ GRUB --- ###
+    if [ "$BOOT_MODE" = "UEFI" ]; then
+        log "Setting GRUB graphics mode for better readability..."
+        sed -i 's/^#\(GRUB_GFXMODE=\).*/\11920x1080x32,auto/' "$grub_conf"
+    fi
+    ### --- КОНЕЦ УЛУЧШЕНИЯ --- ###
 
     run_emerge --noreplace sys-boot/grub:2
     if [ "$BOOT_MODE" = "UEFI" ]; then
@@ -611,14 +732,14 @@ EOF
     log "Configuring sudo for 'wheel' group..."; echo '%wheel ALL=(ALL:ALL) ALL' > /etc/sudoers.d/wheel
     log "Set a password for the 'root' user:"; passwd root
     log "Creating a new user..."; local new_user=""; while true; do read -r -p "Enter a username: " new_user; if echo "$new_user" | grep -qE '^[a-z_][a-z0-9_-]*[$]?$'; then break; else err "Invalid username."; new_user=""; fi; done
-    useradd -m -G wheel,users,audio,video,usb -s /bin/bash "$new_user"
+    useradd -m -G wheel,users,audio,video,usb,input -s /bin/bash "$new_user"
     if [ "$INSTALL_APP_HOST" = true ]; then usermod -aG podman "$new_user"; fi
     log "Set a password for user '$new_user':"; passwd "$new_user"; log "User '$new_user' created."
 
     log "Creating first-login setup script for user '${new_user}'..."; local first_login_script_path="/home/${new_user}/.first_login.sh"
     cat > "$first_login_script_path" <<EOF
 #!/bin/bash
-echo ">>> Performing one-time user setup..."
+echo ">>> Performing one-time user setup... (output is logged to ~/.first_login.log)"
 (
 if [ "${INSTALL_STYLING}" = true ]; then
     echo ">>> Applying base styling..."
@@ -636,7 +757,7 @@ if [ "${INSTALL_APP_HOST}" = true ]; then
     echo ">>> Creating Distrobox container (this may take a few minutes)..."
     distrobox-create --name ubuntu --image ubuntu:latest --yes
 fi
-) &> /home/${new_user}/.first_login.log
+) 2>&1 | tee "/home/${new_user}/.first_login.log"
 echo ">>> Setup complete. This script will now self-destruct."
 rm -- "\$0"
 EOF
@@ -655,7 +776,31 @@ EOF
     
     echo "if [ -f \"\$HOME/.first_login.sh\" ]; then . \"\$HOME/.first_login.sh\"; fi" >> "$shell_profile_path"; chown "${new_user}:${new_user}" "$shell_profile_path"
 
-    log "Installation complete."; log "Finalizing disk writes..."; sync; log "Run: exit -> umount -R ${GENTOO_MNT} -> reboot"
+    log "Installation complete."; log "Finalizing disk writes..."; sync
+}
+
+unmount_and_reboot() {
+    log "Installation has finished."
+    warn "The script will now attempt to cleanly unmount all partitions and reboot."
+    read -r -p "Press ENTER to proceed..."
+    
+    local retries=5
+    while [ $retries -gt 0 ]; do
+        if umount -R "${GENTOO_MNT}"; then
+            log "Successfully unmounted ${GENTOO_MNT}."
+            log "Rebooting in 5 seconds..."
+            sleep 5
+            reboot
+            exit 0
+        else
+            err "Failed to unmount ${GENTOO_MNT}. It might still be busy."
+            warn "Retrying in 10 seconds... (${retries} attempts left)"
+            sleep 10
+            retries=$((retries - 1))
+        fi
+    done
+    
+    die "Could not automatically unmount ${GENTOO_MNT}. Please do it manually ('umount -R ${GENTOO_MNT}') and then reboot."
 }
 
 # ==============================================================================
@@ -710,6 +855,8 @@ main() {
                 fi
             fi
         done
+        
+        unmount_and_reboot
     fi
 }
 
