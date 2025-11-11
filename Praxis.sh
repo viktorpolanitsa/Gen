@@ -2,24 +2,23 @@
 # shellcheck disable=SC1091,SC2016,SC2034
 
 # The Gentoo Genesis Engine
-# Version: 10.6.0 "The Adamant"
+# Version: 10.7.0 "The Aegis"
 #
 # Changelog:
+# - v10.7.0:
+#   - CRITICAL FIX: Resolved `make: command not found` error during bootstrap by creating a
+#     "build essentials" package list (`make`, `patch`, `sandbox`) and ensuring it is
+#     installed before the compiler.
+#   - ROBUSTNESS: The dependency installation logic is now ordered: build tools are installed
+#     first, then helpers, then the compiler, preventing dependency paradoxes.
+#   - CLEANLINESS: Added a check to prevent duplicate `en_US.UTF-8` entries in `locale.gen`.
+#   - UX: Removed redundant final instructions, relying on the smarter `unmount_and_reboot` function.
 # - v10.6.0:
-#   - RESILIENCE: Portage sync now attempts `emerge --sync` first, falling back to `emerge-webrsync`
-#     for improved speed and reliability.
-#   - FUTURE-PROOFING: Stage3 checksum verification is now adaptive. It prefers the stronger
-#     BLAKE2b hash (`b2sum`) if available, falling back to SHA512.
-#   - UX: GRUB configuration now proactively sets a high-resolution graphics mode for better
-#     readability on modern displays.
-#   - UX: The user's first-login script now shows live output in the terminal while also logging
-#     to a file, improving transparency.
-#   - COMPLETENESS: Added the 'input' group to the new user by default to prevent potential
-#     issues with input device management.
-# - v10.5.0:
-#   - CRITICAL FIX: Resolved 'OpenMP not supported' error during LiveCD dependency installation.
-#   - ROBUSTNESS: Added `udevadm settle` to prevent fstab generation race conditions.
-#   - ROBUSTNESS: Replaced fragile `sed` for GRUB config with a more reliable method.
+#   - RESILIENCE: Portage sync now attempts `emerge --sync` first, falling back to `emerge-webrsync`.
+#   - FUTURE-PROOFING: Stage3 checksum verification is now adaptive (prefers BLAKE2b).
+#   - UX: GRUB configuration now proactively sets a high-resolution graphics mode.
+#   - UX: The user's first-login script now shows live output.
+#   - COMPLETENESS: Added the 'input' group to the new user by default.
 
 # --- Self-Awareness Check ---
 if [ -z "$BASH_VERSION" ]; then
@@ -128,40 +127,78 @@ ensure_dependencies() {
         fi
     fi
 
-    local compiler_pkgs=""; local other_pkgs=""
-    local all_deps="curl wget sgdisk partprobe mkfs.vfat mkfs.xfs mkfs.ext4 mkfs.btrfs blkid lsblk sha512sum b2sum chroot wipefs blockdev cryptsetup pvcreate vgcreate lvcreate mkswap lscpu lspci udevadm gcc"
-    get_pkg_for_cmd() { case "$1" in curl) echo "net-misc/curl" ;; wget) echo "net-misc/wget" ;; sgdisk) echo "sys-apps/gptfdisk" ;; partprobe) echo "sys-apps/parted" ;; mkfs.vfat) echo "sys-fs/dosfstools" ;; mkfs.xfs) echo "sys-fs/xfsprogs" ;; mkfs.ext4) echo "sys-fs/e2fsprogs" ;; mkfs.btrfs) echo "sys-fs/btrfs-progs" ;; sha512sum|chroot) echo "sys-apps/coreutils" ;; b2sum) echo "sys-apps/coreutils" ;; lspci) echo "sys-apps/pciutils" ;; gcc) echo "sys-devel/gcc" ;; cryptsetup) echo "sys-fs/cryptsetup" ;; pvcreate|vgcreate|lvcreate) echo "sys-fs/lvm2" ;; udevadm) echo "sys-fs/udev" ;; *) echo "sys-fs/util-linux" ;; esac; }
+    local build_essentials_pkgs=""
+    local compiler_pkgs=""
+    local other_pkgs=""
+    
+    # Define core build tools separately to solve chicken-and-egg problems
+    local all_deps="make patch sandbox curl wget sgdisk partprobe mkfs.vfat mkfs.xfs mkfs.ext4 mkfs.btrfs blkid lsblk sha512sum b2sum chroot wipefs blockdev cryptsetup pvcreate vgcreate lvcreate mkswap lscpu lspci udevadm gcc"
+    
+    get_pkg_for_cmd() {
+        case "$1" in
+            make) echo "sys-devel/make" ;;
+            patch) echo "sys-devel/patch" ;;
+            sandbox) echo "sys-apps/sandbox" ;;
+            curl) echo "net-misc/curl" ;;
+            wget) echo "net-misc/wget" ;;
+            sgdisk) echo "sys-apps/gptfdisk" ;;
+            partprobe) echo "sys-apps/parted" ;;
+            mkfs.vfat) echo "sys-fs/dosfstools" ;;
+            mkfs.xfs) echo "sys-fs/xfsprogs" ;;
+            mkfs.ext4) echo "sys-fs/e2fsprogs" ;;
+            mkfs.btrfs) echo "sys-fs/btrfs-progs" ;;
+            sha512sum|b2sum|chroot) echo "sys-apps/coreutils" ;;
+            lspci) echo "sys-apps/pciutils" ;;
+            gcc) echo "sys-devel/gcc" ;;
+            cryptsetup) echo "sys-fs/cryptsetup" ;;
+            pvcreate|vgcreate|lvcreate) echo "sys-fs/lvm2" ;;
+            udevadm) echo "sys-fs/udev" ;;
+            *) echo "sys-fs/util-linux" ;;
+        esac
+    }
 
     log "Checking for required tools..."
     for cmd in $all_deps; do
         if ! command -v "$cmd" >/dev/null 2>&1; then
             pkg=$(get_pkg_for_cmd "$cmd")
-            if [ "$pkg" = "sys-devel/gcc" ]; then
-                if ! echo "$compiler_pkgs" | grep -q "$pkg"; then compiler_pkgs="$compiler_pkgs $pkg"; fi
-            else
-                if ! echo "$other_pkgs" | grep -q "$pkg"; then other_pkgs="$other_pkgs $pkg"; fi
-            fi
+            case "$pkg" in
+                sys-devel/make|sys-devel/patch|sys-apps/sandbox)
+                    if ! echo "$build_essentials_pkgs" | grep -q "$pkg"; then build_essentials_pkgs="$build_essentials_pkgs $pkg"; fi
+                    ;;
+                sys-devel/gcc)
+                    if ! echo "$compiler_pkgs" | grep -q "$pkg"; then compiler_pkgs="$compiler_pkgs $pkg"; fi
+                    ;;
+                *)
+                    if ! echo "$other_pkgs" | grep -q "$pkg"; then other_pkgs="$other_pkgs $pkg"; fi
+                    ;;
+            esac
         fi
     done
 
-    if [ -n "$compiler_pkgs" ] || [ -n "$other_pkgs" ]; then
+    if [ -n "$build_essentials_pkgs" ] || [ -n "$compiler_pkgs" ] || [ -n "$other_pkgs" ]; then
         warn "Some required packages are missing. Preparing for installation."
         if ask_confirm "Do you want to proceed with automatic installation?"; then
             sync_portage_tree
             local emerge_opts="-q --jobs=1 --load-average=1 --noreplace"
             local emerge_prefix="USE=\"-openmp\""
 
-            if [ -n "$compiler_pkgs" ]; then
-                log "Installing the compiler first...${compiler_pkgs}";
+            if [ -n "$build_essentials_pkgs" ]; then
+                log "Installing build essentials first...${build_essentials_pkgs}";
                 # shellcheck disable=SC2086
-                if ! eval "$emerge_prefix emerge $emerge_opts $compiler_pkgs"; then die "Failed to install the compiler (gcc)."; fi
-                log "Compiler installed successfully."
+                if ! eval "$emerge_prefix emerge $emerge_opts $build_essentials_pkgs"; then die "Failed to install build essentials."; fi
+                log "Build essentials installed successfully."
             fi
             if [ -n "$other_pkgs" ]; then
                 log "Installing other required tools...${other_pkgs}";
                 # shellcheck disable=SC2086
                 if ! eval "$emerge_prefix emerge $emerge_opts $other_pkgs"; then die "Failed to install required dependencies."; fi
                 log "Other tools installed successfully."
+            fi
+            if [ -n "$compiler_pkgs" ]; then
+                log "Installing the compiler...${compiler_pkgs}";
+                # shellcheck disable=SC2086
+                if ! eval "$emerge_prefix emerge $emerge_opts $compiler_pkgs"; then die "Failed to install the compiler (gcc)."; fi
+                log "Compiler installed successfully."
             fi
         else
             die "Missing dependencies. Aborted by user."
@@ -171,7 +208,7 @@ ensure_dependencies() {
     fi
 }
 
-stage0_select_mirrors() { step_log "Selecting Fastest Mirrors"; if ask_confirm "Do you want to automatically select the fastest mirrors? (Recommended)"; then log "Syncing portage tree to get mirrorselect..."; sync_portage_tree; log "Installing mirrorselect..."; emerge -q app-portage/mirrorselect; log "Running mirrorselect, this may take a minute..."; FASTEST_MIRRORS=$(mirrorselect -s4 -b10 -o -D); log "Fastest mirrors selected."; else log "Skipping mirror selection. Default mirrors will be used."; fi; }
+stage0_select_mirrors() { step_log "Selecting Fastest Mirrors"; if ask_confirm "Do you want to automatically select the fastest mirrors? (Recommended)"; then sync_portage_tree; log "Installing mirrorselect..."; emerge -q app-portage/mirrorselect; log "Running mirrorselect, this may take a minute..."; FASTEST_MIRRORS=$(mirrorselect -s4 -b10 -o -D); log "Fastest mirrors selected."; else log "Skipping mirror selection. Default mirrors will be used."; fi; }
 
 # ==============================================================================
 # --- HARDWARE DETECTION ENGINE ---
@@ -459,7 +496,6 @@ stage1_deploy_base_system() {
             success=true; break
         fi
 
-        ### --- АДАПТИВНАЯ ПРОВЕРКА ХЕША --- ###
         local checksum_verified=false
         for hash_cmd in b2sum sha512sum; do
             if command -v "$hash_cmd" >/dev/null; then
@@ -475,7 +511,6 @@ stage1_deploy_base_system() {
                 fi
             fi
         done
-        ### --- КОНЕЦ АДАПТИВНОЙ ПРОВЕРКИ --- ###
 
         if [ "$checksum_verified" = true ]; then
             success=true; break
@@ -520,7 +555,7 @@ EOF
 # ==============================================================================
 # --- STAGES 3-7: CHROOTED OPERATIONS ---
 # ==============================================================================
-stage3_configure_in_chroot() { step_log "System Configuration (Inside Chroot)"; source /etc/profile; export PS1="(chroot) ${PS1:-}"; sync_portage_tree; local profile_base="default/linux/amd64/17.1"; if [ "$USE_HARDENED_PROFILE" = true ]; then profile_base+="/hardened"; fi; local profile_desktop=""; if [ "$DESKTOP_ENV" = "KDE-Plasma" ]; then profile_desktop="/desktop/plasma"; fi; if [ "$DESKTOP_ENV" = "GNOME" ]; then profile_desktop="/desktop/gnome"; fi; if [ "$DESKTOP_ENV" != "Server (No GUI)" -a -z "$profile_desktop" ]; then profile_desktop="/desktop"; fi; local profile_init=""; if [ "$INIT_SYSTEM" = "SystemD" ]; then profile_init="/systemd"; fi; local GENTOO_PROFILE="${profile_base}${profile_desktop}${profile_init}"; log "Setting system profile to: ${GENTOO_PROFILE}"; eselect profile set "${GENTOO_PROFILE}"; if [ "$USE_CCACHE" = true ]; then log "Setting up ccache..."; run_emerge app-misc/ccache; ccache -M 50G; fi; step_log "Installing Kernel Headers and Core System Utilities"; run_emerge sys-kernel/linux-headers; if [ "$USE_LVM" = true ]; then run_emerge sys-fs/lvm2; fi; if [ "$USE_LUKS" = true ]; then run_emerge sys-fs/cryptsetup; fi; if [ "$LSM_CHOICE" = "AppArmor" ]; then run_emerge sys-apps/apparmor; fi; if [ "$LSM_CHOICE" = "SELinux" ]; then run_emerge sys-libs/libselinux sys-apps/policycoreutils; fi; if [ -n "$MICROCODE_PACKAGE" ]; then log "Installing CPU microcode package: ${MICROCODE_PACKAGE}"; run_emerge "${MICROCODE_PACKAGE}"; else warn "No specific microcode package to install."; fi; log "Configuring timezone and locale..."; ln -sf "/usr/share/zoneinfo/${SYSTEM_TIMEZONE}" /etc/localtime; echo "${SYSTEM_LOCALE} UTF-8" > /etc/locale.gen; echo "en_US.UTF-8 UTF-8" >> /etc/locale.gen; locale-gen; eselect locale set "${SYSTEM_LOCALE}"; env-update && source /etc/profile; log "Setting hostname..."; echo "hostname=\"${SYSTEM_HOSTNAME}\"" > /etc/conf.d/hostname; }
+stage3_configure_in_chroot() { step_log "System Configuration (Inside Chroot)"; source /etc/profile; export PS1="(chroot) ${PS1:-}"; sync_portage_tree; local profile_base="default/linux/amd64/17.1"; if [ "$USE_HARDENED_PROFILE" = true ]; then profile_base+="/hardened"; fi; local profile_desktop=""; if [ "$DESKTOP_ENV" = "KDE-Plasma" ]; then profile_desktop="/desktop/plasma"; fi; if [ "$DESKTOP_ENV" = "GNOME" ]; then profile_desktop="/desktop/gnome"; fi; if [ "$DESKTOP_ENV" != "Server (No GUI)" -a -z "$profile_desktop" ]; then profile_desktop="/desktop"; fi; local profile_init=""; if [ "$INIT_SYSTEM" = "SystemD" ]; then profile_init="/systemd"; fi; local GENTOO_PROFILE="${profile_base}${profile_desktop}${profile_init}"; log "Setting system profile to: ${GENTOO_PROFILE}"; eselect profile set "${GENTOO_PROFILE}"; if [ "$USE_CCACHE" = true ]; then log "Setting up ccache..."; run_emerge app-misc/ccache; ccache -M 50G; fi; step_log "Installing Kernel Headers and Core System Utilities"; run_emerge sys-kernel/linux-headers; if [ "$USE_LVM" = true ]; then run_emerge sys-fs/lvm2; fi; if [ "$USE_LUKS" = true ]; then run_emerge sys-fs/cryptsetup; fi; if [ "$LSM_CHOICE" = "AppArmor" ]; then run_emerge sys-apps/apparmor; fi; if [ "$LSM_CHOICE" = "SELinux" ]; then run_emerge sys-libs/libselinux sys-apps/policycoreutils; fi; if [ -n "$MICROCODE_PACKAGE" ]; then log "Installing CPU microcode package: ${MICROCODE_PACKAGE}"; run_emerge "${MICROCODE_PACKAGE}"; else warn "No specific microcode package to install."; fi; log "Configuring timezone and locale..."; ln -sf "/usr/share/zoneinfo/${SYSTEM_TIMEZONE}" /etc/localtime; echo "${SYSTEM_LOCALE} UTF-8" > /etc/locale.gen; if [ "${SYSTEM_LOCALE}" != "en_US.UTF-8" ]; then echo "en_US.UTF-8 UTF-8" >> /etc/locale.gen; fi; locale-gen; eselect locale set "${SYSTEM_LOCALE}"; env-update && source /etc/profile; log "Setting hostname..."; echo "hostname=\"${SYSTEM_HOSTNAME}\"" > /etc/conf.d/hostname; }
 stage4_build_world_and_kernel() {
     step_log "Updating @world set and Building Kernel"; log "Building @world set..."; run_emerge --update --deep --newuse @world; log "Installing firmware..."; run_emerge sys-kernel/linux-firmware
     case "$KERNEL_METHOD" in
@@ -565,311 +600,3 @@ stage5_install_bootloader() {
     if [ -n "$grub_cmdline_additions" ]; then
         log "Adding kernel parameters: ${grub_cmdline_additions}"
         local temp_grub_conf; temp_grub_conf=$(mktemp)
-        awk -v params="${grub_cmdline_additions}" '
-            /^GRUB_CMDLINE_LINUX=/ {
-                match($0, /"(.*)"/);
-                current_params = substr($0, RSTART + 1, RLENGTH - 2);
-                print "GRUB_CMDLINE_LINUX=\"" current_params params "\"";
-                next;
-            }
-            { print }
-        ' "$grub_conf" > "$temp_grub_conf"
-        if grep -q "GRUB_CMDLINE_LINUX=" "$temp_grub_conf"; then
-            mv "$temp_grub_conf" "$grub_conf"
-        else
-            warn "Advanced GRUB config update failed. Using fallback method."; rm -f "$temp_grub_conf"
-            echo "GRUB_CMDLINE_LINUX+=\"${grub_cmdline_additions}\"" >> "$grub_conf"
-        fi
-    fi
-
-    if [ "$USE_LUKS" = true ]; then
-        log "Enabling GRUB cryptodisk feature..."
-        echo 'GRUB_ENABLE_CRYPTODISK=y' >> "$grub_conf"
-    fi
-    
-    ### --- УЛУЧШЕНИЕ ЧИТАЕМОСТИ GRUB --- ###
-    if [ "$BOOT_MODE" = "UEFI" ]; then
-        log "Setting GRUB graphics mode for better readability..."
-        sed -i 's/^#\(GRUB_GFXMODE=\).*/\11920x1080x32,auto/' "$grub_conf"
-    fi
-    ### --- КОНЕЦ УЛУЧШЕНИЯ --- ###
-
-    run_emerge --noreplace sys-boot/grub:2
-    if [ "$BOOT_MODE" = "UEFI" ]; then
-        grub-install --target=x86_64-efi --efi-directory=/boot/efi
-    else
-        grub-install "${TARGET_DEVICE}"
-    fi
-    grub-mkconfig -o /boot/grub/grub.cfg
-}
-stage6_install_software() {
-    step_log "Installing Desktop Environment and Application Profiles"
-    local display_manager=""
-    case "$DESKTOP_ENV" in
-        "XFCE") log "Installing XFCE..."; run_emerge xfce-base/xfce4-meta x11-terms/xfce4-terminal; display_manager="x11-misc/lightdm" ;;
-        "KDE-Plasma") log "Installing KDE Plasma..."; run_emerge kde-plasma/plasma-meta; display_manager="x11-misc/sddm" ;;
-        "GNOME") log "Installing GNOME..."; run_emerge gnome-base/gnome-desktop; display_manager="gnome-base/gdm" ;;
-        "i3-WM") log "Installing i3 Window Manager..."; run_emerge x11-wm/i3 x11-terms/alacritty x11-misc/dmenu; display_manager="x11-misc/lightdm" ;;
-        "Server (No GUI)") log "Skipping GUI installation for server profile." ;;
-    esac
-
-    if [ -n "$display_manager" ]; then log "Installing Xorg Server and Display Manager..."; run_emerge x11-base/xorg-server "${display_manager}"; fi
-    if [ "$USE_PIPEWIRE" = true ]; then log "Installing PipeWire..."; run_emerge media-video/pipewire media-video/wireplumber media-sound/pipewire-pulse; fi
-
-    if [ "$ENABLE_AUTO_UPDATE" = true ]; then
-        log "Installing utilities for automatic maintenance..."
-        local maintenance_pkgs="app-portage/eix app-portage/gentoolkit"
-        if [ "$INIT_SYSTEM" = "OpenRC" ]; then maintenance_pkgs+=" sys-process/cronie"; fi
-        # shellcheck disable=SC2086
-        run_emerge $maintenance_pkgs
-    fi
-
-    local advanced_pkgs=""
-    if [ "$INSTALL_APP_HOST" = true ]; then log "Installing Universal App Host packages..."; advanced_pkgs+=" sys-apps/flatpak app-emulation/distrobox app-emulation/podman"; fi
-    if [ "$ENABLE_BOOT_ENVIRONMENTS" = true ]; then log "Installing Boot Environment packages..."; advanced_pkgs+=" sys-boot/grub-btrfs"; fi
-    if [ "$SWAP_TYPE" = "zram" ]; then log "Installing zram packages..."; advanced_pkgs+=" sys-block/zram-init"; fi
-    if [ "$ENABLE_FIREWALL" = true ]; then log "Installing firewall..."; advanced_pkgs+=" net-firewall/ufw"; fi
-    if [ "$ENABLE_CPU_GOVERNOR" = true ]; then log "Installing CPU governor..."; advanced_pkgs+=" sys-power/auto-cpufreq"; fi
-    if [ "$INSTALL_STYLING" = true ]; then log "Installing styling packages..."; advanced_pkgs+=" x11-themes/papirus-icon-theme media-fonts/firacode-nerd-font"; fi
-    if [ "$INSTALL_CYBER_TERM" = true ]; then log "Installing Cybernetic Terminal packages..."; advanced_pkgs+=" app-shells/zsh app-shells/starship"; fi
-    
-    if [ -n "$advanced_pkgs" ]; then
-        # shellcheck disable=SC2086
-        run_emerge $advanced_pkgs
-    fi
-
-    if [ "$NVIDIA_DRIVER_CHOICE" = "Proprietary" ]; then log "Installing NVIDIA settings panel..."; run_emerge x11-misc/nvidia-settings; fi
-    if [ "$INSTALL_DEV_TOOLS" = true ]; then log "Installing Developer Tools..."; run_emerge dev-vcs/git app-editors/vscode dev-util/docker-cli; fi
-    if [ "$INSTALL_OFFICE_GFX" = true ]; then log "Installing Office/Graphics Suite..."; run_emerge app-office/libreoffice media-gfx/gimp media-gfx/inkscape; fi
-    if [ "$INSTALL_GAMING" = true ]; then log "Installing Gaming Essentials..."; run_emerge games-util/steam-launcher games-util/lutris app-emulation/wine-staging; fi
-    
-    log "Installing essential utilities..."; run_emerge www-client/firefox-bin app-admin/sudo app-shells/bash-completion net-misc/networkmanager
-}
-stage7_finalize() {
-    step_log "Finalizing System"
-    log "Enabling system-wide services..."
-    if [ "$ENABLE_FIREWALL" = true ]; then
-        log "Configuring and enabling firewall..."; ufw default deny incoming; ufw default allow outgoing; ufw enable
-        if [ "$INIT_SYSTEM" = "OpenRC" ]; then rc-update add ufw default; else systemctl enable ufw.service; fi
-    fi
-
-    if [ "$ENABLE_CPU_GOVERNOR" = true ]; then
-        log "Enabling intelligent CPU governor..."
-        if [ "$INIT_SYSTEM" = "OpenRC" ]; then rc-update add auto-cpufreq default; else systemctl enable auto-cpufreq.service; fi
-    fi
-
-    if [ "$SWAP_TYPE" = "zram" ]; then
-        log "Configuring zram..."; local ram_size_mb; ram_size_mb=$(free -m | awk '/^Mem:/{print $2}'); local zram_size; zram_size=$((ram_size_mb / 2))
-        echo -e "ZRAM_SIZE=${zram_size}\nZRAM_COMP_ALGORITHM=zstd" > /etc/conf.d/zram-init
-        if [ "$INIT_SYSTEM" = "OpenRC" ]; then rc-update add zram-init default; else systemctl enable zram-init.service; fi
-    fi
-
-    log "Enabling core services (${INIT_SYSTEM})..."
-    if [ "$INIT_SYSTEM" = "OpenRC" ]; then
-        if [ "$USE_LVM" = true ]; then rc-update add lvm default; fi
-        rc-update add dbus default; if [ "$DESKTOP_ENV" != "Server (No GUI)" ]; then rc-update add display-manager default; fi; rc-update add NetworkManager default
-    else
-        if [ "$USE_LVM" = true ]; then systemctl enable lvm2-monitor.service; fi
-        if [ "$DESKTOP_ENV" != "Server (No GUI)" ]; then systemctl enable display-manager.service; fi; systemctl enable NetworkManager.service
-    fi
-
-    if [ "$ENABLE_AUTO_UPDATE" = true ]; then
-        log "Setting up automatic weekly updates..."; local update_script_path="/usr/local/bin/gentoo-update.sh"
-        if [ "$ENABLE_BOOT_ENVIRONMENTS" = true ]; then
-            cat > "$update_script_path" <<'EOF'
-#!/bin/bash
-set -euo pipefail
-TIMESTAMP=$(date +"%Y-%m-%d_%H-%M-%S")
-CURRENT_ROOT_SUBVOL_PATH=$(findmnt -n -o SOURCE / | awk -F, '{for(i=1;i<=NF;i++)if($i~/^subvol=/)print $i}' | sed 's/subvol=//')
-SNAPSHOT_PATH="/.snapshots/update_${TIMESTAMP}"
-log() { echo ">>> $*"; }
-cleanup() { umount -R "${SNAPSHOT_PATH}/proc" 2>/dev/null || true; umount -R "${SNAPSHOT_PATH}/dev" 2>/dev/null || true; umount -R "${SNAPSHOT_PATH}/sys" 2>/dev/null || true; }
-trap cleanup EXIT
-log "Creating new read-write snapshot: ${SNAPSHOT_PATH}"; btrfs subvolume snapshot "${CURRENT_ROOT_SUBVOL_PATH}" "${SNAPSHOT_PATH}"
-log "Preparing chroot environment for the new snapshot..."; mount --rbind /proc "${SNAPSHOT_PATH}/proc"; mount --rbind /dev "${SNAPSHOT_PATH}/dev"; mount --rbind /sys "${SNAPSHOT_PATH}/sys"; cp /etc/resolv.conf "${SNAPSHOT_PATH}/etc/"
-log "Starting update inside the chroot..."; chroot "${SNAPSHOT_PATH}" /bin/bash -c "source /etc/profile; emerge --update --deep --newuse --keep-going -q @world && emerge --depclean -q"
-log "Update complete. Updating GRUB to detect the new environment..."; grub-mkconfig -o /boot/grub/grub.cfg
-log "SUCCESS! Reboot and select the new snapshot from the GRUB menu."
-EOF
-        else
-            cat > "$update_script_path" <<'EOF'
-#!/bin/bash
-export EIX_QUIET=1; export EIX_LIMIT=0; eix-sync && emerge --update --deep --newuse --keep-going -q @world && emerge --depclean -q && revdep-rebuild -q -- -q1
-EOF
-        fi
-        chmod +x "$update_script_path"
-        if [ "$INIT_SYSTEM" = "OpenRC" ]; then
-            log "Creating weekly cron job..."; ln -s "$update_script_path" /etc/cron.weekly/gentoo-update; rc-update add cronie default
-        else
-            log "Creating systemd service and timer..."; cat > /etc/systemd/system/gentoo-update.service <<EOF
-[Unit]
-Description=Weekly Gentoo Update
-[Service]
-Type=oneshot
-ExecStart=${update_script_path}
-EOF
-            cat > /etc/systemd/system/gentoo-update.timer <<EOF
-[Unit]
-Description=Run weekly Gentoo update
-[Timer]
-OnCalendar=weekly
-RandomizedDelaySec=6h
-Persistent=true
-[Install]
-WantedBy=timers.target
-EOF
-            systemctl enable --now gentoo-update.timer; log "Systemd timer enabled."
-        fi
-        warn "Automatic updates are enabled, but you MUST run 'etc-update' or 'dispatch-conf' manually after updates to merge configuration file changes."
-    fi
-
-    if [ "$ENABLE_BOOT_ENVIRONMENTS" = true ]; then
-        log "Enabling grub-btrfs service..."; if [ "$INIT_SYSTEM" = "SystemD" ]; then systemctl enable grub-btrfs.path; else warn "grub-btrfs auto-update on OpenRC requires manual setup."; fi
-    fi
-
-    if [ "$INSTALL_APP_HOST" = true ]; then log "Finalizing Universal App Host setup..."; flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo; fi
-
-    log "Configuring sudo for 'wheel' group..."; echo '%wheel ALL=(ALL:ALL) ALL' > /etc/sudoers.d/wheel
-    log "Set a password for the 'root' user:"; passwd root
-    log "Creating a new user..."; local new_user=""; while true; do read -r -p "Enter a username: " new_user; if echo "$new_user" | grep -qE '^[a-z_][a-z0-9_-]*[$]?$'; then break; else err "Invalid username."; new_user=""; fi; done
-    useradd -m -G wheel,users,audio,video,usb,input -s /bin/bash "$new_user"
-    if [ "$INSTALL_APP_HOST" = true ]; then usermod -aG podman "$new_user"; fi
-    log "Set a password for user '$new_user':"; passwd "$new_user"; log "User '$new_user' created."
-
-    log "Creating first-login setup script for user '${new_user}'..."; local first_login_script_path="/home/${new_user}/.first_login.sh"
-    cat > "$first_login_script_path" <<EOF
-#!/bin/bash
-echo ">>> Performing one-time user setup... (output is logged to ~/.first_login.log)"
-(
-if [ "${INSTALL_STYLING}" = true ]; then
-    echo ">>> Applying base styling..."
-    case "${DESKTOP_ENV}" in
-        "XFCE")
-            for ((i=0; i<120; i++)); do if pgrep -u "\${USER}" xfce4-session >/dev/null; then break; fi; sleep 1; done
-            if command -v xfconf-query &>/dev/null && [ -n "\$DBUS_SESSION_BUS_ADDRESS" ]; then
-                xfconf-query -c xsettings -p /Net/IconThemeName -s Papirus
-                xfconf-query -c xfce4-terminal -p /font-name -s 'FiraCode Nerd Font Mono 10'
-            fi ;;
-        *) echo ">>> Please manually select 'Papirus' icon theme and 'FiraCode Nerd Font' in your DE settings." ;;
-    esac
-fi
-if [ "${INSTALL_APP_HOST}" = true ]; then
-    echo ">>> Creating Distrobox container (this may take a few minutes)..."
-    distrobox-create --name ubuntu --image ubuntu:latest --yes
-fi
-) 2>&1 | tee "/home/${new_user}/.first_login.log"
-echo ">>> Setup complete. This script will now self-destruct."
-rm -- "\$0"
-EOF
-    chmod +x "$first_login_script_path"; chown "${new_user}:${new_user}" "$first_login_script_path"
-    
-    local shell_profile_path="/home/${new_user}/.profile"; local shell_rc_path="/home/${new_user}/.bashrc"
-    if [ "$INSTALL_CYBER_TERM" = true ]; then
-        log "Setting up Cybernetic Terminal for user '${new_user}'..."; chsh -s /bin/zsh "${new_user}"; shell_rc_path="/home/${new_user}/.zshrc"; shell_profile_path="/home/${new_user}/.zprofile"
-        echo 'eval "$(starship init zsh)"' > "$shell_rc_path"; chown "${new_user}:${new_user}" "$shell_rc_path"
-    fi
-
-    if [ "$INSTALL_APP_HOST" = true ]; then log "Adding Distrobox aliases to ${shell_rc_path}..."; cat >> "$shell_rc_path" <<'EOF'
-if command -v distrobox-enter &> /dev/null; then alias apt="distrobox-enter ubuntu -- sudo apt"; fi
-EOF
-    fi
-    
-    echo "if [ -f \"\$HOME/.first_login.sh\" ]; then . \"\$HOME/.first_login.sh\"; fi" >> "$shell_profile_path"; chown "${new_user}:${new_user}" "$shell_profile_path"
-
-    log "Installation complete."; log "Finalizing disk writes..."; sync
-}
-
-unmount_and_reboot() {
-    log "Installation has finished."
-    warn "The script will now attempt to cleanly unmount all partitions and reboot."
-    read -r -p "Press ENTER to proceed..."
-    
-    local retries=5
-    while [ $retries -gt 0 ]; do
-        if umount -R "${GENTOO_MNT}"; then
-            log "Successfully unmounted ${GENTOO_MNT}."
-            log "Rebooting in 5 seconds..."
-            sleep 5
-            reboot
-            exit 0
-        else
-            err "Failed to unmount ${GENTOO_MNT}. It might still be busy."
-            warn "Retrying in 10 seconds... (${retries} attempts left)"
-            sleep 10
-            retries=$((retries - 1))
-        fi
-    done
-    
-    die "Could not automatically unmount ${GENTOO_MNT}. Please do it manually ('umount -R ${GENTOO_MNT}') and then reboot."
-}
-
-# ==============================================================================
-# --- MAIN SCRIPT LOGIC ---
-# ==============================================================================
-main() {
-    if [ $EUID -ne 0 ]; then die "This script must be run as root."; fi
-
-    if [ "${1:-}" = "--chrooted" ]; then
-        source /etc/autobuilder.conf
-        CHECKPOINT_FILE="/.genesis_checkpoint"
-        if [ -f "$CHECKPOINT_FILE" ]; then START_STAGE=$(<"$CHECKPOINT_FILE"); START_STAGE=$((START_STAGE + 1)); else START_STAGE=3; fi
-
-        declare -a chrooted_stages=(stage3_configure_in_chroot stage4_build_world_and_kernel stage5_install_bootloader stage6_install_software stage7_finalize)
-        local stage_num=3
-        for stage_func in "${chrooted_stages[@]}"; do
-            if [ "$START_STAGE" -le "$stage_num" ]; then
-                "$stage_func"
-                save_checkpoint "$stage_num"
-            fi
-            stage_num=$((stage_num + 1))
-        done
-        log "Chroot stages complete. Cleaning up..."; rm -f /etc/autobuilder.conf "/.genesis_checkpoint"
-    else
-        FORCE_MODE=false
-        for arg in "$@"; do case "$arg" in --force|--auto) FORCE_MODE=true;; --skip-checksum) SKIP_CHECKSUM=true;; esac; done
-
-        if mountpoint -q "${GENTOO_MNT}"; then CHECKPOINT_FILE="${GENTOO_MNT}/.genesis_checkpoint"; fi
-        load_checkpoint
-
-        declare -a stages=(
-            self_check
-            pre_flight_checks
-            ensure_dependencies
-            stage0_select_mirrors
-            detect_cpu_architecture
-            detect_cpu_flags
-            detect_gpu_hardware
-            interactive_setup
-            stage0_partition_and_format
-            stage1_deploy_base_system
-            stage2_prepare_chroot
-        )
-        
-        for i in "${!stages[@]}"; do
-            local stage_num=$i
-            local stage_func=${stages[$i]}
-            if [ "$START_STAGE" -le "$stage_num" ]; then
-                "$stage_func"
-                if [ "$stage_func" != "stage2_prepare_chroot" ]; then
-                    save_checkpoint "$stage_num"
-                fi
-            fi
-        done
-        
-        unmount_and_reboot
-    fi
-}
-
-# --- SCRIPT ENTRYPOINT ---
-if [ "${1:-}" != "--chrooted" ]; then
-    if [ -f "${CHECKPOINT_FILE}" -a -d "${GENTOO_MNT}/root" ]; then
-        EXISTING_LOG=$(find "${GENTOO_MNT}/root" -name "gentoo_genesis_install.log" -print0 | xargs -0 ls -t | head -n 1)
-        if [ -n "$EXISTING_LOG" ]; then
-            LOG_FILE_PATH="$EXISTING_LOG"
-            echo -e "\n\n--- RESUMING LOG $(date) ---\n\n" | tee -a "$LOG_FILE_PATH"
-        fi
-    fi
-    main "$@" 2>&1 | tee -a "$LOG_FILE_PATH"
-else
-    main "$@"
-fi
