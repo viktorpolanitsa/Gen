@@ -88,9 +88,9 @@
 ```bash
 sudo -i
 ```
-Скачайте последнюю версию скрипта (замените `<URL_К_ВАШЕМУ_СКРИПТУ>` на реальную ссылку):
+Скачайте последнюю версию скрипта:
 ```bash
-wget <URL_К_ВАШЕМУ_СКРИПТУ>/Praxis.sh
+wget -O Praxis.sh https://raw.githubusercontent.com/viktorpolanitsa/Gen/refs/heads/main/Praxis.sh/Praxis.sh
 ```
 Сделайте скрипт исполняемым:
 ```bash
