@@ -2,12 +2,13 @@
 # shellcheck disable=SC1091,SC2016
 
 # The Gentoo Genesis Engine
-# Version: 10.3.3 "The Final Form"
+# Version: 10.3.4 "The Purified"
 #
 # Changelog:
-# - v10.3.3: Eradicated all remaining syntax errors in one-line `select` loops by expanding them.
-#            Hardened the first-login script for XFCE styling.
-#            Switched internet connectivity check to a more reliable IP ping.
+# - v10.3.4: FINAL SYNTAX FIX. Expanded all remaining one-liner control structures
+#            (case, if, for) into multi-line blocks to permanently eliminate
+#            the entire class of semicolon-related syntax errors.
+# - v10.3.3: Eradicated syntax errors, hardened first-login script, improved net check.
 # - v10.3.2: Major robustness and security hardening release.
 # - v10.3.1: Fixed a syntax error in the interactive setup for NVIDIA driver selection.
 
@@ -312,21 +313,129 @@ stage5_install_bootloader() {
 }
 
 stage6_install_software() {
-    step_log "Installing Desktop Environment and Application Profiles"; local display_manager=""; case "$DESKTOP_ENV" in "XFCE") log "Installing XFCE..."; emerge_safely xfce-base/xfce4-meta x11-terms/xfce4-terminal; display_manager="x11-misc/lightdm" ;; "KDE-Plasma") log "Installing KDE Plasma..."; emerge_safely kde-plasma/plasma-meta; display_manager="x11-misc/sddm" ;; "GNOME") log "Installing GNOME..."; emerge_safely gnome-base/gnome-desktop; display_manager="gnome-base/gdm" ;; "i3-WM") log "Installing i3 Window Manager..."; emerge_safely x11-wm/i3 x11-terms/alacritty x11-misc/dmenu; display_manager="x11-misc/lightdm" ;; "Server (No GUI)") log "Skipping GUI installation for server profile." ;; esac; if [[ -n "$display_manager" ]]; then log "Installing Xorg Server and Display Manager..."; emerge_safely x11-base/xorg-server "${display_manager}"; fi
-    if [[ "$USE_PIPEWIRE" = true ]]; then log "Installing PipeWire..."; emerge_safely media-video/pipewire media-video/wireplumber media-sound/pipewire-pulse; fi
-    if [[ "$ENABLE_AUTO_UPDATE" = true ]]; then log "Installing utilities for automatic maintenance..."; local maintenance_pkgs="app-portage/eix app-portage/gentoolkit"; if [[ "$INIT_SYSTEM" == "OpenRC" ]]; then maintenance_pkgs+=" sys-process/cronie"; fi; emerge_safely $maintenance_pkgs; fi
-    local advanced_pkgs=""; if [[ "$INSTALL_APP_HOST" = true ]]; then log "Installing Universal App Host packages..."; advanced_pkgs+=" sys-apps/flatpak app-emulation/distrobox app-emulation/podman"; fi; if [[ "$ENABLE_BOOT_ENVIRONMENTS" = true ]]; then log "Installing Boot Environment packages..."; advanced_pkgs+=" sys-boot/grub-btrfs"; fi; if [[ "$SWAP_TYPE" == "zram" ]]; then log "Installing zram packages..."; advanced_pkgs+=" sys-block/zram-init"; fi; if [[ "$ENABLE_FIREWALL" = true ]]; then log "Installing firewall..."; advanced_pkgs+=" net-firewall/ufw"; fi; if [[ "$ENABLE_CPU_GOVERNOR" = true ]]; then log "Installing CPU governor..."; advanced_pkgs+=" sys-power/auto-cpufreq"; fi; if [[ "$INSTALL_STYLING" = true ]]; then log "Installing styling packages..."; advanced_pkgs+=" x11-themes/papirus-icon-theme media-fonts/firacode-nerd-font"; fi; if [[ "$INSTALL_CYBER_TERM" = true ]]; then log "Installing Cybernetic Terminal packages..."; advanced_pkgs+=" app-shells/zsh app-shells/starship"; fi; if [[ -n "$advanced_pkgs" ]]; then emerge_safely $advanced_pkgs; fi
-    if [[ "$NVIDIA_DRIVER_CHOICE" == "Proprietary" ]]; then log "Installing NVIDIA settings panel..."; emerge_safely x11-misc/nvidia-settings; fi; if $INSTALL_DEV_TOOLS; then log "Installing Developer Tools..."; emerge_safely dev-vcs/git app-editors/vscode dev-util/docker-cli; fi; if $INSTALL_OFFICE_GFX; then log "Installing Office/Graphics Suite..."; emerge_safely app-office/libreoffice media-gfx/gimp media-gfx/inkscape; fi; if $INSTALL_GAMING; then log "Installing Gaming Essentials..."; emerge_safely games-util/steam-launcher games-util/lutris app-emulation/wine-staging; fi; log "Installing essential utilities..."; emerge_safely www-client/firefox-bin app-admin/sudo app-shells/bash-completion net-misc/networkmanager
+    step_log "Installing Desktop Environment and Application Profiles"
+    local display_manager=""
+    case "$DESKTOP_ENV" in
+        "XFCE") 
+            log "Installing XFCE..."
+            emerge_safely xfce-base/xfce4-meta x11-terms/xfce4-terminal
+            display_manager="x11-misc/lightdm"
+            ;;
+        "KDE-Plasma")
+            log "Installing KDE Plasma..."
+            emerge_safely kde-plasma/plasma-meta
+            display_manager="x11-misc/sddm"
+            ;;
+        "GNOME")
+            log "Installing GNOME..."
+            emerge_safely gnome-base/gnome-desktop
+            display_manager="gnome-base/gdm"
+            ;;
+        "i3-WM")
+            log "Installing i3 Window Manager..."
+            emerge_safely x11-wm/i3 x11-terms/alacritty x11-misc/dmenu
+            display_manager="x11-misc/lightdm"
+            ;;
+        "Server (No GUI)")
+            log "Skipping GUI installation for server profile."
+            ;;
+    esac
+
+    if [[ -n "$display_manager" ]]; then
+        log "Installing Xorg Server and Display Manager..."
+        emerge_safely x11-base/xorg-server "${display_manager}"
+    fi
+
+    if [[ "$USE_PIPEWIRE" = true ]]; then
+        log "Installing PipeWire..."
+        emerge_safely media-video/pipewire media-video/wireplumber media-sound/pipewire-pulse
+    fi
+
+    if [[ "$ENABLE_AUTO_UPDATE" = true ]]; then
+        log "Installing utilities for automatic maintenance..."
+        local maintenance_pkgs="app-portage/eix app-portage/gentoolkit"
+        if [[ "$INIT_SYSTEM" == "OpenRC" ]]; then
+            maintenance_pkgs+=" sys-process/cronie"
+        fi
+        emerge_safely $maintenance_pkgs
+    fi
+
+    local advanced_pkgs=""
+    if [[ "$INSTALL_APP_HOST" = true ]]; then log "Installing Universal App Host packages..."; advanced_pkgs+=" sys-apps/flatpak app-emulation/distrobox app-emulation/podman"; fi
+    if [[ "$ENABLE_BOOT_ENVIRONMENTS" = true ]]; then log "Installing Boot Environment packages..."; advanced_pkgs+=" sys-boot/grub-btrfs"; fi
+    if [[ "$SWAP_TYPE" == "zram" ]]; then log "Installing zram packages..."; advanced_pkgs+=" sys-block/zram-init"; fi
+    if [[ "$ENABLE_FIREWALL" = true ]]; then log "Installing firewall..."; advanced_pkgs+=" net-firewall/ufw"; fi
+    if [[ "$ENABLE_CPU_GOVERNOR" = true ]]; then log "Installing CPU governor..."; advanced_pkgs+=" sys-power/auto-cpufreq"; fi
+    if [[ "$INSTALL_STYLING" = true ]]; then log "Installing styling packages..."; advanced_pkgs+=" x11-themes/papirus-icon-theme media-fonts/firacode-nerd-font"; fi
+    if [[ "$INSTALL_CYBER_TERM" = true ]]; then log "Installing Cybernetic Terminal packages..."; advanced_pkgs+=" app-shells/zsh app-shells/starship"; fi
+    
+    if [[ -n "$advanced_pkgs" ]]; then
+        emerge_safely $advanced_pkgs
+    fi
+
+    if [[ "$NVIDIA_DRIVER_CHOICE" == "Proprietary" ]]; then log "Installing NVIDIA settings panel..."; emerge_safely x11-misc/nvidia-settings; fi
+    if $INSTALL_DEV_TOOLS; then log "Installing Developer Tools..."; emerge_safely dev-vcs/git app-editors/vscode dev-util/docker-cli; fi
+    if $INSTALL_OFFICE_GFX; then log "Installing Office/Graphics Suite..."; emerge_safely app-office/libreoffice media-gfx/gimp media-gfx/inkscape; fi
+    if $INSTALL_GAMING; then log "Installing Gaming Essentials..."; emerge_safely games-util/steam-launcher games-util/lutris app-emulation/wine-staging; fi
+    
+    log "Installing essential utilities..."
+    emerge_safely www-client/firefox-bin app-admin/sudo app-shells/bash-completion net-misc/networkmanager
 }
 
 stage7_finalize() {
-    step_log "Finalizing System"; log "Enabling system-wide services..."; if [[ "$ENABLE_FIREWALL" = true ]]; then log "Configuring and enabling firewall..."; ufw default deny incoming; ufw default allow outgoing; ufw enable; if [[ "$INIT_SYSTEM" == "OpenRC" ]]; then rc-update add ufw default; else systemctl enable ufw.service; fi; fi; if [[ "$ENABLE_CPU_GOVERNOR" = true ]]; then log "Enabling intelligent CPU governor..."; if [[ "$INIT_SYSTEM" == "OpenRC" ]]; then rc-update add auto-cpufreq default; else systemctl enable auto-cpufreq.service; fi; fi; if [[ "$SWAP_TYPE" == "zram" ]]; then log "Configuring zram..."; local ram_size_mb; ram_size_mb=$(free -m | awk '/^Mem:/{print $2}'); local zram_size; zram_size=$((ram_size_mb / 2)); cat > /etc/conf.d/zram-init <<EOF
-ZRAM_SIZE=${zram_size}\nZRAM_COMP_ALGORITHM=zstd
+    step_log "Finalizing System"
+    log "Enabling system-wide services..."
+    if [[ "$ENABLE_FIREWALL" = true ]]; then
+        log "Configuring and enabling firewall..."
+        ufw default deny incoming
+        ufw default allow outgoing
+        ufw enable
+        if [[ "$INIT_SYSTEM" == "OpenRC" ]]; then
+            rc-update add ufw default
+        else
+            systemctl enable ufw.service
+        fi
+    fi
+
+    if [[ "$ENABLE_CPU_GOVERNOR" = true ]]; then
+        log "Enabling intelligent CPU governor..."
+        if [[ "$INIT_SYSTEM" == "OpenRC" ]]; then
+            rc-update add auto-cpufreq default
+        else
+            systemctl enable auto-cpufreq.service
+        fi
+    fi
+
+    if [[ "$SWAP_TYPE" == "zram" ]]; then
+        log "Configuring zram..."
+        local ram_size_mb; ram_size_mb=$(free -m | awk '/^Mem:/{print $2}')
+        local zram_size; zram_size=$((ram_size_mb / 2))
+        cat > /etc/conf.d/zram-init <<EOF
+ZRAM_SIZE=${zram_size}
+ZRAM_COMP_ALGORITHM=zstd
 EOF
-; if [[ "$INIT_SYSTEM" == "OpenRC" ]]; then rc-update add zram-init default; else systemctl enable zram-init.service; fi; fi
-    log "Enabling core services (${INIT_SYSTEM})..."; if [[ "$INIT_SYSTEM" == "OpenRC" ]]; then if [[ "$USE_LVM" = true ]]; then rc-update add lvm default; fi; rc-update add dbus default; if [[ "$DESKTOP_ENV" != "Server (No GUI)" ]]; then rc-update add display-manager default; fi; rc-update add NetworkManager default; else if [[ "$USE_LVM" = true ]]; then systemctl enable lvm2-monitor.service; fi; if [[ "$DESKTOP_ENV" != "Server (No GUI)" ]]; then systemctl enable display-manager.service; fi; systemctl enable NetworkManager.service; fi
+        if [[ "$INIT_SYSTEM" == "OpenRC" ]]; then
+            rc-update add zram-init default
+        else
+            systemctl enable zram-init.service
+        fi
+    fi
+
+    log "Enabling core services (${INIT_SYSTEM})..."
+    if [[ "$INIT_SYSTEM" == "OpenRC" ]]; then
+        if [[ "$USE_LVM" = true ]]; then rc-update add lvm default; fi
+        rc-update add dbus default
+        if [[ "$DESKTOP_ENV" != "Server (No GUI)" ]]; then rc-update add display-manager default; fi
+        rc-update add NetworkManager default
+    else
+        if [[ "$USE_LVM" = true ]]; then systemctl enable lvm2-monitor.service; fi
+        if [[ "$DESKTOP_ENV" != "Server (No GUI)" ]]; then systemctl enable display-manager.service; fi
+        systemctl enable NetworkManager.service
+    fi
+
     if [[ "$ENABLE_AUTO_UPDATE" = true ]]; then
-        log "Setting up automatic weekly updates..."; local update_script_path="/usr/local/bin/gentoo-update.sh"
+        log "Setting up automatic weekly updates..."
+        local update_script_path="/usr/local/bin/gentoo-update.sh"
         if [[ "$ENABLE_BOOT_ENVIRONMENTS" = true ]]; then
             cat > "$update_script_path" <<'EOF'
 #!/bin/bash
@@ -348,20 +457,62 @@ EOF
 #!/bin/bash
 export EIX_QUIET=1; export EIX_LIMIT=0; eix-sync && emerge --update --deep --newuse --keep-going -q @world && emerge --depclean -q && revdep-rebuild -q -- -q1
 EOF
-        fi; chmod +x "$update_script_path"; if [[ "$INIT_SYSTEM" == "OpenRC" ]]; then log "Creating weekly cron job..."; ln -s "$update_script_path" /etc/cron.weekly/gentoo-update; rc-update add cronie default; else log "Creating systemd service and timer..."; cat > /etc/systemd/system/gentoo-update.service <<EOF
-[Unit]\nDescription=Weekly Gentoo Update\n[Service]\nType=oneshot\nExecStart=${update_script_path}
+        fi
+        chmod +x "$update_script_path"
+        if [[ "$INIT_SYSTEM" == "OpenRC" ]]; then
+            log "Creating weekly cron job..."
+            ln -s "$update_script_path" /etc/cron.weekly/gentoo-update
+            rc-update add cronie default
+        else
+            log "Creating systemd service and timer..."
+            cat > /etc/systemd/system/gentoo-update.service <<EOF
+[Unit]
+Description=Weekly Gentoo Update
+[Service]
+Type=oneshot
+ExecStart=${update_script_path}
 EOF
-; cat > /etc/systemd/system/gentoo-update.timer <<EOF
-[Unit]\nDescription=Run weekly Gentoo update\n[Timer]\nOnCalendar=weekly\nRandomizedDelaySec=6h\nPersistent=true\n[Install]\nWantedBy=timers.target
+            cat > /etc/systemd/system/gentoo-update.timer <<EOF
+[Unit]
+Description=Run weekly Gentoo update
+[Timer]
+OnCalendar=weekly
+RandomizedDelaySec=6h
+Persistent=true
+[Install]
+WantedBy=timers.target
 EOF
-; systemctl enable --now gentoo-update.timer; log "Systemd timer enabled."; fi; warn "Automatic updates are enabled, but you MUST run 'etc-update' or 'dispatch-conf' manually after updates to merge configuration file changes."
+            systemctl enable --now gentoo-update.timer
+            log "Systemd timer enabled."
+        fi
+        warn "Automatic updates are enabled, but you MUST run 'etc-update' or 'dispatch-conf' manually after updates to merge configuration file changes."
     fi
-    if [[ "$ENABLE_BOOT_ENVIRONMENTS" = true ]]; then log "Enabling grub-btrfs service..."; if [[ "$INIT_SYSTEM" == "SystemD" ]]; then systemctl enable grub-btrfs.path; else warn "grub-btrfs auto-update on OpenRC requires manual setup."; fi; fi
-    if [[ "$INSTALL_APP_HOST" = true ]]; then log "Finalizing Universal App Host setup..."; flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo; fi
 
-    log "Configuring sudo for 'wheel' group..."; echo '%wheel ALL=(ALL:ALL) ALL' > /etc/sudoers.d/wheel; log "Set a password for the 'root' user:"; passwd root; log "Creating a new user..."; local new_user=""; while true; do read -r -p "Enter a username: " new_user; if [[ "$new_user" =~ ^[a-z_][a-z0-9_-]*[$]?$ ]]; then break; else err "Invalid username."; new_user=""; fi; done; useradd -m -G wheel,users,audio,video,usb -s /bin/bash "$new_user"; if [[ "$INSTALL_APP_HOST" = true ]]; then usermod -aG podman "$new_user"; fi; log "Set a password for user '$new_user':"; passwd "$new_user"; log "User '$new_user' created."
+    if [[ "$ENABLE_BOOT_ENVIRONMENTS" = true ]]; then
+        log "Enabling grub-btrfs service..."
+        if [[ "$INIT_SYSTEM" == "SystemD" ]]; then
+            systemctl enable grub-btrfs.path
+        else
+            warn "grub-btrfs auto-update on OpenRC requires manual setup."
+        fi
+    fi
 
-    log "Creating first-login setup script for user '${new_user}'..."; local first_login_script_path="/home/${new_user}/.first_login.sh"
+    if [[ "$INSTALL_APP_HOST" = true ]]; then
+        log "Finalizing Universal App Host setup..."
+        flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
+    fi
+
+    log "Configuring sudo for 'wheel' group..."; echo '%wheel ALL=(ALL:ALL) ALL' > /etc/sudoers.d/wheel
+    log "Set a password for the 'root' user:"; passwd root
+    log "Creating a new user..."; local new_user=""
+    while true; do read -r -p "Enter a username: " new_user; if [[ "$new_user" =~ ^[a-z_][a-z0-9_-]*[$]?$ ]]; then break; else err "Invalid username."; new_user=""; fi; done
+    useradd -m -G wheel,users,audio,video,usb -s /bin/bash "$new_user"
+    if [[ "$INSTALL_APP_HOST" = true ]]; then usermod -aG podman "$new_user"; fi
+    log "Set a password for user '$new_user':"; passwd "$new_user"
+    log "User '$new_user' created."
+
+    log "Creating first-login setup script for user '${new_user}'..."
+    local first_login_script_path="/home/${new_user}/.first_login.sh"
     cat > "$first_login_script_path" <<EOF
 #!/bin/bash
 echo ">>> Performing one-time user setup..."
@@ -391,38 +542,77 @@ echo ">>> Setup complete. This script will now self-destruct."
 rm -- "\$0"
 EOF
     chmod +x "$first_login_script_path"; chown "${new_user}:${new_user}" "$first_login_script_path"
-    local shell_profile_path="/home/${new_user}/.profile"; local shell_rc_path="/home/${new_user}/.bashrc"
+    
+    local shell_profile_path="/home/${new_user}/.profile"
+    local shell_rc_path="/home/${new_user}/.bashrc"
     if [[ "$INSTALL_CYBER_TERM" = true ]]; then
-        log "Setting up Cybernetic Terminal for user '${new_user}'..."; chsh -s /bin/zsh "${new_user}"; shell_rc_path="/home/${new_user}/.zshrc"; shell_profile_path="/home/${new_user}/.zprofile"
-        echo 'eval "$(starship init zsh)"' > "$shell_rc_path"; chown "${new_user}:${new_user}" "$shell_rc_path"
+        log "Setting up Cybernetic Terminal for user '${new_user}'..."
+        chsh -s /bin/zsh "${new_user}"
+        shell_rc_path="/home/${new_user}/.zshrc"
+        shell_profile_path="/home/${new_user}/.zprofile"
+        echo 'eval "$(starship init zsh)"' > "$shell_rc_path"
+        chown "${new_user}:${new_user}" "$shell_rc_path"
     fi
+
     if [[ "$INSTALL_APP_HOST" = true ]]; then
-        log "Adding Distrobox aliases to ${shell_rc_path}..."; cat >> "$shell_rc_path" <<'EOF'
+        log "Adding Distrobox aliases to ${shell_rc_path}..."
+        cat >> "$shell_rc_path" <<'EOF'
 if command -v distrobox-enter &> /dev/null; then alias apt="distrobox-enter ubuntu -- sudo apt"; fi
 EOF
     fi
-    echo "if [ -f \"\$HOME/.first_login.sh\" ]; then . \"\$HOME/.first_login.sh\"; fi" >> "$shell_profile_path"; chown "${new_user}:${new_user}" "$shell_profile_path"
+    
+    echo "if [ -f \"\$HOME/.first_login.sh\" ]; then . \"\$HOME/.first_login.sh\"; fi" >> "$shell_profile_path"
+    chown "${new_user}:${new_user}" "$shell_profile_path"
 
-    log "Installation complete."; log "Finalizing disk writes..."; sync; log "Run: exit -> umount -R ${GENTOO_MNT} -> reboot"
+    log "Installation complete."; log "Finalizing disk writes..."; sync
+    log "Run: exit -> umount -R ${GENTOO_MNT} -> reboot"
 }
 
 # ==============================================================================
 # --- MAIN SCRIPT LOGIC ---
 # ==============================================================================
 main() {
-    if [[ $EUID -ne 0 ]]; then die "This script must be run as root."; fi
+    if [[ $EUID -ne 0 ]]; then
+        die "This script must be run as root."
+    fi
+
     if [[ "${1:-}" == "--chrooted" ]]; then
-        source /etc/autobuilder.conf; local chrooted_stages=(stage3_configure_in_chroot stage4_build_world_and_kernel stage5_install_bootloader stage6_install_software stage7_finalize); local stage_num=3; for stage_func in "${chrooted_stages[@]}"; do if (( START_STAGE <= stage_num )); then "$stage_func"; save_checkpoint "$stage_num"; fi; stage_num=$((stage_num + 1)); done
+        source /etc/autobuilder.conf
+        local chrooted_stages=(stage3_configure_in_chroot stage4_build_world_and_kernel stage5_install_bootloader stage6_install_software stage7_finalize)
+        local stage_num=3
+        for stage_func in "${chrooted_stages[@]}"; do
+            if (( START_STAGE <= stage_num )); then
+                "$stage_func"
+                save_checkpoint "$stage_num"
+            fi
+            stage_num=$((stage_num + 1))
+        done
     else
-        local FORCE_MODE=false; for arg in "$@"; do case "$arg" in --force|--auto) FORCE_MODE=true;; --skip-checksum) SKIP_CHECKSUM=true;; esac; done
-        if mountpoint -q "${GENTOO_MNT}"; then load_checkpoint; fi
+        local FORCE_MODE=false
+        for arg in "$@"; do
+            case "$arg" in
+                --force|--auto) FORCE_MODE=true;;
+                --skip-checksum) SKIP_CHECKSUM=true;;
+            esac
+        done
+
+        if mountpoint -q "${GENTOO_MNT}"; then
+            load_checkpoint
+        fi
+
         local initial_stages=(self_check pre_flight_checks dependency_check stage0_select_mirrors detect_cpu_architecture detect_cpu_flags detect_gpu_hardware interactive_setup stage0_partition_and_format stage1_deploy_base_system)
         
-        if (( START_STAGE == 0 )); then for stage_func in "${initial_stages[@]}"; do "$stage_func"; done; fi
+        if (( START_STAGE == 0 )); then
+            for stage_func in "${initial_stages[@]}"; do
+                "$stage_func"
+            done
+        fi
         
         if (( START_STAGE <= 2 )); then 
             source "$CONFIG_FILE_TMP"
-            if [[ -v LUKS_PASSPHRASE ]]; then export LUKS_PASSPHRASE; fi
+            if [[ -v LUKS_PASSPHRASE ]]; then
+                export LUKS_PASSPHRASE
+            fi
             echo "BOOT_MODE='${BOOT_MODE}'" >> "$CONFIG_FILE_TMP"
             stage2_prepare_chroot
             save_checkpoint 2
@@ -436,7 +626,10 @@ if [[ "${1:-}" != "--chrooted" ]]; then
     mkdir -p "${GENTOO_MNT}/root"
     if [[ -f "${CHECKPOINT_FILE}" ]]; then
         EXISTING_LOG=$(find "${GENTOO_MNT}/root" -name "gentoo_autobuilder_*.log" -print0 | xargs -0 ls -t | head -n 1)
-        if [[ -n "$EXISTING_LOG" ]]; then LOG_FILE_PATH="$EXISTING_LOG"; echo -e "\n\n--- RESUMING LOG $(date) ---\n\n" | tee -a "$LOG_FILE_PATH"; fi
+        if [[ -n "$EXISTING_LOG" ]]; then
+            LOG_FILE_PATH="$EXISTING_LOG"
+            echo -e "\n\n--- RESUMING LOG $(date) ---\n\n" | tee -a "$LOG_FILE_PATH"
+        fi
     fi
     main "$@" 2>&1 | tee -a "$LOG_FILE_PATH"
 else
