@@ -2,19 +2,14 @@
 # shellcheck disable=SC1091,SC2016,SC2034
 
 # The Gentoo Genesis Engine
-# Version: 10.3.14 "The Sentinel"
+# Version: 10.3.15 "The Resetter"
 #
 # Changelog:
-# - v10.3.14:
-#   - FUTURE-PROOFING: Replaced fragile `lspci | grep` with robust, machine-readable `lspci -mm`
-#     parsing to prevent failures from future output format changes.
-#   - ROBUSTNESS: Added a check to verify the ZRAM kernel module was loaded successfully.
-#   - ROBUSTNESS: Hardened the GRUB configuration logic. It now verifies that kernel parameters
-#     were added correctly via `sed` and uses a fallback method if the modification fails silently.
-#   - COMPATIBILITY: Broadened `ACCEPT_LICENSE` to prevent future installation failures if a
-#     package requires a new, unlisted license.
-# - v10.3.13: Fixed the "OpenMP support" paradox by splitting dependency installation into two stages.
-# - v10.3.12: Implemented prophylactic ZRAM setup to prevent OOM errors on LiveCDs.
+# - v10.3.15:
+#   - CRITICAL FIX: Fixed `Device or resource busy` error when setting up ZRAM on LiveCDs
+#     that pre-configure zram devices. The script now explicitly resets the zram device
+#     before configuration, ensuring a clean state.
+# - v10.3.14: Implemented future-proofing for hardware detection and GRUB configuration.
 
 # --- Self-Awareness Check ---
 if [ -z "$BASH_VERSION" ]; then
@@ -86,6 +81,13 @@ ensure_dependencies() {
             if modprobe zram; then
                 local total_mem_kb; total_mem_kb=$(grep MemTotal /proc/meminfo | awk '{print $2}')
                 local zram_size_kb=$(( total_mem_kb / 2 )); if [ "$zram_size_kb" -gt 2097152 ]; then zram_size_kb=2097152; fi
+                
+                ### --- КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ --- ###
+                # Принудительно сбрасываем устройство zram0 перед настройкой.
+                # Это решает проблему "Device or resource busy" на LiveCD, которые уже используют zram.
+                echo 1 > /sys/block/zram0/reset
+                ### --- КОНЕЦ ИСПРАВЛЕНИЯ --- ###
+
                 echo $(( zram_size_kb * 1024 )) > /sys/block/zram0/disksize
                 mkswap /dev/zram0; swapon /dev/zram0 -p 10; log "ZRAM swap activated successfully."
             else
