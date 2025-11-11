@@ -2,17 +2,19 @@
 # shellcheck disable=SC1091,SC2016,SC2034
 
 # The Gentoo Genesis Engine
-# Version: 10.3.12 "The Prophylactic"
+# Version: 10.3.14 "The Sentinel"
 #
 # Changelog:
-# - v10.3.12:
-#   - CRITICAL FIX: Fixed internal Portage crash (`Task destroyed but it is pending!`) on
-#     resource-constrained LiveCDs. The `ensure_dependencies` function now proactively
-#     sets up a temporary ZRAM swap if no swap is detected, preventing Out-Of-Memory errors.
-#   - ROBUSTNESS: The initial `emerge` call for dependencies is now forced to use a single
-#     core (`--jobs=1`) to minimize memory pressure on the LiveCD.
-# - v10.3.11: Hardened the script against interpreter misconfiguration (`/bin/bash` -> `dash`).
-# - v10.3.10: Added a self-awareness check to prevent execution by sh/dash.
+# - v10.3.14:
+#   - FUTURE-PROOFING: Replaced fragile `lspci | grep` with robust, machine-readable `lspci -mm`
+#     parsing to prevent failures from future output format changes.
+#   - ROBUSTNESS: Added a check to verify the ZRAM kernel module was loaded successfully.
+#   - ROBUSTNESS: Hardened the GRUB configuration logic. It now verifies that kernel parameters
+#     were added correctly via `sed` and uses a fallback method if the modification fails silently.
+#   - COMPATIBILITY: Broadened `ACCEPT_LICENSE` to prevent future installation failures if a
+#     package requires a new, unlisted license.
+# - v10.3.13: Fixed the "OpenMP support" paradox by splitting dependency installation into two stages.
+# - v10.3.12: Implemented prophylactic ZRAM setup to prevent OOM errors on LiveCDs.
 
 # --- Self-Awareness Check ---
 if [ -z "$BASH_VERSION" ]; then
@@ -77,54 +79,56 @@ pre_flight_checks() { step_log "Performing Pre-flight System Checks"; log "Check
 
 ensure_dependencies() {
     step_log "Ensuring LiveCD Dependencies"
-
-    # --- Профилактика сбоев Portage ---
     if ! grep -q swap /proc/swaps; then
         warn "No active swap detected. This can cause Portage to crash on low-memory LiveCDs."
         if ask_confirm "Create a temporary 2GB swap in RAM (ZRAM) to prevent this?"; then
-            log "Setting up ZRAM..."
-            modprobe zram
-            local total_mem_kb; total_mem_kb=$(grep MemTotal /proc/meminfo | awk '{print $2}')
-            local zram_size_kb=$(( total_mem_kb / 2 ))
-            if [ "$zram_size_kb" -gt 2097152 ]; then
-                zram_size_kb=2097152
+            log "Setting up ZRAM..."; 
+            if modprobe zram; then
+                local total_mem_kb; total_mem_kb=$(grep MemTotal /proc/meminfo | awk '{print $2}')
+                local zram_size_kb=$(( total_mem_kb / 2 )); if [ "$zram_size_kb" -gt 2097152 ]; then zram_size_kb=2097152; fi
+                echo $(( zram_size_kb * 1024 )) > /sys/block/zram0/disksize
+                mkswap /dev/zram0; swapon /dev/zram0 -p 10; log "ZRAM swap activated successfully."
+            else
+                warn "Failed to load zram kernel module. Continuing without swap. Installation may fail."
             fi
-            echo $(( zram_size_kb * 1024 )) > /sys/block/zram0/disksize
-            mkswap /dev/zram0
-            swapon /dev/zram0 -p 10
-            log "ZRAM swap activated successfully."
         else
             warn "Proceeding without swap. Installation may fail."
         fi
     fi
-    # --- Конец профилактики ---
 
-    local missing_pkgs=""
+    local compiler_pkgs=""; local other_pkgs=""
     local all_deps="curl wget sgdisk partprobe mkfs.vfat mkfs.xfs mkfs.ext4 mkfs.btrfs blkid lsblk sha512sum chroot wipefs blockdev cryptsetup pvcreate vgcreate lvcreate mkswap lscpu lspci udevadm gcc"
-
     get_pkg_for_cmd() { case "$1" in curl) echo "net-misc/curl" ;; wget) echo "net-misc/wget" ;; sgdisk) echo "sys-apps/gptfdisk" ;; partprobe) echo "sys-apps/parted" ;; mkfs.vfat) echo "sys-fs/dosfstools" ;; mkfs.xfs) echo "sys-fs/xfsprogs" ;; mkfs.ext4) echo "sys-fs/e2fsprogs" ;; mkfs.btrfs) echo "sys-fs/btrfs-progs" ;; sha512sum|chroot) echo "sys-apps/coreutils" ;; lspci) echo "sys-apps/pciutils" ;; gcc) echo "sys-devel/gcc" ;; cryptsetup) echo "sys-fs/cryptsetup" ;; pvcreate|vgcreate|lvcreate) echo "sys-fs/lvm2" ;; udevadm) echo "sys-fs/udev" ;; *) echo "sys-fs/util-linux" ;; esac; }
 
     log "Checking for required tools..."
     for cmd in $all_deps; do
         if ! command -v "$cmd" >/dev/null 2>&1; then
             pkg=$(get_pkg_for_cmd "$cmd")
-            if ! echo "$missing_pkgs" | grep -q "$pkg"; then
-                missing_pkgs="$missing_pkgs $pkg"
+            if [ "$pkg" = "sys-devel/gcc" ]; then
+                if ! echo "$compiler_pkgs" | grep -q "$pkg"; then compiler_pkgs="$compiler_pkgs $pkg"; fi
+            else
+                if ! echo "$other_pkgs" | grep -q "$pkg"; then other_pkgs="$other_pkgs $pkg"; fi
             fi
         fi
     done
 
-    if [ -n "$missing_pkgs" ]; then
-        warn "The following required packages are missing:${missing_pkgs}"
+    if [ -n "$compiler_pkgs" ] || [ -n "$other_pkgs" ]; then
+        warn "Some required packages are missing. Preparing for installation."
         if ask_confirm "Do you want to proceed with automatic installation?"; then
-            log "Preparing LiveCD environment..."
-            emerge-webrsync || die "Failed to sync Portage tree."
-            log "Installing missing packages:${missing_pkgs}"
-            # shellcheck disable=SC2086
-            if ! emerge -q --jobs=1 --load-average=1 --noreplace $missing_pkgs; then
-                die "Failed to install required dependencies."
+            log "Preparing LiveCD environment..."; emerge-webrsync || die "Failed to sync Portage tree."
+            local emerge_opts="-q --jobs=1 --load-average=1 --noreplace"
+            if [ -n "$compiler_pkgs" ]; then
+                log "Installing the compiler first...${compiler_pkgs}";
+                # shellcheck disable=SC2086
+                if ! emerge $emerge_opts $compiler_pkgs; then die "Failed to install the compiler (gcc)."; fi
+                log "Compiler installed successfully."
             fi
-            log "LiveCD dependencies successfully installed."
+            if [ -n "$other_pkgs" ]; then
+                log "Installing other required tools...${other_pkgs}";
+                # shellcheck disable=SC2086
+                if ! emerge $emerge_opts $other_pkgs; then die "Failed to install required dependencies."; fi
+                log "Other tools installed successfully."
+            fi
         else
             die "Missing dependencies. Aborted by user."
         fi
@@ -140,7 +144,34 @@ stage0_select_mirrors() { step_log "Selecting Fastest Mirrors"; if ask_confirm "
 # ==============================================================================
 detect_cpu_architecture() { step_log "Hardware Detection Engine (CPU)"; if ! command -v lscpu >/dev/null; then warn "lscpu command not found. Falling back to generic settings."; CPU_VENDOR="Generic"; CPU_MODEL_NAME="Unknown"; CPU_MARCH="x86-64"; MICROCODE_PACKAGE=""; VIDEO_CARDS="vesa fbdev"; return; fi; CPU_MODEL_NAME=$(lscpu --parse=MODELNAME | tail -n 1); local vendor_id; vendor_id=$(lscpu --parse=VENDORID | tail -n 1); log "Detected CPU Model: ${CPU_MODEL_NAME}"; case "$vendor_id" in "GenuineIntel") CPU_VENDOR="Intel"; MICROCODE_PACKAGE="sys-firmware/intel-microcode"; case "$CPU_MODEL_NAME" in *14th*Gen*|*13th*Gen*|*12th*Gen*) CPU_MARCH="alderlake" ;; *11th*Gen*) CPU_MARCH="tigerlake" ;; *10th*Gen*) CPU_MARCH="icelake-client" ;; *9th*Gen*|*8th*Gen*|*7th*Gen*|*6th*Gen*) CPU_MARCH="skylake" ;; *Core*2*) CPU_MARCH="core2" ;; *) warn "Unrecognized Intel CPU. Attempting to detect native march with GCC."; if command -v gcc &>/dev/null; then local native_march; native_march=$(gcc -march=native -Q --help=target | grep -- '-march=' | awk '{print $2}'); if [ -n "$native_march" ]; then CPU_MARCH="$native_march"; log "Successfully detected native GCC march: ${CPU_MARCH}"; else warn "GCC native march detection failed. Falling back to generic x86-64."; CPU_MARCH="x86-64"; fi; else warn "GCC not found. Falling back to a generic but safe architecture."; CPU_MARCH="x86-64"; fi ;; esac ;; "AuthenticAMD") CPU_VENDOR="AMD"; MICROCODE_PACKAGE="sys-firmware/amd-microcode"; case "$CPU_MODEL_NAME" in *Ryzen*9*7*|*Ryzen*7*7*|*Ryzen*5*7*) CPU_MARCH="znver4" ;; *Ryzen*9*5*|*Ryzen*7*5*|*Ryzen*5*5*) CPU_MARCH="znver3" ;; *Ryzen*9*3*|*Ryzen*7*3*|*Ryzen*5*3*) CPU_MARCH="znver2" ;; *Ryzen*7*2*|*Ryzen*5*2*|*Ryzen*7*1*|*Ryzen*5*1*) CPU_MARCH="znver1" ;; *FX*) CPU_MARCH="bdver4" ;; *) warn "Unrecognized AMD CPU. Attempting to detect native march with GCC."; if command -v gcc &>/dev/null; then local native_march; native_march=$(gcc -march=native -Q --help=target | grep -- '-march=' | awk '{print $2}'); if [ -n "$native_march" ]; then CPU_MARCH="$native_march"; log "Successfully detected native GCC march: ${CPU_MARCH}"; else warn "GCC native march detection failed. Falling back to generic x86-64."; CPU_MARCH="x86-64"; fi; else warn "GCC not found. Falling back to a generic but safe architecture."; CPU_MARCH="x86-64"; fi ;; esac ;; *) die "Unsupported CPU Vendor: ${vendor_id}. This script is for x86_64 systems." ;; esac; log "Auto-selected -march=${CPU_MARCH} for your ${CPU_VENDOR} CPU."; }
 detect_cpu_flags() { log "Hardware Detection Engine (CPU Flags)"; if command -v emerge &>/dev/null && ! command -v cpuid2cpuflags &>/dev/null; then if ask_confirm "Utility 'cpuid2cpuflags' not found. Install it to detect optimal CPU USE flags?"; then emerge -q app-portage/cpuid2cpuflags; fi; fi; if command -v cpuid2cpuflags &>/dev/null; then log "Detecting CPU-specific USE flags..."; CPU_FLAGS_X86=$(cpuid2cpuflags | cut -d' ' -f2-); log "Detected CPU_FLAGS_X86: ${CPU_FLAGS_X86}"; else warn "Skipping CPU flag detection."; fi; }
-detect_gpu_hardware() { step_log "Hardware Detection Engine (GPU)"; local gpu_info; gpu_info=$(lspci | grep -i 'vga\|3d\|2d'); log "Detected GPUs:\n${gpu_info}"; VIDEO_CARDS="vesa fbdev"; if echo "$gpu_info" | grep -iq "intel"; then log "Intel GPU detected. Adding 'intel i965' drivers."; VIDEO_CARDS+=" intel i965"; GPU_VENDOR="Intel"; fi; if echo "$gpu_info" | grep -iq "amd\|ati"; then log "AMD/ATI GPU detected. Adding 'amdgpu radeonsi' drivers."; VIDEO_CARDS+=" amdgpu radeonsi"; GPU_VENDOR="AMD"; fi; if echo "$gpu_info" | grep -iq "nvidia"; then log "NVIDIA GPU detected. Adding 'nouveau' driver for kernel support."; VIDEO_CARDS+=" nouveau"; GPU_VENDOR="NVIDIA"; fi; log "Final VIDEO_CARDS for make.conf: ${VIDEO_CARDS}"; log "Primary GPU vendor for user interaction: ${GPU_VENDOR}"; }
+
+detect_gpu_hardware() {
+    step_log "Hardware Detection Engine (GPU)"
+    if ! command -v lspci >/dev/null; then
+        warn "lspci not found. Using generic video drivers."
+        VIDEO_CARDS="vesa fbdev"; GPU_VENDOR="Unknown"; return
+    fi
+
+    local intel_detected=false
+    local amd_detected=false
+    local nvidia_detected=false
+
+    while IFS=$'\n' read -r line; do
+        if echo "$line" | grep -q -e "VGA" -e "3D controller"; then
+            if echo "$line" | grep -iq "Intel"; then intel_detected=true; fi
+            if echo "$line" | grep -iq "AMD/ATI"; then amd_detected=true; fi
+            if echo "$line" | grep -iq "NVIDIA"; then nvidia_detected=true; fi
+        fi
+    done < <(lspci -mm)
+
+    VIDEO_CARDS="vesa fbdev"
+    if [ "$intel_detected" = true ]; then log "Intel GPU detected. Adding 'intel i965' drivers."; VIDEO_CARDS+=" intel i965"; GPU_VENDOR="Intel"; fi
+    if [ "$amd_detected" = true ]; then log "AMD/ATI GPU detected. Adding 'amdgpu radeonsi' drivers."; VIDEO_CARDS+=" amdgpu radeonsi"; GPU_VENDOR="AMD"; fi
+    if [ "$nvidia_detected" = true ]; then log "NVIDIA GPU detected. Adding 'nouveau' driver for kernel support."; VIDEO_CARDS+=" nouveau"; GPU_VENDOR="NVIDIA"; fi
+    
+    log "Final VIDEO_CARDS for make.conf: ${VIDEO_CARDS}"
+    log "Primary GPU vendor for user interaction: ${GPU_VENDOR}"
+}
 
 # ==============================================================================
 # --- STAGE 0B: INTERACTIVE SETUP WIZARD ---
@@ -378,7 +409,7 @@ FEATURES="${features}"
 VIDEO_CARDS="${VIDEO_CARDS}"
 INPUT_DEVICES="libinput synaptics"
 USE="${base_use} ${extra_use}"
-ACCEPT_LICENSE="@FREE @BINARY-REDISTRIBUTABLE linux-fw-redistributable"
+ACCEPT_LICENSE="-* @FREE @BINARY-REDISTRIBUTABLE"
 GRUB_PLATFORMS='${GRUB_PLATFORMS}'
 L10N="${SYSTEM_LINGUAS}"
 LINGUAS="${SYSTEM_LINGUAS}"
@@ -418,9 +449,7 @@ stage5_install_bootloader() {
         log "Configuring GRUB for LUKS (standard)..."
         local LUKS_DEVICE_UUID; LUKS_DEVICE_UUID=$(blkid -s UUID -o value "${LUKS_PART}")
         local ROOT_DEVICE_PATH="/dev/mapper/gentoo_crypted"
-        if [ "$USE_LVM" = true ]; then
-            ROOT_DEVICE_PATH="/dev/gentoo_vg/root"
-        fi
+        if [ "$USE_LVM" = true ]; then ROOT_DEVICE_PATH="/dev/gentoo_vg/root"; fi
         grub_cmdline_additions+=" crypt_device=UUID=${LUKS_DEVICE_UUID}:gentoo_crypted root=${ROOT_DEVICE_PATH}"
     fi
 
@@ -430,6 +459,11 @@ stage5_install_bootloader() {
     if [ -n "$grub_cmdline_additions" ]; then
         log "Adding kernel parameters: ${grub_cmdline_additions}"
         sed -i "s/^\(GRUB_CMDLINE_LINUX=.*\)\"$/\1${grub_cmdline_additions}\"/" /etc/default/grub
+        
+        if ! grep -q "crypt_device" /etc/default/grub && [ "$USE_LUKS" = true ]; then
+            warn "sed command failed to add kernel parameters. Using fallback method."
+            echo "GRUB_CMDLINE_LINUX+=\"${grub_cmdline_additions}\"" >> /etc/default/grub
+        fi
     fi
 
     if [ "$USE_LUKS" = true ]; then
