@@ -29,19 +29,48 @@
 #   - CRITICAL FIX: Resolved `make: command not found` error during bootstrap.
 # --- Self-Awareness Check ---
 SCRIPT_TERMINATOR="" # This will be set to "END" on the very last line of the script.
+
+# Validate script has been completely downloaded before proceeding
+if ! command -v head &>/dev/null || ! command -v tail &>/dev/null || ! command -v wc &>/dev/null; then
+    echo "Error: Essential utilities (head, tail, wc) are missing. Cannot perform integrity check." >&2
+    echo "This script requires a proper Gentoo LiveCD environment. Please ensure you're using the latest Gentoo Minimal Install CD." >&2
+    exit 1
+fi
+
+# Verify the script is not truncated by checking for the terminator at the end
+if [ "$(tail -n 1 "$0" | grep -c 'SCRIPT_TERMINATOR="END"')" -eq 0 ]; then
+    echo "Error: Script appears to be truncated or incomplete." >&2
+    echo "Please download the complete script using wget or curl:" >&2
+    echo "  wget https://raw.githubusercontent.com/.../script.sh" >&2
+    echo "  curl -O https://raw.githubusercontent.com/.../script.sh" >&2
+    exit 1
+fi
+
 if [ -z "$BASH_VERSION" ]; then
     echo "Error: This script must be run with bash, not sh or dash." >&2
     echo "Please run as: bash ${0}" >&2
     exit 1
 fi
+
+# Set strict error handling early
 set -euo pipefail
+
 # --- Configuration and Globals ---
 GENTOO_MNT="/mnt/gentoo"
-CONFIG_FILE_TMP=$(mktemp "/tmp/autobuilder.conf.XXXXXX")
+CONFIG_FILE_TMP=""
 CHECKPOINT_FILE="/tmp/.genesis_checkpoint"
 LOG_FILE_PATH="/tmp/gentoo_autobuilder_$(date +%F_%H-%M).log"
 START_STAGE=0
-# ... (остальные глобальные переменные)
+
+# Critical: Create temp config file safely
+if ! CONFIG_FILE_TMP=$(mktemp "/tmp/autobuilder.conf.XXXXXX"); then
+    echo "Error: Failed to create temporary configuration file." >&2
+    exit 1
+fi
+
+export GENTOO_MNT CONFIG_FILE_TMP CHECKPOINT_FILE LOG_FILE_PATH START_STAGE
+
+# Global variables initialization
 EFI_PART=""
 BOOT_PART=""
 ROOT_PART=""
@@ -59,56 +88,170 @@ FASTEST_MIRRORS=""
 MICROCODE_PACKAGE=""
 VIDEO_CARDS=""
 GPU_VENDOR="Unknown"
+FORCE_MODE=false
+
 # --- UX Enhancements & Logging ---
-C_RESET='\033[0m'; C_GREEN='\033[0;32m'; C_YELLOW='\033[0;33m'; C_RED='\033[0;31m'
-STEP_COUNT=0; TOTAL_STEPS=11
-log() { printf "${C_GREEN}[INFO] %s${C_RESET}\n" "$*"; }
-warn() { printf "${C_YELLOW}[WARN] %s${C_RESET}\n" "$*" >&2; }
-err() { printf "${C_RED}[ERROR] %s${C_RESET}\n" "$*" >&2; }
-step_log() { STEP_COUNT=$((STEP_COUNT + 1)); printf "\n${C_GREEN}>>> [STEP %s/%s] %s${C_RESET}\n" "$STEP_COUNT" "$TOTAL_STEPS" "$*"; }
-die() { err "$*"; exit 1; }
+C_RESET='\033[0m'
+C_GREEN='\033[0;32m'
+C_YELLOW='\033[0;33m'
+C_RED='\033[0;31m'
+STEP_COUNT=0
+TOTAL_STEPS=11
+
+# Check terminal capabilities before using colors
+if [ -t 1 ] && command -v tput &>/dev/null && [ "$(tput colors 2>/dev/null || echo 0)" -ge 8 ]; then
+    use_colors=true
+else
+    use_colors=false
+    C_RESET=''; C_GREEN=''; C_YELLOW=''; C_RED=''
+fi
+
+log() { 
+    printf "${C_GREEN}[INFO] %s${C_RESET}\n" "$*" | tee -a "$LOG_FILE_PATH"
+}
+
+warn() { 
+    printf "${C_YELLOW}[WARN] %s${C_RESET}\n" "$*" >&2 | tee -a "$LOG_FILE_PATH"
+}
+
+err() { 
+    printf "${C_RED}[ERROR] %s${C_RESET}\n" "$*" >&2 | tee -a "$LOG_FILE_PATH"
+}
+
+step_log() { 
+    STEP_COUNT=$((STEP_COUNT + 1))
+    printf "\n${C_GREEN}>>> [STEP %s/%s] %s${C_RESET}\n" "$STEP_COUNT" "$TOTAL_STEPS" "$*" | tee -a "$LOG_FILE_PATH"
+}
+
+die() { 
+    err "$*"
+    cleanup
+    exit 1
+}
+
 # ==============================================================================
 # --- ХЕЛПЕРЫ и Core Functions ---
 # ==============================================================================
 get_blkid_uuid() {
     local device=$1
+    if [ ! -e "$device" ]; then
+        die "Device $device does not exist. Cannot get UUID."
+    fi
+    
     if command -v blkid >/dev/null 2>&1; then
         if blkid -o value -s UUID "$device" >/dev/null 2>&1; then
             blkid -o value -s UUID "$device"
         elif blkid -s UUID -o value "$device" >/dev/null 2>&1; then
             blkid -s UUID -o value "$device"
         else
-            die "Could not get UUID for device $device. blkid command failed."
+            warn "Could not get UUID for device $device using standard blkid methods."
+            warn "Trying fallback method using udevadm..."
+            if command -v udevadm >/dev/null 2>&1; then
+                udevadm info --query=property --name="$device" | grep -i "ID_FS_UUID=" | cut -d'=' -f2
+            else
+                die "Could not get UUID for device $device. blkid command failed and udevadm is not available."
+            fi
         fi
     else
         die "blkid command not found. Please install sys-fs/util-linux."
     fi
 }
 
-save_checkpoint() { log "--- Checkpoint reached: Stage $1 completed. ---"; echo "$1" > "${CHECKPOINT_FILE}"; }
+# Check if filesystem is writable before performing operations
+check_filesystem_writable() {
+    local path=$1
+    local tmpfile
+    
+    if [ ! -d "$path" ]; then
+        mkdir -p "$path"
+    fi
+    
+    tmpfile=$(mktemp -p "$path" .writetest.XXXXXX || echo "")
+    if [ -z "$tmpfile" ] || [ ! -w "$tmpfile" ]; then
+        return 1
+    fi
+    rm -f "$tmpfile" 2>/dev/null || true
+    return 0
+}
+
+# Ensure critical filesystems are writable
+ensure_writable_filesystems() {
+    local critical_paths=("/tmp" "/var/tmp" "$GENTOO_MNT")
+    
+    # Check root filesystem
+    if ! check_filesystem_writable "/"; then
+        warn "Root filesystem is read-only. Attempting to remount as read-write..."
+        if ! mount -o remount,rw /; then
+            die "Failed to remount root filesystem as read-write. Please check dmesg for errors."
+        fi
+    fi
+    
+    # Check each critical path
+    for path in "${critical_paths[@]}"; do
+        if [ -d "$path" ] && ! check_filesystem_writable "$path"; then
+            warn "Filesystem at $path is read-only. This may cause installation to fail."
+            if ! mount -o remount,rw "$path" 2>/dev/null; then
+                warn "Could not remount $path as read-write. Continuing, but installation may fail."
+            fi
+        fi
+    done
+}
+
+save_checkpoint() { 
+    log "--- Checkpoint reached: Stage $1 completed. ---"
+    echo "$1" > "${CHECKPOINT_FILE}"
+    sync
+}
+
 load_checkpoint() {
     if [ -f "${CHECKPOINT_FILE}" ]; then
-        local last_stage; last_stage=$(cat "${CHECKPOINT_FILE}")
+        local last_stage
+        last_stage=$(cat "${CHECKPOINT_FILE}" 2>/dev/null || echo "0")
         warn "Previous installation was interrupted after Stage ${last_stage}."
         if ${FORCE_MODE:-false}; then
             warn "Force mode is active. Automatically restarting installation from scratch."
-            rm -f "${CHECKPOINT_FILE}"
+            rm -f "${CHECKPOINT_FILE}" 2>/dev/null || true
             return
         fi
-        read -r -p "Choose action: [C]ontinue, [R]estart from scratch, [A]bort: " choice
-        case "$choice" in
-            [cC]) START_STAGE=$((last_stage + 1)); log "Resuming installation from Stage ${START_STAGE}." ;;
-            [rR]) log "Restarting installation from scratch."; rm -f "${CHECKPOINT_FILE}" ;;
-            *) die "Installation aborted by user." ;;
-        esac
+        
+        local choice
+        while true; do
+            read -r -p "Choose action: [C]ontinue, [R]estart from scratch, [A]bort: " choice
+            case "$choice" in
+                [cC]) 
+                    START_STAGE=$((last_stage + 1))
+                    log "Resuming installation from Stage ${START_STAGE}."
+                    return
+                    ;;
+                [rR]) 
+                    log "Restarting installation from scratch."
+                    rm -f "${CHECKPOINT_FILE}" 2>/dev/null || true
+                    return
+                    ;;
+                [aA])
+                    die "Installation aborted by user."
+                    ;;
+                *)
+                    echo "Invalid choice. Please enter C, R, or A."
+                    ;;
+            esac
+        done
     fi
 }
+
 run_emerge() {
     log "Emerging packages: $*"
     local retry_count=0
     local max_retries=3
+    
+    # Check if Portage tree is synced before emerging
+    if [ ! -d "/var/db/repos/gentoo" ] || [ "$(find /var/db/repos/gentoo -maxdepth 0 -empty 2>/dev/null)" ]; then
+        log "Portage tree appears to be unsynced or missing. Syncing now..."
+        sync_portage_tree
+    fi
+    
     while [ $retry_count -lt $max_retries ]; do
-        if emerge --autounmask-write=y --autounmask-continue=y --with-bdeps=y -v "$@"; then
+        if emerge --autounmask-write=y --autounmask-continue=y --with-bdeps=y -v "$@" 2>&1 | tee -a "$LOG_FILE_PATH"; then
             log "Emerge successful for: $*"
             # Apply any config changes
             etc-update --automode -5 &>/dev/null || dispatch-conf --automode &>/dev/null || true
@@ -127,57 +270,140 @@ run_emerge() {
     warn "The required changes have likely been written to /etc/portage."
     warn "ACTION REQUIRED: After the script exits, run 'etc-update --automode -5' (or dispatch-conf) to apply them,"
     warn "then restart the installation to continue."
-    die "Emerge process halted. Please review the errors above and apply configuration changes."
+    return 1
 }
+
 cleanup() {
     err "An error occurred. Initiating cleanup..."
     sync
-    if mountpoint -q "${GENTOO_MNT}"; then
-        log "Attempting to unmount ${GENTOO_MNT}..."
-        umount -R "${GENTOO_MNT}" &>/dev/null || umount -l "${GENTOO_MNT}" &>/dev/null || true
+    
+    # Ensure we're not in chroot before unmounting
+    if [ "$(cut -d ' ' -f 2 /proc/1/cmdline 2>/dev/null)" != "CHROOT" ] && [ -d "${GENTOO_MNT}" ]; then
+        # Try to unmount in reverse order
+        if mountpoint -q "${GENTOO_MNT}/proc" 2>/dev/null; then
+            umount -R "${GENTOO_MNT}/proc" &>/dev/null || umount -l "${GENTOO_MNT}/proc" &>/dev/null || true
+        fi
+        if mountpoint -q "${GENTOO_MNT}/sys" 2>/dev/null; then
+            umount -R "${GENTOO_MNT}/sys" &>/dev/null || umount -l "${GENTOO_MNT}/sys" &>/dev/null || true
+        fi
+        if mountpoint -q "${GENTOO_MNT}/dev" 2>/dev/null; then
+            umount -R "${GENTOO_MNT}/dev" &>/dev/null || umount -l "${GENTOO_MNT}/dev" &>/dev/null || true
+        fi
+        if mountpoint -q "${GENTOO_MNT}/run" 2>/dev/null; then
+            umount -R "${GENTOO_MNT}/run" &>/dev/null || umount -l "${GENTOO_MNT}/run" &>/dev/null || true
+        fi
+        
+        # Final attempt to unmount the main mount point
+        if mountpoint -q "${GENTOO_MNT}"; then
+            log "Attempting to unmount ${GENTOO_MNT}..."
+            umount -R "${GENTOO_MNT}" &>/dev/null || umount -l "${GENTOO_MNT}" &>/dev/null || true
+        fi
     fi
+    
     # Safely handle ZRAM cleanup
     if [ -e /dev/zram0 ] && grep -q /dev/zram0 /proc/swaps &>/dev/null; then
+        log "Deactivating ZRAM swap..."
         swapoff /dev/zram0 &>/dev/null || true
     fi
+    
     # Clean up LUKS mappings if any
     if command -v cryptsetup &>/dev/null; then
-        for dm in $(dmsetup ls --target crypt | awk '{print $1}' 2>/dev/null || true); do
-            cryptsetup close "$dm" &>/dev/null || true
+        for dm in $(dmsetup ls --target crypt --exec basename 2>/dev/null || true); do
+            if [ -n "$dm" ]; then
+                log "Closing LUKS mapping: $dm"
+                cryptsetup close "$dm" &>/dev/null || true
+            fi
         done
     fi
+    
+    # Clean up LVM
+    if command -v lvdisplay &>/dev/null; then
+        for vg in $(vgs --noheadings -o vg_name 2>/dev/null || true); do
+            if [ -n "$vg" ] && [[ "$vg" == *"gentoo_vg"* ]]; then
+                log "Deactivating volume group: $vg"
+                vgchange -an "$vg" &>/dev/null || true
+            fi
+        done
+    fi
+    
+    # Clean up temp files
+    if [ -n "$CONFIG_FILE_TMP" ] && [ -f "$CONFIG_FILE_TMP" ]; then
+        rm -f "$CONFIG_FILE_TMP" 2>/dev/null || true
+    fi
+    
+    if [ -f "$CHECKPOINT_FILE" ]; then
+        rm -f "$CHECKPOINT_FILE" 2>/dev/null || true
+    fi
+    
     log "Cleanup finished."
 }
-trap 'cleanup' ERR INT TERM
-trap 'rm -f "$CONFIG_FILE_TMP"' EXIT
-ask_confirm() {
-    if ${FORCE_MODE:-false}; then
-        return 0
+
+# Enhanced trap handling for all exit scenarios
+trap_handler() {
+    local exit_code=$?
+    local signal_name=$1
+    
+    # Only run cleanup once
+    if [ "$exit_code" -eq 0 ] && [ "$signal_name" = "EXIT" ]; then
+        return
     fi
-    read -r -p "$1 [y/N] " response
-    case "$response" in
-        [yY]|[yY][eE][sS]) return 0 ;;
-        *) return 1 ;;
+    
+    case $signal_name in
+        INT)
+            err "Script interrupted by user (Ctrl+C)."
+            ;;
+        TERM)
+            err "Script terminated by SIGTERM."
+            ;;
+        ERR)
+            err "Script encountered an error (exit code: $exit_code)."
+            ;;
+        EXIT)
+            # Normal exit, no message needed
+            ;;
+        *)
+            err "Script terminated by signal: $signal_name"
+            ;;
     esac
+    
+    cleanup
+    exit $exit_code
 }
+
+# Set up comprehensive signal handling
+trap 'trap_handler $? INT' INT
+trap 'trap_handler $? TERM' TERM
+trap 'trap_handler $? ERR' ERR
+trap 'trap_handler $? EXIT' EXIT
+
 self_check() {
     log "Performing script integrity self-check..."
+    
+    # Check if script terminator is properly set
     if [ "$SCRIPT_TERMINATOR" != "END" ]; then
         die "Integrity check failed: The script file is incomplete. Please use 'wget' or 'curl' to download the raw file again, ensuring it is complete."
     fi
+    
+    # Check required functions
     local funcs=(pre_flight_checks ensure_dependencies stage0_select_mirrors interactive_setup stage0_partition_and_format stage1_deploy_base_system stage2_prepare_chroot stage3_configure_in_chroot stage4_build_world_and_kernel stage5_install_bootloader stage6_install_software stage7_finalize unmount_and_reboot)
     for func in "${funcs[@]}"; do
-        if ! declare -F "$func" > /dev/null; then
+        if ! declare -f "$func" >/dev/null; then
             die "Self-check failed: Function '$func' is not defined. The script may be corrupt."
         fi
     done
+    
     log "Self-check passed."
 }
+
 # ==============================================================================
 # --- STAGES 0A: PRE-FLIGHT ---
 # ==============================================================================
 pre_flight_checks() {
     step_log "Performing Pre-flight System Checks"
+    
+    # Ensure critical filesystems are writable before proceeding
+    ensure_writable_filesystems
+    
     log "Checking for internet connectivity..."
     if ! ping -c 3 8.8.8.8 &>/dev/null; then
         warn "Could not ping 8.8.8.8. Trying alternative connectivity check..."
@@ -186,6 +412,7 @@ pre_flight_checks() {
         fi
     fi
     log "Internet connection is OK."
+    
     log "Detecting boot mode..."
     if [ -d /sys/firmware/efi ]; then
         BOOT_MODE="UEFI"
@@ -193,10 +420,17 @@ pre_flight_checks() {
         BOOT_MODE="LEGACY"
     fi
     log "System booted in ${BOOT_MODE} mode."
-    if compgen -G "/sys/class/power_supply/BAT*" > /dev/null; then
-        log "Laptop detected."
+    
+    if command -v laptop-detect &>/dev/null; then
+        if laptop-detect; then
+            log "Laptop detected using laptop-detect."
+            IS_LAPTOP=true
+        fi
+    elif compgen -G "/sys/class/power_supply/BAT*" > /dev/null; then
+        log "Laptop detected (battery found)."
         IS_LAPTOP=true
     fi
+    
     # Check available disk space
     local available_space_mb
     available_space_mb=$(df -m /tmp | tail -1 | awk '{print $4}')
@@ -206,33 +440,92 @@ pre_flight_checks() {
             die "Insufficient disk space. Installation aborted."
         fi
     fi
-}
-sync_portage_tree() {
-    log "Syncing Portage tree..."
-    if emerge --sync 2>/dev/null; then
-        log "Portage sync via git successful."
-    else
-        warn "Git sync failed, falling back to emerge-webrsync."
-        if emerge-webrsync; then
-            log "Portage sync via webrsync successful."
-        else
-            die "Failed to sync Portage tree with both git and webrsync methods."
+    
+    # Check system architecture
+    if [ "$(uname -m)" != "x86_64" ]; then
+        die "This script only supports x86_64 architecture. Detected: $(uname -m)"
+    fi
+    
+    # Check kernel version
+    local kernel_version
+    kernel_version=$(uname -r | cut -d'.' -f1-2)
+    if [ "$(printf '%s\n4.14' "$kernel_version" | sort -V | head -n1)" = "$kernel_version" ]; then
+        warn "Your kernel version ($kernel_version) is older than recommended (4.14+)."
+        warn "Some features might not work correctly. Continue at your own risk."
+        if ! ask_confirm "Continue with older kernel?"; then
+            die "Installation requires kernel 4.14 or newer."
         fi
     fi
+    
+    # Check CPU
+    if ! command -v lscpu &>/dev/null; then
+        warn "lscpu command not found. CPU detection will be limited."
+    fi
 }
+
+sync_portage_tree() {
+    log "Syncing Portage tree..."
+    mkdir -p /var/db/repos/gentoo 2>/dev/null || true
+    
+    # Try git sync first
+    if command -v git &>/dev/null && [ -d "/var/db/repos/gentoo/.git" ]; then
+        if emerge --sync 2>>"$LOG_FILE_PATH"; then
+            log "Portage sync via git successful."
+            return 0
+        fi
+    fi
+    
+    # Fallback to websync
+    warn "Git sync failed or not available, falling back to emerge-webrsync."
+    if command -v wget &>/dev/null || command -v curl &>/dev/null; then
+        if emerge-webrsync 2>>"$LOG_FILE_PATH"; then
+            log "Portage sync via webrsync successful."
+            return 0
+        else
+            # Last resort: try to download a snapshot manually
+            warn "emerge-webrsync failed. Trying to download a portage snapshot manually..."
+            local snapshot_url="https://distfiles.gentoo.org/snapshots/portage-latest.tar.xz"
+            local snapshot_file="/var/tmp/portage-latest.tar.xz"
+            
+            if command -v wget &>/dev/null; then
+                wget --tries=3 --timeout=30 -O "$snapshot_file" "$snapshot_url" 2>>"$LOG_FILE_PATH"
+            elif command -v curl &>/dev/null; then
+                curl --retry 3 --connect-timeout 30 -L -o "$snapshot_file" "$snapshot_url" 2>>"$LOG_FILE_PATH"
+            fi
+            
+            if [ -f "$snapshot_file" ] && command -v tar &>/dev/null; then
+                log "Extracting portage snapshot..."
+                tar xpvf "$snapshot_file" -C /var/db/repos/ 2>>"$LOG_FILE_PATH"
+                rm -f "$snapshot_file"
+                log "Portage snapshot extracted successfully."
+                return 0
+            fi
+        fi
+    fi
+    
+    die "Failed to sync Portage tree with all available methods."
+}
+
 ensure_dependencies() {
     step_log "Ensuring LiveCD Dependencies"
+    
+    # Check for required core utilities first
+    local core_utils="bash coreutils util-linux findutils grep sed awk tar xz"
+    for util in $core_utils; do
+        if ! command -v "$util" >/dev/null 2>&1; then
+            die "Critical dependency missing: $util. This script requires a full Gentoo Minimal Install CD environment."
+        fi
+    done
+    
     # Check for swap and create ZRAM if needed
     if ! grep -q swap /proc/swaps; then
         warn "No active swap detected. This can cause Portage to crash on low-memory LiveCDs."
         local total_mem_kb
         total_mem_kb=$(grep MemTotal /proc/meminfo | awk '{print $2}')
         local total_mem_mb=$((total_mem_kb / 1024))
-        
         if [ "$total_mem_mb" -lt 2048 ]; then
             warn "WARNING: System has less than 2GB RAM. ZRAM swap is strongly recommended."
         fi
-        
         if ask_confirm "Create a temporary ZRAM swap to prevent installation failures?"; then
             log "Setting up ZRAM..."
             # Ensure zram module is loaded
@@ -244,6 +537,16 @@ ensure_dependencies() {
             else
                 local zram_size_kb=$(( total_mem_kb / 2 ))
                 if [ "$zram_size_kb" -gt 2097152 ]; then zram_size_kb=2097152; fi
+                
+                # Make sure zram device exists
+                if [ ! -e /dev/zram0 ]; then
+                    if [ -d /sys/class/zram-control ]; then
+                        echo 1 > /sys/class/zram-control/hot_add 2>/dev/null || true
+                    else
+                        warn "Could not create zram device. Continuing without swap."
+                        return
+                    fi
+                fi
                 
                 # Reset zram device if it exists
                 if [ -e /sys/block/zram0 ]; then
@@ -267,7 +570,13 @@ ensure_dependencies() {
     local build_essentials_pkgs=""
     local compiler_pkgs=""
     local other_pkgs=""
-    local all_deps="make patch sandbox curl wget sgdisk parted mkfs.vfat mkfs.xfs mkfs.ext4 mkfs.btrfs blkid lsblk sha512sum b2sum chroot wipefs blockdev cryptsetup lvm pvcreate vgcreate lvcreate mkswap lscpu lspci udevadm gcc"
+    local all_deps="make patch sandbox curl wget sgdisk parted mkfs.vfat mkfs.xfs mkfs.ext4 mkfs.btrfs blkid lsblk sha512sum b2sum chroot wipefs blockdev cryptsetup lvm pvcreate vgcreate lvcreate mkswap lscpu lspci udevadm gcc parted"
+    
+    # Check if we're in a proper Gentoo environment
+    if ! command -v emerge &>/dev/null; then
+        die "emerge command not found. Please ensure you are running this script from a Gentoo LiveCD."
+    fi
+    
     get_pkg_for_cmd() {
         case "$1" in
             make) echo "sys-devel/make" ;;
@@ -275,65 +584,71 @@ ensure_dependencies() {
             sandbox) echo "sys-apps/sandbox" ;;
             curl) echo "net-misc/curl" ;;
             wget) echo "net-misc/wget" ;;
-            sgdisk|parted) echo "sys-apps/gptfdisk sys-apps/parted" ;;
+            sgdisk) echo "sys-apps/gptfdisk" ;;
+            parted) echo "sys-apps/parted" ;;
             mkfs.vfat) echo "sys-fs/dosfstools" ;;
             mkfs.xfs) echo "sys-fs/xfsprogs" ;;
             mkfs.ext4) echo "sys-fs/e2fsprogs" ;;
             mkfs.btrfs) echo "sys-fs/btrfs-progs" ;;
-            sha512sum|b2sum|chroot) echo "sys-apps/coreutils" ;;
+            sha512sum|b2sum) echo "app-crypt/sha512sum app-crypt/b2sum" ;;
+            chroot) echo "sys-apps/util-linux" ;;
             lspci) echo "sys-apps/pciutils" ;;
             gcc) echo "sys-devel/gcc" ;;
             cryptsetup) echo "sys-fs/cryptsetup" ;;
             pvcreate|vgcreate|lvcreate) echo "sys-fs/lvm2" ;;
-            udevadm) echo "sys-fs/udev" ;;
-            blockdev) echo "sys-apps/util-linux" ;;
-            *) echo "sys-apps/util-linux" ;;
+            udevadm) echo "virtual/udev" ;;
+            blockdev|lsblk) echo "sys-apps/util-linux" ;;
+            lscpu) echo "sys-apps/util-linux" ;;
+            *) echo "" ;;
         esac
     }
     
     log "Checking for required tools..."
+    local missing_commands=""
     for cmd in $all_deps; do
         if ! command -v "$cmd" >/dev/null 2>&1; then
+            missing_commands="$missing_commands $cmd"
             pkgs=$(get_pkg_for_cmd "$cmd")
             for pkg in $pkgs; do
-                case "$pkg" in
-                    sys-devel/make|sys-devel/patch|sys-apps/sandbox)
-                        if ! echo "$build_essentials_pkgs" | grep -q "$pkg"; then
-                            build_essentials_pkgs="$build_essentials_pkgs $pkg"
-                        fi
-                        ;;
-                    sys-devel/gcc)
-                        if ! echo "$compiler_pkgs" | grep -q "$pkg"; then
-                            compiler_pkgs="$compiler_pkgs $pkg"
-                        fi
-                        ;;
-                    *)
-                        if ! echo "$other_pkgs" | grep -q "$pkg"; then
-                            other_pkgs="$other_pkgs $pkg"
-                        fi
-                        ;;
-                esac
+                if [ -n "$pkg" ]; then
+                    case "$pkg" in
+                        sys-devel/make|sys-devel/patch|sys-apps/sandbox)
+                            if ! echo "$build_essentials_pkgs" | grep -q "$pkg"; then
+                                build_essentials_pkgs="$build_essentials_pkgs $pkg"
+                            fi
+                            ;;
+                        sys-devel/gcc)
+                            if ! echo "$compiler_pkgs" | grep -q "$pkg"; then
+                                compiler_pkgs="$compiler_pkgs $pkg"
+                            fi
+                            ;;
+                        *)
+                            if ! echo "$other_pkgs" | grep -q "$pkg"; then
+                                other_pkgs="$other_pkgs $pkg"
+                            fi
+                            ;;
+                    esac
+                fi
             done
         fi
     done
     
+    if [ -n "$missing_commands" ]; then
+        warn "Missing commands detected:$missing_commands"
+    fi
+    
     if [ -n "$build_essentials_pkgs" ] || [ -n "$compiler_pkgs" ] || [ -n "$other_pkgs" ]; then
         warn "Some required packages are missing. Preparing for installation."
-        if ! command -v emerge &>/dev/null; then
-            die "emerge command not found. Please ensure you are running this script from a Gentoo LiveCD."
-        fi
-        
         if ask_confirm "Do you want to proceed with automatic installation of dependencies?"; then
             sync_portage_tree
-            
             local emerge_opts="--jobs=1 --load-average=1.5 --quiet-build"
             
             # Install essentials in the correct order
             if [ -n "$build_essentials_pkgs" ]; then
                 log "Installing build essentials: ${build_essentials_pkgs}"
-                if ! emerge $emerge_opts --noreplace $build_essentials_pkgs; then
+                if ! emerge $emerge_opts --noreplace $build_essentials_pkgs 2>>"${LOG_FILE_PATH}"; then
                     warn "Failed to install some build essentials. Trying with reduced parallelism..."
-                    if ! emerge $emerge_opts --jobs=1 --load-average=1 --noreplace $build_essentials_pkgs; then
+                    if ! emerge $emerge_opts --jobs=1 --load-average=1 --noreplace $build_essentials_pkgs 2>>"${LOG_FILE_PATH}"; then
                         die "Failed to install build essentials after multiple attempts."
                     fi
                 fi
@@ -342,9 +657,9 @@ ensure_dependencies() {
             
             if [ -n "$other_pkgs" ]; then
                 log "Installing other required tools: ${other_pkgs}"
-                if ! emerge $emerge_opts --noreplace $other_pkgs; then
+                if ! emerge $emerge_opts --noreplace $other_pkgs 2>>"${LOG_FILE_PATH}"; then
                     warn "Failed to install some dependencies. Trying with reduced parallelism..."
-                    if ! emerge $emerge_opts --jobs=1 --load-average=1 --noreplace $other_pkgs; then
+                    if ! emerge $emerge_opts --jobs=1 --load-average=1 --noreplace $other_pkgs 2>>"${LOG_FILE_PATH}"; then
                         die "Failed to install required dependencies after multiple attempts."
                     fi
                 fi
@@ -353,9 +668,9 @@ ensure_dependencies() {
             
             if [ -n "$compiler_pkgs" ]; then
                 log "Installing compiler: ${compiler_pkgs}"
-                if ! emerge $emerge_opts --noreplace $compiler_pkgs; then
+                if ! emerge $emerge_opts --noreplace $compiler_pkgs 2>>"${LOG_FILE_PATH}"; then
                     warn "Failed to install compiler. Trying with reduced parallelism and disabled openmp..."
-                    if ! USE="-openmp" emerge $emerge_opts --jobs=1 --load-average=1 --noreplace $compiler_pkgs; then
+                    if ! USE="-openmp" emerge $emerge_opts --jobs=1 --load-average=1 --noreplace $compiler_pkgs 2>>"${LOG_FILE_PATH}"; then
                         die "Failed to install the compiler (gcc) after multiple attempts."
                     fi
                 fi
@@ -367,7 +682,16 @@ ensure_dependencies() {
     else
         log "All dependencies are satisfied."
     fi
+    
+    # Additional check for filesystem tools
+    local fs_tools="mkfs.ext4 mkfs.xfs mkfs.btrfs mkfs.vfat"
+    for tool in $fs_tools; do
+        if ! command -v "$tool" >/dev/null 2>&1; then
+            warn "Filesystem tool $tool is missing. Installation may fail when formatting partitions."
+        fi
+    done
 }
+
 stage0_select_mirrors() {
     step_log "Selecting Fastest Mirrors"
     if ask_confirm "Do you want to automatically select the fastest mirrors? (Recommended)"; then
@@ -380,7 +704,7 @@ stage0_select_mirrors() {
         # Retry mirrorselect if it fails
         local retry_count=0
         while [ $retry_count -lt 3 ]; do
-            if FASTEST_MIRRORS=$(mirrorselect -s4 -b10 -o -D 2>/dev/null); then
+            if FASTEST_MIRRORS=$(mirrorselect -s4 -b10 -o -D 2>>"${LOG_FILE_PATH}"); then
                 break
             else
                 retry_count=$((retry_count + 1))
@@ -392,11 +716,16 @@ stage0_select_mirrors() {
             warn "Failed to select fastest mirrors after multiple attempts. Using default mirrors."
         else
             log "Fastest mirrors selected."
+            # Ensure the directory exists before writing
+            mkdir -p /etc/portage
+            echo "$FASTEST_MIRRORS" > /etc/portage/make.conf.mirrors
+            log "Mirror configuration saved to /etc/portage/make.conf.mirrors"
         fi
     else
         log "Skipping mirror selection. Default mirrors will be used."
     fi
 }
+
 # ==============================================================================
 # --- HARDWARE DETECTION ENGINE ---
 # ==============================================================================
@@ -417,7 +746,6 @@ detect_cpu_architecture() {
     CPU_MODEL_NAME=$(lscpu --parse=MODELNAME | tail -n 1 | sed 's/"//g')
     local vendor_id
     vendor_id=$(lscpu --parse=VENDORID | tail -n 1)
-    
     log "Detected CPU Model: ${CPU_MODEL_NAME}"
     
     case "$vendor_id" in
@@ -425,19 +753,19 @@ detect_cpu_architecture() {
             CPU_VENDOR="Intel"
             MICROCODE_PACKAGE="sys-firmware/intel-microcode"
             case "$CPU_MODEL_NAME" in
-                *14th*Gen*|*13th*Gen*|*12th*Gen*)
+                *"14th Gen"*|*"13th Gen"*|*"12th Gen"*)
                     CPU_MARCH="alderlake"
                     ;;
-                *11th*Gen*)
+                *"11th Gen"*)
                     CPU_MARCH="tigerlake"
                     ;;
-                *10th*Gen*)
+                *"10th Gen"*)
                     CPU_MARCH="icelake-client"
                     ;;
-                *9th*Gen*|*8th*Gen*|*7th*Gen*|*6th*Gen*)
+                *"9th Gen"*|*"8th Gen"*|*"7th Gen"*|*"6th Gen"*)
                     CPU_MARCH="skylake"
                     ;;
-                *Core*2*)
+                *"Core 2"*)
                     CPU_MARCH="core2"
                     ;;
                 *)
@@ -463,19 +791,19 @@ detect_cpu_architecture() {
             CPU_VENDOR="AMD"
             MICROCODE_PACKAGE="sys-firmware/amd-microcode"
             case "$CPU_MODEL_NAME" in
-                *Ryzen*9*7*|*Ryzen*7*7*|*Ryzen*5*7*)
+                *"Ryzen 9 7"*|*"Ryzen 7 7"*|*"Ryzen 5 7"*)
                     CPU_MARCH="znver4"
                     ;;
-                *Ryzen*9*5*|*Ryzen*7*5*|*Ryzen*5*5*)
+                *"Ryzen 9 5"*|*"Ryzen 7 5"*|*"Ryzen 5 5"*)
                     CPU_MARCH="znver3"
                     ;;
-                *Ryzen*9*3*|*Ryzen*7*3*|*Ryzen*5*3*)
+                *"Ryzen 9 3"*|*"Ryzen 7 3"*|*"Ryzen 5 3"*)
                     CPU_MARCH="znver2"
                     ;;
-                *Ryzen*7*2*|*Ryzen*5*2*|*Ryzen*7*1*|*Ryzen*5*1*)
+                *"Ryzen 7 2"*|*"Ryzen 5 2"*|*"Ryzen 7 1"*|*"Ryzen 5 1"*)
                     CPU_MARCH="znver1"
                     ;;
-                *FX*)
+                *"FX"*)
                     CPU_MARCH="bdver4"
                     ;;
                 *)
@@ -498,13 +826,17 @@ detect_cpu_architecture() {
             esac
             ;;
         *)
-            die "Unsupported CPU Vendor: ${vendor_id}. This script is for x86_64 systems."
+            warn "Unsupported CPU Vendor: ${vendor_id}. Falling back to generic x86-64-v2."
+            CPU_VENDOR="Generic"
+            CPU_MARCH="x86-64-v2"
+            MICROCODE_PACKAGE=""
             ;;
     esac
     
     # Safety check for march values
     case "$CPU_MARCH" in
         native) CPU_MARCH="x86-64-v3" ;;
+        "") CPU_MARCH="x86-64-v2" ;;
         *) ;;
     esac
     
@@ -513,8 +845,8 @@ detect_cpu_architecture() {
 
 detect_cpu_flags() {
     log "Hardware Detection Engine (CPU Flags)"
-    if command -v emerge &>/dev/null && ! command -v cpuid2cpuflags &>/dev/null; then
-        if ask_confirm "Utility 'cpuid2cpuflags' not found. Install it to detect optimal CPU USE flags?"; then
+    if ! command -v cpuid2cpuflags &>/dev/null; then
+        if command -v emerge &>/dev/null && ask_confirm "Utility 'cpuid2cpuflags' not found. Install it to detect optimal CPU USE flags?"; then
             run_emerge app-portage/cpuid2cpuflags
         fi
     fi
@@ -522,7 +854,7 @@ detect_cpu_flags() {
     if command -v cpuid2cpuflags &>/dev/null; then
         log "Detecting CPU-specific USE flags..."
         # Filter out any problematic flags
-        CPU_FLAGS_X86=$(cpuid2cpuflags | cut -d' ' -f2- | sed 's/-march=[^ ]*//g' | sed 's/-mtune=[^ ]*//g')
+        CPU_FLAGS_X86=$(cpuid2cpuflags 2>/dev/null | cut -d' ' -f2- | sed 's/-march=[^ ]*//g' | sed 's/-mtune=[^ ]*//g')
         # Remove duplicate flags and clean up
         CPU_FLAGS_X86=$(echo "$CPU_FLAGS_X86" | tr ' ' '\n' | sort -u | tr '\n' ' ' | sed 's/ $//')
         log "Detected CPU_FLAGS_X86: ${CPU_FLAGS_X86}"
@@ -545,7 +877,7 @@ detect_gpu_hardware() {
     local nvidia_detected=false
     
     # Use safer parsing of lspci output
-    while IFS= read -r line; do
+    lspci -mm 2>/dev/null | while IFS= read -r line; do
         if echo "$line" | grep -iqE "VGA|3D controller"; then
             if echo "$line" | grep -iq "Intel"; then
                 intel_detected=true
@@ -557,23 +889,20 @@ detect_gpu_hardware() {
                 nvidia_detected=true
             fi
         fi
-    done < <(lspci -mm 2>/dev/null || true)
+    done
     
     # Default drivers
     VIDEO_CARDS="vesa fbdev"
-    
     if [ "$intel_detected" = true ]; then
         log "Intel GPU detected. Adding 'intel i965' drivers."
         VIDEO_CARDS+=" intel i965"
         GPU_VENDOR="Intel"
     fi
-    
     if [ "$amd_detected" = true ]; then
         log "AMD/ATI GPU detected. Adding 'amdgpu radeonsi' drivers."
-        VIDEO_CARDS+=" amdgpu radeonsi"
+        VIDEO_CARDS+=" amdgpu radesi"
         GPU_VENDOR="AMD"
     fi
-    
     if [ "$nvidia_detected" = true ]; then
         log "NVIDIA GPU detected. Adding 'nouveau' driver for kernel support."
         VIDEO_CARDS+=" nouveau"
@@ -583,6 +912,48 @@ detect_gpu_hardware() {
     log "Final VIDEO_CARDS for make.conf: ${VIDEO_CARDS}"
     log "Primary GPU vendor for user interaction: ${GPU_VENDOR}"
 }
+
+# ==============================================================================
+# --- Utility Functions ---
+# ==============================================================================
+ask_confirm() {
+    if ${FORCE_MODE:-false}; then
+        return 0
+    fi
+    
+    local response
+    while true; do
+        read -r -p "$1 [y/N] " response
+        case "$response" in
+            [yY]|[yY][eE][sS]) return 0 ;;
+            [nN]|[nN][oO]|"") return 1 ;;
+            *) echo "Please enter y or n." ;;
+        esac
+    done
+}
+
+ask_password() {
+    local password1 password2
+    
+    while true; do
+        read -rs -p "$1: " password1
+        echo
+        read -rs -p "Confirm $1: " password2
+        echo
+        
+        if [ "$password1" = "$password2" ]; then
+            if [ "${#password1}" -lt 8 ]; then
+                echo "Password too short. Minimum 8 characters required."
+                continue
+            fi
+            echo "$password1"
+            return 0
+        else
+            echo "Passwords do not match. Please try again."
+        fi
+    done
+}
+
 # ==============================================================================
 # --- STAGE 0B: INTERACTIVE SETUP WIZARD ---
 # ==============================================================================
@@ -602,14 +973,16 @@ interactive_setup() {
     if [ "$GPU_VENDOR" = "NVIDIA" ]; then
         log "--- NVIDIA Driver Selection ---"
         warn "An NVIDIA GPU has been detected. Please choose the desired driver:"
+        PS3="Select driver option (1-3): "
         select choice in "Proprietary (Best Performance, Recommended)" "Nouveau (Open-Source, Good Compatibility)" "Manual (Configure later)"; do
-            case $choice in
-                "Proprietary (Best Performance, Recommended)") NVIDIA_DRIVER_CHOICE="Proprietary"; VIDEO_CARDS+=" nvidia"; break;;
-                "Nouveau (Open-Source, Good Compatibility)") NVIDIA_DRIVER_CHOICE="Nouveau"; break;;
-                "Manual (Configure later)") NVIDIA_DRIVER_CHOICE="Manual"; break;;
+            case $REPLY in
+                1) NVIDIA_DRIVER_CHOICE="Proprietary"; VIDEO_CARDS+=" nvidia"; break;;
+                2) NVIDIA_DRIVER_CHOICE="Nouveau"; break;;
+                3) NVIDIA_DRIVER_CHOICE="Manual"; break;;
                 *) echo "Invalid option. Please select 1, 2, or 3." ;;
             esac
         done
+        unset PS3
     fi
     
     log "--- System Architecture & Security ---"
@@ -619,20 +992,27 @@ interactive_setup() {
     fi
     
     log "Select init system:"
+    PS3="Select init system (1-2): "
     select INIT_SYSTEM in "OpenRC" "SystemD"; do
-        case $INIT_SYSTEM in
-            OpenRC|SystemD) break;;
+        case $REPLY in
+            1) INIT_SYSTEM="OpenRC"; break;;
+            2) INIT_SYSTEM="SystemD"; break;;
             *) echo "Invalid option. Please select 1 or 2." ;;
         esac
     done
+    unset PS3
     
     log "Select Linux Security Module (LSM):"
+    PS3="Select LSM (1-3): "
     select LSM_CHOICE in "None" "AppArmor" "SELinux"; do
-        case $LSM_CHOICE in
-            None|AppArmor|SELinux) break;;
+        case $REPLY in
+            1) LSM_CHOICE="None"; break;;
+            2) LSM_CHOICE="AppArmor"; break;;
+            3) LSM_CHOICE="SELinux"; break;;
             *) echo "Invalid option. Please select 1, 2, or 3." ;;
         esac
     done
+    unset PS3
     
     ENABLE_FIREWALL=false
     if ask_confirm "Set up a basic firewall (ufw)? (Highly Recommended)"; then
@@ -647,12 +1027,18 @@ interactive_setup() {
     
     log "--- Desktop Environment ---"
     log "Select desktop environment:"
+    PS3="Select desktop environment (1-5): "
     select DESKTOP_ENV in "XFCE" "KDE-Plasma" "GNOME" "i3-WM" "Server (No GUI)"; do
-        case $DESKTOP_ENV in
-            XFCE|KDE-Plasma|GNOME|i3-WM|"Server (No GUI)") break;;
+        case $REPLY in
+            1) DESKTOP_ENV="XFCE"; break;;
+            2) DESKTOP_ENV="KDE-Plasma"; break;;
+            3) DESKTOP_ENV="GNOME"; break;;
+            4) DESKTOP_ENV="i3-WM"; break;;
+            5) DESKTOP_ENV="Server (No GUI)"; break;;
             *) echo "Invalid option. Please select 1-5." ;;
         esac
     done
+    unset PS3
     
     INSTALL_STYLING=false
     if [ "$DESKTOP_ENV" != "Server (No GUI)" ]; then
@@ -663,12 +1049,17 @@ interactive_setup() {
     
     log "--- Kernel Management ---"
     log "Select kernel management method:"
+    PS3="Select kernel method (1-4): "
     select KERNEL_METHOD in "genkernel (recommended, auto)" "gentoo-kernel (distribution kernel, balanced)" "gentoo-kernel-bin (fastest, pre-compiled)" "manual (expert, interactive)"; do
-        case $KERNEL_METHOD in
-            "genkernel (recommended, auto)"|"gentoo-kernel (distribution kernel, balanced)"|"gentoo-kernel-bin (fastest, pre-compiled)"|"manual (expert, interactive)") break;;
+        case $REPLY in
+            1) KERNEL_METHOD="genkernel (recommended, auto)"; break;;
+            2) KERNEL_METHOD="gentoo-kernel (distribution kernel, balanced)"; break;;
+            3) KERNEL_METHOD="gentoo-kernel-bin (fastest, pre-compiled)"; break;;
+            4) KERNEL_METHOD="manual (expert, interactive)"; break;;
             *) echo "Invalid option. Please select 1-4." ;;
         esac
     done
+    unset PS3
     
     log "--- Performance Options ---"
     USE_CCACHE=false
@@ -703,26 +1094,32 @@ interactive_setup() {
     log "Available block devices:"
     lsblk -d -o NAME,SIZE,TYPE
     
-    while true; do
+    local valid_device=false
+    while [ "$valid_device" = false ]; do
         read -r -p "Enter the target device for installation (e.g., /dev/sda): " TARGET_DEVICE
+        
         if [ -z "$TARGET_DEVICE" ]; then
             err "Device name cannot be empty."
             continue
         fi
+        
         if ! [ -b "$TARGET_DEVICE" ]; then
             err "Device '$TARGET_DEVICE' does not exist."
             continue
         fi
+        
         if echo "$TARGET_DEVICE" | grep -qE '[0-9]$'; then
             warn "Device '$TARGET_DEVICE' looks like a partition, not a whole disk."
             if ! ask_confirm "Are you absolutely sure you want to proceed?"; then
                 continue
             fi
         fi
+        
         if ! blockdev --getsize64 "$TARGET_DEVICE" &>/dev/null; then
             err "Cannot get size of device '$TARGET_DEVICE'. It might not be a valid block device."
             continue
         fi
+        
         local device_size_mb
         device_size_mb=$(( $(blockdev --getsize64 "$TARGET_DEVICE" 2>/dev/null || echo 0) / 1024 / 1024 ))
         if [ "$device_size_mb" -lt 8192 ]; then
@@ -731,7 +1128,8 @@ interactive_setup() {
                 continue
             fi
         fi
-        break
+        
+        valid_device=true
     done
     
     while true; do
@@ -755,12 +1153,17 @@ interactive_setup() {
     log "--- Swap Configuration ---"
     SWAP_TYPE="zram"
     SWAP_SIZE_GB=0
-    
     log "Select swap type:"
+    PS3="Select swap type (1-3): "
     select choice in "zram (in-memory swap, recommended)" "partition (traditional on-disk swap)" "none"; do
-        SWAP_TYPE="$choice"
-        break
+        case $REPLY in
+            1) SWAP_TYPE="zram (in-memory swap, recommended)"; break;;
+            2) SWAP_TYPE="partition (traditional on-disk swap)"; break;;
+            3) SWAP_TYPE="none"; break;;
+            *) echo "Invalid option. Please select 1, 2, or 3." ;;
+        esac
     done
+    unset PS3
     
     if [ "$SWAP_TYPE" = "partition (traditional on-disk swap)" ]; then
         while true; do
@@ -782,7 +1185,6 @@ interactive_setup() {
     
     USE_LUKS=false
     ENCRYPT_BOOT=false
-    
     if ask_confirm "Use LUKS full-disk encryption for the root partition?"; then
         USE_LUKS=true
         if [ "$BOOT_MODE" = "UEFI" ]; then
@@ -797,22 +1199,8 @@ interactive_setup() {
     fi
     
     if [ "$USE_LUKS" = true ]; then
-        while true; do
-            read -s -r -p "Enter LUKS passphrase (minimum 8 characters): " LUKS_PASSPHRASE
-            echo
-            if [ "${#LUKS_PASSPHRASE}" -lt 8 ]; then
-                err "Passphrase too short. Minimum 8 characters required."
-                continue
-            fi
-            read -s -r -p "Confirm LUKS passphrase: " LUKS_PASSPHRASE_CONFIRM
-            echo
-            if [ "$LUKS_PASSPHRASE" = "$LUKS_PASSPHRASE_CONFIRM" ]; then
-                export LUKS_PASSPHRASE
-                break
-            else
-                err "Passphrases do not match. Please try again."
-            fi
-        done
+        LUKS_PASSPHRASE=$(ask_password "Enter LUKS passphrase (minimum 8 characters)")
+        export LUKS_PASSPHRASE
     fi
     
     if [ "$ENCRYPT_BOOT" != true ]; then
@@ -824,7 +1212,6 @@ interactive_setup() {
     
     USE_SEPARATE_HOME=false
     HOME_SIZE_GB=0
-    
     if [ "$USE_LVM" = true ]; then
         if ask_confirm "Create a separate logical volume for /home?"; then
             USE_SEPARATE_HOME=true
@@ -871,7 +1258,6 @@ interactive_setup() {
     local detected_cores
     detected_cores=$(nproc --all 2>/dev/null || echo 4)
     local default_makeopts="-j${detected_cores} -l${detected_cores}"
-    
     read -r -p "Enter MAKEOPTS [Default: ${default_makeopts}]: " MAKEOPTS
     [ -z "$MAKEOPTS" ] && MAKEOPTS="$default_makeopts"
     
@@ -909,6 +1295,7 @@ interactive_setup() {
     # Create config directory if needed
     mkdir -p "$(dirname "$CONFIG_FILE_TMP")"
     
+    # Ensure the config file is created with proper permissions
     cat > "$CONFIG_FILE_TMP" <<EOF
 TARGET_DEVICE='${TARGET_DEVICE}'
 ROOT_FS_TYPE='${ROOT_FS_TYPE}'
@@ -944,17 +1331,19 @@ ENABLE_AUTO_UPDATE=${ENABLE_AUTO_UPDATE}
 ENABLE_BOOT_ENVIRONMENTS=${ENABLE_BOOT_ENVIRONMENTS}
 INSTALL_APP_HOST=${INSTALL_APP_HOST}
 SWAP_TYPE='${SWAP_TYPE}'
-SWAP_SIZE_GB='${SWAP_SIZE_GB}'
+SWAP_SIZE_GB=${SWAP_SIZE_GB}
 ENABLE_FIREWALL=${ENABLE_FIREWALL}
 ENABLE_CPU_GOVERNOR=${ENABLE_CPU_GOVERNOR}
 INSTALL_STYLING=${INSTALL_STYLING}
 INSTALL_CYBER_TERM=${INSTALL_CYBER_TERM}
 GRUB_PLATFORMS='${grub_platform}'
+IS_LAPTOP=${IS_LAPTOP}
 EOF
     
     log "Configuration complete. Review summary before proceeding."
     cat "$CONFIG_FILE_TMP"
 }
+
 # ==============================================================================
 # --- STAGE 0C, 1, 2: PARTITION, DEPLOY, CHROOT ---
 # ==============================================================================
@@ -967,6 +1356,7 @@ stage0_partition_and_format() {
     fi
     
     log "Initiating 'Absolute Zero' protocol..."
+    
     # Unmount any mounted partitions on the target device
     while mount | grep -q "^${TARGET_DEVICE}"; do
         local mounted_part
@@ -987,8 +1377,10 @@ stage0_partition_and_format() {
         vgchange -an &>/dev/null || true
     fi
     if command -v cryptsetup &>/dev/null; then
-        for dm in $(dmsetup ls --target crypt | awk '{print $1}' 2>/dev/null || true); do
-            cryptsetup close "$dm" &>/dev/null || true
+        for dm in $(dmsetup ls --target crypt --exec basename 2>/dev/null || true); do
+            if [ -n "$dm" ]; then
+                cryptsetup close "$dm" &>/dev/null || true
+            fi
         done
     fi
     
@@ -996,8 +1388,12 @@ stage0_partition_and_format() {
     blockdev --flushbufs "${TARGET_DEVICE}" &>/dev/null || true
     log "Device locks released."
     
+    # Wipe partition table safely
     log "Wiping partition table on ${TARGET_DEVICE}..."
-    sgdisk --zap-all "${TARGET_DEVICE}" &>/dev/null || true
+    if ! sgdisk --zap-all "${TARGET_DEVICE}" &>/dev/null; then
+        warn "sgdisk failed. Trying with dd to wipe the first few MB..."
+        dd if=/dev/zero of="${TARGET_DEVICE}" bs=1M count=8 &>/dev/null || true
+    fi
     wipefs -a "${TARGET_DEVICE}" &>/dev/null || true
     sync
     
@@ -1017,45 +1413,35 @@ stage0_partition_and_format() {
         sync
         partprobe "${TARGET_DEVICE}" &>/dev/null || true
         udevadm settle &>/dev/null || true
-        
         log "Formatting EFI partition..."
         wipefs -a "${EFI_PART}" &>/dev/null || true
         mkfs.vfat -F 32 "${EFI_PART}"
-        
         log "Creating LUKS container on ${LUKS_PART}..."
-        echo -e "$LUKS_PASSPHRASE\n$LUKS_PASSPHRASE" | cryptsetup luksFormat "${luks_opts[@]}" "${LUKS_PART}"
-        
+        echo -e "$LUKS_PASSPHRASE\n$LUKS_PASSPHRASE" | cryptsetup luksFormat "${luks_opts[@]}" "${LUKS_PART}" &>/dev/null
         log "Opening LUKS container..."
         echo -n "$LUKS_PASSPHRASE" | cryptsetup open "${LUKS_PART}" gentoo_crypted
-        
         local device_to_format="/dev/mapper/gentoo_crypted"
         echo "LUKS_UUID=$(get_blkid_uuid "${LUKS_PART}")" >> "$CONFIG_FILE_TMP"
-        
         log "Setting up LVM on ${device_to_format}..."
         pvcreate -ff "${device_to_format}" &>/dev/null
         vgcreate -ff gentoo_vg "${device_to_format}" &>/dev/null
-        
         log "Creating Boot logical volume..."
         lvcreate -L 1G -n boot gentoo_vg &>/dev/null
         BOOT_PART="/dev/gentoo_vg/boot"
-        
         if [ "$SWAP_TYPE" = "partition (traditional on-disk swap)" ] && [ "$SWAP_SIZE_GB" -gt 0 ]; then
             log "Creating SWAP logical volume..."
             lvcreate -L "${SWAP_SIZE_GB}G" -n swap gentoo_vg &>/dev/null
             SWAP_PART="/dev/gentoo_vg/swap"
             mkswap "${SWAP_PART}"
         fi
-        
         if [ "$USE_SEPARATE_HOME" = true ]; then
             log "Creating Home logical volume..."
             lvcreate -L "${HOME_SIZE_GB}G" -n home gentoo_vg &>/dev/null
             HOME_PART="/dev/gentoo_vg/home"
         fi
-        
         log "Creating Root logical volume..."
         lvcreate -l 100%FREE -n root gentoo_vg &>/dev/null
         ROOT_PART="/dev/gentoo_vg/root"
-        
         log "Formatting logical volumes..."
         wipefs -a "${BOOT_PART}" &>/dev/null || true
         mkfs.ext4 -F "${BOOT_PART}"
@@ -1101,16 +1487,12 @@ stage0_partition_and_format() {
         fi
         
         local device_to_format="${MAIN_PART}"
-        
         if [ "$USE_LUKS" = true ]; then
             LUKS_PART="${MAIN_PART}"
-            
             log "Creating LUKS container on ${LUKS_PART}..."
-            echo -e "$LUKS_PASSPHRASE\n$LUKS_PASSPHRASE" | cryptsetup luksFormat "${luks_opts[@]}" "${LUKS_PART}"
-            
+            echo -e "$LUKS_PASSPHRASE\n$LUKS_PASSPHRASE" | cryptsetup luksFormat "${luks_opts[@]}" "${LUKS_PART}" &>/dev/null
             log "Opening LUKS container..."
             echo -n "$LUKS_PASSPHRASE" | cryptsetup open "${LUKS_PART}" gentoo_crypted
-            
             device_to_format="/dev/mapper/gentoo_crypted"
             echo "LUKS_UUID=$(get_blkid_uuid "${LUKS_PART}")" >> "$CONFIG_FILE_TMP"
         fi
@@ -1167,8 +1549,8 @@ stage0_partition_and_format() {
             fi
             ;;
     esac
-    sync
     
+    sync
     log "Waiting for udev to process new partition information..."
     udevadm settle &>/dev/null || true
     
@@ -1224,6 +1606,7 @@ stage0_partition_and_format() {
     echo "ROOT_PART='${ROOT_PART}'" >> "$CONFIG_FILE_TMP"
     echo "BOOT_MODE='${BOOT_MODE}'" >> "$CONFIG_FILE_TMP"
     
+    # Migrate log to chroot environment
     if [ -f "$LOG_FILE_PATH" ]; then
         mkdir -p "${GENTOO_MNT}/root"
         local final_log_path="${GENTOO_MNT}/root/gentoo_genesis_install.log"
@@ -1317,7 +1700,6 @@ stage1_deploy_base_system() {
                     echo "$match_line" | $hash_cmd --strict -c - && checksum_verified=true
                 fi
                 popd >/dev/null
-                
                 if [ "$checksum_verified" = true ]; then
                     log "Checksum OK with ${hash_cmd}. Found a valid stage3 build."
                     break
@@ -1355,7 +1737,6 @@ stage1_deploy_base_system() {
     
     # Clean up downloaded files
     rm -f "${local_tarball_path}" "${local_digests_path}"
-    
     log "Base system deployed successfully."
 }
 
@@ -1383,7 +1764,6 @@ stage2_prepare_chroot() {
         cat > "${GENTOO_MNT}/etc/portage/repos.conf/gentoo.conf" <<EOF
 [DEFAULT]
 main-repo = gentoo
-
 [gentoo]
 location = /var/db/repos/gentoo
 sync-type = git
@@ -1480,12 +1860,10 @@ EOF
         echo "# /etc/fstab: static file system information."
         echo "# Generated by Gentoo Genesis Engine"
         echo ""
-        
         local root_opts="defaults,noatime"
         if [ "$ROOT_FS_TYPE" = "btrfs" ]; then
             root_opts="subvol=@,compress=zstd,noatime"
         fi
-        
         echo "# Root filesystem"
         echo "UUID=$(get_blkid_uuid "${ROOT_PART}")  /  ${ROOT_FS_TYPE}  ${root_opts}  0 1"
         
@@ -1550,7 +1928,7 @@ EOF
     cp "$CONFIG_FILE_TMP" "${GENTOO_MNT}/etc/autobuilder.conf" || die "Failed to copy config file to chroot"
     
     log "Entering chroot to continue installation..."
-    chroot "${GENTOO_MNT}" /bin/bash "${script_dest_path}" --chrooted
+    chroot "${GENTOO_MNT}" /bin/bash -c "echo 'CHROOT' > /proc/1/cmdline && exec /bin/bash ${script_dest_path} --chrooted"
     log "Chroot execution finished."
 }
 
@@ -1564,6 +1942,11 @@ stage3_configure_in_chroot() {
     
     # Fix potential DNS issues in chroot
     echo "nameserver 8.8.8.8" > /etc/resolv.conf
+    
+    # Check and fix portage permissions
+    if [ -d "/var/db/repos/gentoo" ]; then
+        chown -R portage:portage /var/db/repos/gentoo &>/dev/null || true
+    fi
     
     sync_portage_tree
     
@@ -1646,7 +2029,6 @@ stage3_configure_in_chroot() {
     eselect locale set "${SYSTEM_LOCALE}" || warn "Failed to set locale, continuing anyway"
     
     env-update && source /etc/profile
-    
     log "Setting hostname..."
     echo "${SYSTEM_HOSTNAME}" > /etc/hostname
     echo "127.0.0.1 ${SYSTEM_HOSTNAME} localhost" > /etc/hosts
@@ -1665,7 +2047,6 @@ stage4_build_world_and_kernel() {
         "genkernel (recommended, auto)"|"manual (expert, interactive)")
             log "Installing kernel sources..."
             run_emerge sys-kernel/gentoo-sources
-            
             log "Setting the default kernel symlink..."
             eselect kernel list
             eselect kernel set 1
@@ -1673,7 +2054,6 @@ stage4_build_world_and_kernel() {
             if [ "$KERNEL_METHOD" = "genkernel (recommended, auto)" ]; then
                 log "Building kernel with genkernel"
                 run_emerge sys-kernel/genkernel
-                
                 local genkernel_opts="--install"
                 if [ "$USE_LVM" = true ]; then
                     genkernel_opts+=" --lvm"
@@ -1681,40 +2061,31 @@ stage4_build_world_and_kernel() {
                 if [ "$USE_LUKS" = true ]; then
                     genkernel_opts+=" --luks"
                 fi
-                
                 if [ "$LSM_CHOICE" = "AppArmor" ]; then
                     genkernel_opts+=" --apparmor"
                 fi
                 if [ "$LSM_CHOICE" = "SELinux" ]; then
                     genkernel_opts+=" --selinux"
                 fi
-                
                 log "Running genkernel with options: ${genkernel_opts}"
                 genkernel "${genkernel_opts}" all
             else
                 log "Preparing for manual kernel configuration..."
-                cd /usr/src/linux
-                
+                cd /usr/src/linux || die "Failed to change to kernel source directory"
                 warn "--- MANUAL INTERVENTION REQUIRED ---"
                 warn "The script is about to launch the interactive kernel configuration menu ('make menuconfig')."
                 warn "You will need to configure your kernel manually."
-                
                 if [ "$LSM_CHOICE" != "None" ]; then
                     warn "-> REMINDER: Enable ${LSM_CHOICE} support in 'Security options'."
                 fi
-                
                 if [ "$NVIDIA_DRIVER_CHOICE" = "Proprietary" ]; then
                     warn "-> CRITICAL: You MUST DISABLE the Nouveau driver: 'Device Drivers -> Graphics support -> Nouveau driver' (set to [N])."
                 fi
-                
                 warn "Once you save your configuration and exit, the script will automatically continue with compilation."
                 read -r -p "Press ENTER to launch the kernel configuration menu..."
-                
                 make menuconfig
-                
                 log "Compiling and installing kernel..."
                 make -j$(nproc) && make modules_install && make install
-                
                 # Install initramfs for LUKS/LVM
                 if [ "$USE_LUKS" = true ] || [ "$USE_LVM" = true ]; then
                     log "Generating initramfs..."
@@ -1725,7 +2096,6 @@ stage4_build_world_and_kernel() {
         "gentoo-kernel (distribution kernel, balanced)")
             log "Installing distribution kernel..."
             run_emerge sys-kernel/gentoo-kernel
-            
             # Install initramfs for LUKS/LVM
             if [ "$USE_LUKS" = true ] || [ "$USE_LVM" = true ]; then
                 log "Generating initramfs..."
@@ -1736,7 +2106,6 @@ stage4_build_world_and_kernel() {
         "gentoo-kernel-bin (fastest, pre-compiled)")
             log "Installing pre-compiled binary kernel..."
             run_emerge sys-kernel/gentoo-kernel-bin
-            
             # Install initramfs for LUKS/LVM
             if [ "$USE_LUKS" = true ] || [ "$USE_LVM" = true ]; then
                 log "Generating initramfs..."
@@ -1749,7 +2118,6 @@ stage4_build_world_and_kernel() {
 
 stage5_install_bootloader() {
     step_log "Installing GRUB Bootloader (Mode: ${BOOT_MODE})"
-    
     # For LUKS systems, we need to ensure the initramfs has the right modules
     if [ "$USE_LUKS" = true ]; then
         log "Ensuring initramfs has LUKS modules..."
@@ -1855,7 +2223,6 @@ EOF
 
 stage6_install_software() {
     step_log "Installing Desktop Environment and Application Profiles"
-    
     local display_manager=""
     case "$DESKTOP_ENV" in
         "XFCE")
@@ -1886,7 +2253,6 @@ stage6_install_software() {
     if [ -n "$display_manager" ] && [ "$DESKTOP_ENV" != "Server (No GUI)" ]; then
         log "Installing Xorg Server and Display Manager..."
         run_emerge x11-base/xorg-server "${display_manager}"
-        
         # Configure display manager
         if [ "$INIT_SYSTEM" = "OpenRC" ]; then
             rc-update add "${display_manager#*/}" default
@@ -1956,7 +2322,6 @@ stage6_install_software() {
     if [ "$NVIDIA_DRIVER_CHOICE" = "Proprietary" ]; then
         log "Installing NVIDIA drivers and settings panel..."
         run_emerge x11-drivers/nvidia-drivers x11-misc/nvidia-settings
-        
         # Add NVIDIA module to initramfs
         if [ "$USE_LUKS" = true ] || [ "$USE_LVM" = true ]; then
             sed -i 's/MODULES=""/MODULES="nvidia nvidia-drm"/' /etc/genkernel.conf 2>/dev/null || true
@@ -1984,7 +2349,6 @@ stage6_install_software() {
 
 stage7_finalize() {
     step_log "Finalizing System"
-    
     # Ensure NetworkManager is installed and enabled
     run_emerge net-misc/networkmanager
     
@@ -1994,7 +2358,6 @@ stage7_finalize() {
         ufw default deny incoming
         ufw default allow outgoing
         ufw enable || true
-        
         if [ "$INIT_SYSTEM" = "OpenRC" ]; then
             rc-update add ufw default
         else
@@ -2017,7 +2380,6 @@ stage7_finalize() {
         ram_size_mb=$(free -m | awk '/^Mem:/{print $2}')
         local zram_size
         zram_size=$((ram_size_mb / 2))
-        
         if [ "$INIT_SYSTEM" = "OpenRC" ]; then
             mkdir -p /etc/conf.d
             cat > /etc/conf.d/zram-init <<EOF
@@ -2057,49 +2419,38 @@ EOF
     if [ "$ENABLE_AUTO_UPDATE" = true ]; then
         log "Setting up automatic weekly updates..."
         local update_script_path="/usr/local/bin/gentoo-update.sh"
-        
         if [ "$ENABLE_BOOT_ENVIRONMENTS" = true ]; then
             cat > "$update_script_path" <<'EOF'
 #!/bin/bash
 set -euo pipefail
 exec >> /var/log/gentoo-update.log 2>&1
 echo "=== Gentoo Update started at $(date) ==="
-
 TIMESTAMP=$(date +"%Y-%m-%d_%H-%M-%S")
 CURRENT_ROOT_SUBVOL_PATH="/@"
 BOOT_ENV_ROOT="/@bootenv"
-
 # Ensure directories exist
 mkdir -p /.snapshots
 mkdir -p /boot/grub/bootenv
-
 log() { echo ">>> $*"; }
-
 cleanup() {
     umount -R "${SNAPSHOT_PATH}/proc" 2>/dev/null || true
     umount -R "${SNAPSHOT_PATH}/dev" 2>/dev/null || true
     umount -R "${SNAPSHOT_PATH}/sys" 2>/dev/null || true
     umount -R "${SNAPSHOT_PATH}" 2>/dev/null || true
 }
-
 trap cleanup EXIT
-
 log "Creating new boot environment snapshot: ${BOOT_ENV_ROOT}/update_${TIMESTAMP}"
 btrfs subvolume snapshot -r "${CURRENT_ROOT_SUBVOL_PATH}" "${BOOT_ENV_ROOT}/update_${TIMESTAMP}"
-
 SNAPSHOT_PATH="/mnt/snapshot_$$"
 mkdir -p "${SNAPSHOT_PATH}"
-
 log "Mounting snapshot for update..."
 mount -o subvol="${BOOT_ENV_ROOT}/update_${TIMESTAMP}",compress=zstd,noatime /dev/disk/by-uuid/$(blkid -s UUID -o value /dev/disk/by-label/root) "${SNAPSHOT_PATH}"
-
 log "Preparing chroot environment for the new snapshot..."
 mount --rbind /proc "${SNAPSHOT_PATH}/proc"
 mount --rbind /dev "${SNAPSHOT_PATH}/dev"
 mount --rbind /sys "${SNAPSHOT_PATH}/sys"
 mount --bind /run "${SNAPSHOT_PATH}/run"
 cp /etc/resolv.conf "${SNAPSHOT_PATH}/etc/"
-
 log "Starting update inside the chroot..."
 chroot "${SNAPSHOT_PATH}" /bin/bash -c '
     source /etc/profile
@@ -2109,14 +2460,11 @@ chroot "${SNAPSHOT_PATH}" /bin/bash -c '
     emerge --depclean
     revdep-rebuild -- --quiet
 '
-
 log "Unmounting snapshot..."
 umount -R "${SNAPSHOT_PATH}"
 rmdir "${SNAPSHOT_PATH}"
-
 log "Updating GRUB to detect the new boot environment..."
 grub-mkconfig -o /boot/grub/grub.cfg
-
 log "SUCCESS! Reboot and select the new boot environment from the GRUB menu."
 echo "=== Gentoo Update completed at $(date) ==="
 EOF
@@ -2126,21 +2474,16 @@ EOF
 set -euo pipefail
 exec >> /var/log/gentoo-update.log 2>&1
 echo "=== Gentoo Update started at $(date) ==="
-
 export EIX_QUIET=1
 export EIX_LIMIT=0
-
 eix-sync
 emerge --update --deep --newuse --keep-going @world
 emerge --depclean
 revdep-rebuild -- --quiet
-
 echo "=== Gentoo Update completed at $(date) ==="
 EOF
         fi
-        
         chmod +x "$update_script_path"
-        
         if [ "$INIT_SYSTEM" = "OpenRC" ]; then
             log "Creating weekly cron job..."
             mkdir -p /etc/cron.weekly
@@ -2149,42 +2492,34 @@ EOF
         else
             log "Creating systemd service and timer..."
             mkdir -p /etc/systemd/system
-            
             cat > /etc/systemd/system/gentoo-update.service <<EOF
 [Unit]
 Description=Weekly Gentoo Update
 After=network-online.target
 Wants=network-online.target
-
 [Service]
 Type=oneshot
 ExecStart=${update_script_path}
 Nice=10
 IOSchedulingClass=idle
-
 [Install]
 WantedBy=multi-user.target
 EOF
-
             cat > /etc/systemd/system/gentoo-update.timer <<EOF
 [Unit]
 Description=Run weekly Gentoo update
 Requires=gentoo-update.service
-
 [Timer]
 OnCalendar=Sun 03:00
 RandomizedDelaySec=3600
 Persistent=true
-
 [Install]
 WantedBy=timers.target
 EOF
-
             systemctl daemon-reload
             systemctl enable --now gentoo-update.timer
             log "Systemd timer enabled."
         fi
-        
         warn "Automatic updates are enabled, but you MUST run 'etc-update' or 'dispatch-conf' manually to merge configuration file changes."
     fi
     
@@ -2281,9 +2616,7 @@ EOF
     else
         log "Set a password for the 'root' user:"
         passwd root
-        
         useradd -m -G "$user_groups" -s /bin/bash "$new_user" || die "Failed to create user $new_user"
-        
         log "Set a password for user '$new_user':"
         passwd "$new_user"
     fi
@@ -2293,17 +2626,14 @@ EOF
     fi
     
     log "User '$new_user' created."
-    
     log "Creating first-login setup script for user '${new_user}'..."
     local first_login_script_path="/home/${new_user}/.first_login.sh"
-    
     cat > "$first_login_script_path" <<EOF
 #!/bin/bash
 echo ">>> Performing one-time user setup... (output is logged to ~/.first_login.log)"
 (
 export HOME="/home/${new_user}"
 export USER="${new_user}"
-
 if [ "$INSTALL_STYLING" = true ]; then
     echo ">>> Applying base styling..."
     case "$DESKTOP_ENV" in
@@ -2333,7 +2663,6 @@ if [ "$INSTALL_STYLING" = true ]; then
             ;;
     esac
 fi
-
 if [ "$INSTALL_APP_HOST" = true ] && command -v distrobox-create &>/dev/null; then
     echo ">>> Creating Distrobox container (this may take a few minutes)..."
     # Check if container already exists
@@ -2341,13 +2670,11 @@ if [ "$INSTALL_APP_HOST" = true ] && command -v distrobox-create &>/dev/null; th
         distrobox-create --name ubuntu --image ubuntu:latest --yes
     fi
 fi
-
 echo ">>> Setup complete!" 
 ) 2>&1 | tee "/home/${new_user}/.first_login.log"
 echo ">>> Removing first-login script..."
 rm -- "\$0"
 EOF
-    
     chmod +x "$first_login_script_path"
     chown "${new_user}:${new_user}" "$first_login_script_path"
     
@@ -2359,24 +2686,20 @@ EOF
         chsh -s /bin/zsh "${new_user}"
         shell_rc_path="/home/${new_user}/.zshrc"
         shell_profile_path="/home/${new_user}/.zprofile"
-        
         cat > "$shell_rc_path" <<'EOF'
 # Enable Powerlevel10k prompt if available
 if [ -f /usr/share/zsh/site-contrib/powerlevel10k.zsh-theme ]; then
     source /usr/share/zsh/site-contrib/powerlevel10k.zsh-theme
 fi
-
 # Enable starship prompt
 if command -v starship &>/dev/null; then
     eval "$(starship init zsh)"
 fi
-
 # Enable fzf keybindings and fuzzy completion
 if command -v fzf &>/dev/null; then
     source /usr/share/fzf/completion.zsh
     source /usr/share/fzf/key-bindings.zsh
 fi
-
 # Aliases
 alias ls='ls --color=auto'
 alias ll='ls -lh'
@@ -2389,23 +2712,19 @@ alias df='df -h'
 alias du='du -h'
 alias free='free -h'
 alias neofetch='neofetch --disable title model --ascii_colors 5 6 1 2 3'
-
 # Add user bin to PATH
 export PATH="$HOME/.local/bin:$PATH"
-
 # Add distrobox to PATH if available
 if [ -d "$HOME/.local/share/distrobox" ]; then
     export PATH="$PATH:$HOME/.local/share/distrobox"
 fi
 EOF
-        
         chown "${new_user}:${new_user}" "$shell_rc_path"
     fi
     
     if [ "$INSTALL_APP_HOST" = true ]; then
         log "Adding Distrobox aliases to ${shell_rc_path}..."
         cat >> "$shell_rc_path" <<'EOF'
-
 # Distrobox aliases
 if command -v distrobox-enter &> /dev/null; then
     alias db='distrobox-enter'
@@ -2425,7 +2744,6 @@ if [ -f "\$HOME/.first_login.sh" ]; then
     . "\$HOME/.first_login.sh"
 fi
 EOF
-    
     chown "${new_user}:${new_user}" "$shell_profile_path"
     
     log "Installation complete."
@@ -2436,7 +2754,6 @@ EOF
 unmount_and_reboot() {
     log "Installation has finished."
     warn "The script will now attempt to cleanly unmount all partitions and reboot."
-    
     if ! ${FORCE_MODE:-false}; then
         read -r -p "Press ENTER to proceed..."
     else
@@ -2462,16 +2779,28 @@ unmount_and_reboot() {
         umount -R "${GENTOO_MNT}/sys" &>/dev/null || true
         umount -R "${GENTOO_MNT}/dev" &>/dev/null || true
         umount -R "${GENTOO_MNT}/run" &>/dev/null || true
+        
+        # Handle LVM and LUKS
+        if [ "$USE_LVM" = true ]; then
+            vgchange -an gentoo_vg &>/dev/null || true
+        fi
+        
+        if [ "$USE_LUKS" = true ]; then
+            cryptsetup close gentoo_crypted &>/dev/null || true
+        fi
+        
         umount -R "${GENTOO_MNT}" &>/dev/null || umount -l "${GENTOO_MNT}" &>/dev/null || true
         
         if ! mountpoint -q "${GENTOO_MNT}"; then
             log "Successfully unmounted ${GENTOO_MNT}."
             
-            # Clean up LUKS mappings if any
-            if command -v cryptsetup &>/dev/null; then
-                for dm in $(dmsetup ls --target crypt | awk '{print $1}' 2>/dev/null || true); do
-                    cryptsetup close "$dm" &>/dev/null || true
-                done
+            # Final cleanup of temp files
+            if [ -f "$CONFIG_FILE_TMP" ]; then
+                rm -f "$CONFIG_FILE_TMP" 2>/dev/null || true
+            fi
+            
+            if [ -f "$CHECKPOINT_FILE" ]; then
+                rm -f "$CHECKPOINT_FILE" 2>/dev/null || true
             fi
             
             log "Rebooting in 5 seconds..."
@@ -2484,7 +2813,6 @@ unmount_and_reboot() {
                 warn "Processes still using the mount point:"
                 lsof "${GENTOO_MNT}" || echo " (none found, might be a kernel issue)"
             fi
-            
             warn "Retrying in 10 seconds... (${retries} attempts left)"
             sleep 10
             retries=$((retries - 1))
@@ -2494,9 +2822,13 @@ unmount_and_reboot() {
     warn "Could not automatically unmount all filesystems. You may need to do this manually."
     warn "Run the following commands before rebooting:"
     warn "  umount -R ${GENTOO_MNT}"
-    warn "  cryptsetup close gentoo_crypted (if applicable)"
+    if [ "$USE_LUKS" = true ]; then
+        warn "  cryptsetup close gentoo_crypted"
+    fi
+    if [ "$USE_LVM" = true ]; then
+        warn "  vgchange -an gentoo_vg"
+    fi
     warn "Then reboot with: reboot"
-    
     read -r -p "Press ENTER to drop to a shell for manual cleanup, or Ctrl+C to abort..."
     exec /bin/bash
 }
@@ -2521,7 +2853,6 @@ main() {
         fi
         
         CHECKPOINT_FILE="/.genesis_checkpoint"
-        
         if [ -f "$CHECKPOINT_FILE" ]; then
             START_STAGE=$(<"$CHECKPOINT_FILE")
             START_STAGE=$((START_STAGE + 1))
@@ -2555,15 +2886,12 @@ main() {
         done
         
         log "Chroot stages complete. Cleaning up..."
-        rm -f /etc/autobuilder.conf "/.genesis_checkpoint"
+        rm -f /etc/autobuilder.conf "/.genesis_checkpoint" 2>/dev/null || true
         
         # Exit chroot
         exit 0
     else
         # Parse command line arguments
-        FORCE_MODE=false
-        SKIP_CHECKSUM=false
-        
         for arg in "$@"; do
             case "$arg" in
                 --force|--auto)
@@ -2572,9 +2900,6 @@ main() {
                 --skip-checksum)
                     SKIP_CHECKSUM=true
                     warn "WARNING: Checksum verification is disabled. This is a security risk."
-                    ;;
-                *)
-                    # Ignore unknown arguments
                     ;;
             esac
         done
@@ -2605,7 +2930,6 @@ main() {
         for i in "${!stages[@]}"; do
             local stage_num=$i
             local stage_func=${stages[$i]}
-            
             if [ "$START_STAGE" -le "$stage_num" ]; then
                 if declare -f "$stage_func" >/dev/null; then
                     log "Executing stage ${stage_num}: ${stage_func}"
@@ -2628,7 +2952,6 @@ main() {
 # --- SCRIPT ENTRYPOINT ---
 # Setup logging before main function
 mkdir -p /tmp
-
 if [ "${1:-}" != "--chrooted" ]; then
     # Handle log file for initial run
     if [ -f "${CHECKPOINT_FILE}" ] && [ -d "${GENTOO_MNT}/root" ]; then
@@ -2638,6 +2961,9 @@ if [ "${1:-}" != "--chrooted" ]; then
             echo -e "\n--- RESUMING LOG $(date) ---\n" >> "$LOG_FILE_PATH"
         fi
     fi
+    
+    # Ensure log directory exists
+    mkdir -p "$(dirname "$LOG_FILE_PATH")"
     
     # Run main function with logging
     main "$@" 2>&1 | tee -a "$LOG_FILE_PATH"
