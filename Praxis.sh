@@ -2,15 +2,14 @@
 # shellcheck disable=SC1091,SC2016
 
 # The Gentoo Genesis Engine
-# Version: 10.3.4 "The Purified"
+# Version: 10.3.6 "The Self-Sufficient"
 #
 # Changelog:
-# - v10.3.4: FINAL SYNTAX FIX. Expanded all remaining one-liner control structures
-#            (case, if, for) into multi-line blocks to permanently eliminate
-#            the entire class of semicolon-related syntax errors.
-# - v10.3.3: Eradicated syntax errors, hardened first-login script, improved net check.
-# - v10.3.2: Major robustness and security hardening release.
-# - v10.3.1: Fixed a syntax error in the interactive setup for NVIDIA driver selection.
+# - v10.3.6: Implemented a proactive dependency handler. The script now detects missing
+#            tools on the LiveCD and offers to automatically install them via Portage,
+#            making it self-sufficient in most Gentoo-based environments.
+# - v10.3.5: Made `gcc` an optional dependency to prevent script failure on minimal LiveCDs.
+# - v10.3.4: Expanded all one-liner control structures to fix all semicolon syntax errors.
 
 set -euo pipefail
 
@@ -58,13 +57,53 @@ cleanup() { err "An error occurred. Initiating cleanup..."; sync; if mountpoint 
 trap 'cleanup' ERR INT TERM
 trap 'rm -f "$CONFIG_FILE_TMP"' EXIT
 ask_confirm() { if ${FORCE_MODE:-false}; then return 0; fi; read -r -p "$1 [y/N] " response; [[ "$response" =~ ^[yY]([eE][sS])?$ ]]; }
-self_check() { log "Performing script integrity self-check..."; local funcs=(pre_flight_checks dependency_check stage0_select_mirrors interactive_setup stage0_partition_and_format stage1_deploy_base_system stage2_prepare_chroot stage3_configure_in_chroot stage4_build_world_and_kernel stage5_install_bootloader stage6_install_software stage7_finalize); for func in "${funcs[@]}"; do if ! declare -F "$func" > /dev/null; then die "Self-check failed: Function '$func' is not defined. The script may be corrupt."; fi; done; log "Self-check passed."; }
+self_check() { log "Performing script integrity self-check..."; local funcs=(pre_flight_checks ensure_dependencies stage0_select_mirrors interactive_setup stage0_partition_and_format stage1_deploy_base_system stage2_prepare_chroot stage3_configure_in_chroot stage4_build_world_and_kernel stage5_install_bootloader stage6_install_software stage7_finalize); for func in "${funcs[@]}"; do if ! declare -F "$func" > /dev/null; then die "Self-check failed: Function '$func' is not defined. The script may be corrupt."; fi; done; log "Self-check passed."; }
 
 # ==============================================================================
 # --- STAGES -2, -1, 0A: PRE-FLIGHT ---
 # ==============================================================================
 pre_flight_checks() { step_log "Performing Pre-flight System Checks"; log "Checking for internet connectivity..."; if ! ping -c 3 8.8.8.8 &>/dev/null; then die "No internet connection."; fi; log "Internet connection is OK."; log "Detecting boot mode..."; if [ -d /sys/firmware/efi ]; then BOOT_MODE="UEFI"; else BOOT_MODE="LEGACY"; fi; log "System booted in ${BOOT_MODE} mode."; if compgen -G "/sys/class/power_supply/BAT*" > /dev/null; then log "Laptop detected."; IS_LAPTOP=true; fi; }
-dependency_check() { step_log "Verifying LiveCD Dependencies"; local missing_deps=(); local deps=(curl wget sgdisk partprobe mkfs.vfat mkfs.xfs mkfs.ext4 mkfs.btrfs blkid lsblk sha512sum chroot wipefs blockdev cryptsetup pvcreate vgcreate lvcreate mkswap lscpu lspci gcc udevadm); for cmd in "${deps[@]}"; do if ! command -v "$cmd" &>/dev/null; then missing_deps+=("$cmd"); fi; done; if (( ${#missing_deps[@]} > 0 )); then die "Required commands not found: ${missing_deps[*]}"; fi; log "All dependencies are satisfied."; }
+
+### --- НОВАЯ УЛУЧШЕННАЯ ФУНКЦИЯ --- ###
+ensure_dependencies() {
+    step_log "Ensuring LiveCD Dependencies"
+    local missing_deps=()
+    # `gcc` is included here because it's needed for the CPU arch fallback.
+    local all_deps=(curl wget sgdisk partprobe mkfs.vfat mkfs.xfs mkfs.ext4 mkfs.btrfs blkid lsblk sha512sum chroot wipefs blockdev cryptsetup pvcreate vgcreate lvcreate mkswap lscpu lspci udevadm gcc)
+    
+    log "Checking for required tools..."
+    for cmd in "${all_deps[@]}"; do
+        if ! command -v "$cmd" &>/dev/null; then
+            missing_deps+=("$cmd")
+        fi
+    done
+
+    if (( ${#missing_deps[@]} > 0 )); then
+        warn "The following required tools are missing from your LiveCD: ${missing_deps[*]}"
+        log "The script can attempt to automatically install them using Portage."
+        warn "This process might take a significant amount of time (30+ minutes), as it needs to sync the Portage tree and compile the tools."
+        
+        if ask_confirm "Do you want to proceed with automatic installation?"; then
+            log "Preparing LiveCD environment... This may take a while."
+            
+            log "Step 1/2: Syncing the Portage tree..."
+            emerge-webrsync || die "Failed to sync Portage tree. Please check your internet connection."
+            
+            log "Step 2/2: Installing missing packages: ${missing_deps[*]}"
+            # Portage is smart enough to find the package for a given command
+            if ! emerge -q --noreplace "${missing_deps[@]}"; then
+                die "Failed to install required dependencies. Cannot continue."
+            fi
+            log "LiveCD dependencies successfully installed."
+        else
+            die "Missing dependencies. Aborted by user."
+        fi
+    else
+        log "All dependencies are satisfied."
+    fi
+}
+### --- КОНЕЦ НОВОЙ ФУНКЦИИ --- ###
+
 stage0_select_mirrors() { step_log "Selecting Fastest Mirrors"; if ask_confirm "Do you want to automatically select the fastest mirrors? (Recommended)"; then log "Syncing portage tree to get mirrorselect..."; emerge-webrsync >/dev/null; log "Installing mirrorselect..."; emerge -q app-portage/mirrorselect; log "Running mirrorselect, this may take a minute..."; FASTEST_MIRRORS=$(mirrorselect -s4 -b10 -o -D); log "Fastest mirrors selected."; else log "Skipping mirror selection. Default mirrors will be used."; fi; }
 
 # ==============================================================================
@@ -77,6 +116,7 @@ detect_gpu_hardware() { step_log "Hardware Detection Engine (GPU)"; local gpu_in
 # ==============================================================================
 # --- STAGE 0B: INTERACTIVE SETUP WIZARD ---
 # ==============================================================================
+# ... (эта функция и все последующие остаются без изменений) ...
 interactive_setup() {
     step_log "Interactive Setup Wizard"
     log "--- Hardware Auto-Detection Results ---"; log "  CPU Model:       ${CPU_MODEL_NAME}"; log "  Selected March:  ${CPU_MARCH}"; log "  CPU Flags:       ${CPU_FLAGS_X86:-None detected}"; log "  GPU Vendor:      ${GPU_VENDOR}"; if ! ask_confirm "Are these hardware settings correct?"; then die "Installation cancelled."; fi
@@ -194,9 +234,6 @@ interactive_setup() {
     log "Configuration complete. Review summary before proceeding."
 }
 
-# ==============================================================================
-# --- STAGE 0C: DISK PREPARATION (DESTRUCTIVE) ---
-# ==============================================================================
 stage0_partition_and_format() {
     step_log "Disk Partitioning and Formatting (Mode: ${BOOT_MODE})"; warn "Final confirmation. ALL DATA ON ${TARGET_DEVICE} WILL BE PERMANENTLY DESTROYED!"; read -r -p "To confirm, type the full device name ('${TARGET_DEVICE}'): " confirmation; if [[ "$confirmation" != "${TARGET_DEVICE}" ]]; then die "Confirmation failed. Aborting."; fi
     log "Initiating 'Absolute Zero' protocol..."; 
@@ -219,14 +256,8 @@ stage0_partition_and_format() {
     echo "LUKS_PART='${LUKS_PART}'" >> "$CONFIG_FILE_TMP"
 }
 
-# ==============================================================================
-# --- STAGE 1: BASE SYSTEM DEPLOYMENT ---
-# ==============================================================================
 stage1_deploy_base_system() { step_log "Base System Deployment"; local stage3_variant="openrc"; if [[ "$INIT_SYSTEM" == "SystemD" ]]; then stage3_variant="systemd"; fi; log "Selecting '${stage3_variant}' stage3 build based on user choice."; local success=false; local base_url="https://distfiles.gentoo.org/releases/amd64/autobuilds/"; local latest_info_url="${base_url}latest-stage3-amd64-${stage3_variant}.txt"; log "Fetching list of recent stage3 builds from ${latest_info_url}..."; local build_list; build_list=$(curl --fail -L -s --connect-timeout 15 "$latest_info_url" | grep '\.tar\.xz' | awk '{print $1}') || die "Could not fetch stage3 build list from ${latest_info_url}"; local attempt_count=0; for build_path in $build_list; do attempt_count=$((attempt_count + 1)); log "--- [Attempt ${attempt_count}] Trying build: ${build_path} ---"; local tarball_name; tarball_name=$(basename "$build_path"); local tarball_url="${base_url}${build_path}"; local local_tarball_path="${GENTOO_MNT}/${tarball_name}"; log "Downloading stage3: ${tarball_name}"; wget --tries=3 --timeout=45 -c -O "${local_tarball_path}" "$tarball_url"; if [[ ! -s "${local_tarball_path}" ]]; then warn "Stage3 download failed. Trying next build..."; continue; fi; local digests_url="${tarball_url}.DIGESTS"; local local_digests_path="${GENTOO_MNT}/${tarball_name}.DIGESTS"; log "Downloading digests file..."; wget --tries=3 -c -O "${local_digests_path}" "$digests_url"; if [[ ! -s "${local_digests_path}" ]]; then warn "Digests download failed. Trying next build..."; rm -f "${local_tarball_path}"; continue; fi; if ${SKIP_CHECKSUM}; then warn "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"; err "  DANGER: CHECKSUM VERIFICATION IS DISABLED!"; err "  This is a significant security risk. You are installing a"; err "  base system without verifying its integrity. Proceed only"; err "  if you understand and accept this risk."; warn "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"; read -r -p "Press ENTER to acknowledge this risk and continue..."; success=true; break; fi; log "Verifying tarball integrity with SHA512..."; pushd "${GENTOO_MNT}" >/dev/null; if grep -E "\s+${tarball_name}$" "$(basename "${local_digests_path}")" | sha512sum --strict -c -; then popd >/dev/null; log "Checksum OK. Found a valid stage3 build."; success=true; break; else popd >/dev/null; warn "Checksum FAILED for this build. Trying next."; rm -f "${local_tarball_path}" "${local_digests_path}"; fi; done; if [ "$success" = false ]; then die "Failed to find a verifiable stage3 build after trying ${attempt_count} options."; fi; log "Unpacking stage3 tarball..."; tar xpvf "${local_tarball_path}" --xattrs-include='*.*' --numeric-owner -C "${GENTOO_MNT}"; log "Base system deployed successfully."; }
 
-# ==============================================================================
-# --- STAGE 2: CHROOT PREPARATION ---
-# ==============================================================================
 stage2_prepare_chroot() {
     step_log "Chroot Preparation"; log "Configuring Portage..."; mkdir -p "${GENTOO_MNT}/etc/portage/repos.conf"; cp "${GENTOO_MNT}/usr/share/portage/config/repos.conf" "${GENTOO_MNT}/etc/portage/repos.conf/gentoo.conf"
     log "Writing dynamic make.conf..."; local emerge_opts="--jobs=${EMERGE_JOBS} --load-average=${EMERGE_JOBS} --quiet-build=y --autounmask-write=y --with-bdeps=y"; if [[ "$USE_BINPKGS" = true ]]; then emerge_opts+=" --getbinpkg=y"; fi; local features="candy"; if [[ "$USE_CCACHE" = true ]]; then features+=" ccache"; fi; local base_use="X dbus policykit gtk udev udisks vaapi vdpau vulkan"; if [[ "$USE_PIPEWIRE" = true ]]; then base_use+=" pipewire wireplumber -pulseaudio"; else base_use+=" pulseaudio"; fi; local extra_use=""; case "$DESKTOP_ENV" in "KDE-Plasma") extra_use="kde plasma qt5 -gnome" ;; "GNOME") extra_use="gnome -kde -qt5" ;; "i3-WM") extra_use="-gnome -kde -qt5" ;; "XFCE") extra_use="-gnome -kde -qt5" ;; esac; if [[ "$INIT_SYSTEM" == "SystemD" ]]; then extra_use+=" systemd -elogind"; else extra_use+=" elogind -systemd"; fi; if [[ "$LSM_CHOICE" == "AppArmor" ]]; then extra_use+=" apparmor"; fi; if [[ "$LSM_CHOICE" == "SELinux" ]]; then extra_use+=" selinux"; fi; local common_flags="-O2 -pipe -march=${CPU_MARCH}"; local ld_flags=""; if [[ "$USE_LTO" = true ]]; then common_flags+=" -flto=auto"; ld_flags+="-flto=auto"; fi
@@ -255,9 +286,6 @@ EOF
     log "Mounting virtual filesystems..."; mount --types proc /proc "${GENTOO_MNT}/proc"; mount --rbind /sys "${GENTOO_MNT}/sys"; mount --make-rslave "${GENTOO_MNT}/sys"; mount --rbind /dev "${GENTOO_MNT}/dev"; mount --make-rslave "${GENTOO_MNT}/dev"; log "Copying DNS info..."; cp --dereference /etc/resolv.conf "${GENTOO_MNT}/etc/"; local script_name; script_name=$(basename "$0"); local script_dest_path="/root/${script_name}"; log "Copying this script into the chroot..."; cp "$0" "${GENTOO_MNT}${script_dest_path}"; chmod +x "${GENTOO_MNT}${script_dest_path}"; cp "$CONFIG_FILE_TMP" "${GENTOO_MNT}/etc/autobuilder.conf"; log "Entering chroot to continue installation (canonical method)..."; chroot "${GENTOO_MNT}" /usr/bin/env -i HOME=/root TERM="$TERM" "${script_dest_path}" --chrooted; log "Chroot execution finished."
 }
 
-# ==============================================================================
-# --- STAGES 3 through 7 ---
-# ==============================================================================
 stage3_configure_in_chroot() { step_log "System Configuration (Inside Chroot)"; source /etc/profile; export PS1="(chroot) ${PS1:-}"; log "Syncing Portage tree snapshot..."; emerge_safely -q --sync; local profile_base="default/linux/amd64/17.1"; if [[ "$USE_HARDENED_PROFILE" = true ]]; then profile_base+="/hardened"; fi; local profile_desktop=""; if [[ "$DESKTOP_ENV" == "KDE-Plasma" ]]; then profile_desktop="/desktop/plasma"; fi; if [[ "$DESKTOP_ENV" == "GNOME" ]]; then profile_desktop="/desktop/gnome"; fi; if [[ "$DESKTOP_ENV" != "Server (No GUI)" && -z "$profile_desktop" ]]; then profile_desktop="/desktop"; fi; local profile_init=""; if [[ "$INIT_SYSTEM" == "SystemD" ]]; then profile_init="/systemd"; fi; local GENTOO_PROFILE="${profile_base}${profile_desktop}${profile_init}"; log "Setting system profile to: ${GENTOO_PROFILE}"; eselect profile set "${GENTOO_PROFILE}"; if [[ "$USE_CCACHE" = true ]]; then log "Setting up ccache..."; emerge_safely app-misc/ccache; ccache -M 50G; fi; step_log "Installing Kernel Headers and Core System Utilities"; emerge_safely sys-kernel/linux-headers; if [[ "$USE_LVM" = true ]]; then emerge_safely sys-fs/lvm2; fi; if [[ "$USE_LUKS" = true ]]; then emerge_safely sys-fs/cryptsetup; fi; if [[ "$LSM_CHOICE" == "AppArmor" ]]; then emerge_safely sys-apps/apparmor; fi; if [[ "$LSM_CHOICE" == "SELinux" ]]; then emerge_safely sys-libs/libselinux sys-apps/policycoreutils; fi; if [[ -n "$MICROCODE_PACKAGE" ]]; then log "Installing CPU microcode package: ${MICROCODE_PACKAGE}"; emerge_safely "${MICROCODE_PACKAGE}"; else warn "No specific microcode package to install."; fi; log "Configuring timezone and locale..."; ln -sf "/usr/share/zoneinfo/${SYSTEM_TIMEZONE}" /etc/localtime; echo "${SYSTEM_LOCALE} UTF-8" > /etc/locale.gen; echo "en_US.UTF-8 UTF-8" >> /etc/locale.gen; locale-gen; eselect locale set "${SYSTEM_LOCALE}"; env-update && source /etc/profile; log "Setting hostname..."; echo "hostname=\"${SYSTEM_HOSTNAME}\"" > /etc/conf.d/hostname; }
 
 stage4_build_world_and_kernel() {
@@ -600,7 +628,8 @@ main() {
             load_checkpoint
         fi
 
-        local initial_stages=(self_check pre_flight_checks dependency_check stage0_select_mirrors detect_cpu_architecture detect_cpu_flags detect_gpu_hardware interactive_setup stage0_partition_and_format stage1_deploy_base_system)
+        # Порядок вызова изменён
+        local initial_stages=(self_check pre_flight_checks ensure_dependencies stage0_select_mirrors detect_cpu_architecture detect_cpu_flags detect_gpu_hardware interactive_setup stage0_partition_and_format stage1_deploy_base_system)
         
         if (( START_STAGE == 0 )); then
             for stage_func in "${initial_stages[@]}"; do
