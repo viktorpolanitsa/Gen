@@ -1,169 +1,122 @@
 #!/bin/bash
-
 set -e
+LOGFILE="/tmp/autogentoo_install.log"
+exec > >(tee -i $LOGFILE)
+exec 2>&1
 
-# ------------------------------
-# Gentoo Auto Installer (Binary)
-# Fully automated, minimal user intervention
-# Supports multiple DEs, init systems, filesystems
-# Dynamically selects fastest mirror
-# ------------------------------
-
-# --- Functions ---
-
-detect_region_mirror() {
-    # Detect region by IP and suggest mirrors
-    echo "--> Detecting region and best mirror..."
-    REGION=$(curl -s https://ipapi.co/country/)
-    case "$REGION" in
-        RU)
-            MIRROR_LIST=("https://mirror.yandex.ru/gentoo" "https://mirror.karelia.ru/gentoo")
-            ;;
-        *)
-            MIRROR_LIST=("https://mirror.rackspace.com/gentoo" "https://gentoo.osuosl.org")
-            ;;
-    esac
-}
-
-select_fastest_mirror() {
-    # Select fastest available mirror
-    echo "--> Selecting fastest mirror..."
-    for mirror in "${MIRROR_LIST[@]}"; do
-        if curl --head --silent --fail "$mirror/releases/amd64/autobuilds/" >/dev/null; then
-            FASTEST_MIRROR=$mirror
-            echo "--> Mirror selected: $FASTEST_MIRROR"
-            return
-        fi
-    done
-    echo "No available mirrors found. Exiting."
-    exit 1
-}
-
-get_latest_stage3() {
-    echo "--> Fetching latest Stage3 tarball URL..."
-    STAGE3_LIST=$(curl -s "$FASTEST_MIRROR/releases/amd64/autobuilds/latest-stage3-amd64-openrc.txt" | grep -v "^#" | grep "stage3")
-    STAGE3_FILE=$(echo "$STAGE3_LIST" | head -n1 | awk '{print $1}')
-    echo "--> Latest Stage3: $STAGE3_FILE"
-}
-
-# --- User Input ---
+# --- Preliminary ---
+cd /
+echo "---= AutoGentoo Installer =---"
+echo "WARNING: This will erase ALL DATA on the selected disk."
 
 lsblk -dno NAME,SIZE,MODEL
-echo ""
-read -p "Enter disk for installation (e.g., sda or nvme0n1): " disk
-disk="/dev/${disk}"
+read -p "Enter disk (e.g., sda or nvme0n1): " disk
+disk="/dev/$disk"
 
-# Filesystem choice
-echo "Select filesystem for root partition:"
-fs_options=("ext4" "xfs" "btrfs")
-select fs_choice in "${fs_options[@]}"; do
-    case $fs_choice in
-        ext4|xfs|btrfs) break;;
-        *) echo "Invalid. Try again.";;
-    esac
-done
-
-# Desktop Environment choice
 echo "Select Desktop Environment:"
-de_options=("GNOME" "KDE Plasma" "XFCE" "LXQt" "MATE" "Cinnamon" "Exit")
-select de_choice in "${de_options[@]}"; do
-    case $de_choice in
-        GNOME|KDE\ Plasma|XFCE|LXQt|MATE|Cinnamon) break;;
-        Exit) exit;;
-        *) echo "Invalid choice.";;
-    esac
+options=("GNOME" "KDE Plasma" "XFCE" "LXQt" "MATE" "Exit")
+select de_choice in "${options[@]}"; do
+  [[ "$de_choice" =~ ^(GNOME|KDE\ Plasma|XFCE|LXQt|MATE)$ ]] && break
+  [[ "$de_choice" == "Exit" ]] && exit
+  echo "Invalid choice."
 done
 
-# Init system
-echo "Select init system:"
-init_options=("OpenRC" "systemd")
-select init_choice in "${init_options[@]}"; do
-    case $init_choice in
-        OpenRC|systemd) break;;
-        *) echo "Invalid choice.";;
-    esac
-done
-
-# Hostname & user
 read -p "Enter hostname: " hostname
 read -p "Enter username: " username
+read -p "Enter timezone (e.g., Europe/Moscow): " timezone
 
-# Passwords
 while true; do
-    read -sp "Enter root password: " root_password
-    echo
-    read -sp "Confirm root password: " root_password2
-    echo
-    [ "$root_password" = "$root_password2" ] && break
-    echo "Passwords do not match."
+  read -sp "Root password: " root_password; echo
+  read -sp "Confirm root password: " root_password2; echo
+  [[ "$root_password" == "$root_password2" ]] && break
+  echo "Passwords do not match."
 done
 
 while true; do
-    read -sp "Enter password for user $username: " user_password
-    echo
-    read -sp "Confirm password: " user_password2
-    echo
-    [ "$user_password" = "$user_password2" ] && break
-    echo "Passwords do not match."
+  read -sp "Password for $username: " user_password; echo
+  read -sp "Confirm password: " user_password2; echo
+  [[ "$user_password" == "$user_password2" ]] && break
+  echo "Passwords do not match."
 done
 
-# --- Mirror & Stage3 ---
-detect_region_mirror
-select_fastest_mirror
-get_latest_stage3
+echo ""
+echo "--- Installation Configuration ---"
+echo "Disk: $disk"
+echo "Desktop Environment: $de_choice"
+echo "Hostname: $hostname"
+echo "Timezone: $timezone"
+read -p "Press Enter to continue..."
 
-# --- Disk preparation ---
+# --- System Preparation ---
 swapoff -a || true
 umount -R /mnt/gentoo || true
 umount -R ${disk}* || true
 blockdev --flushbufs "$disk" || true
-sleep 2
+sleep 3
 
-echo "--> Partitioning disk..."
-sfdisk --force --wipe always --wipe-partitions always "$disk" << EOF
+# --- Partitioning ---
+sfdisk --force --wipe always --wipe-partitions always "$disk" <<DISKEOF
 label: gpt
 ${disk}1 : size=512MiB, type=uefi
 ${disk}2 : type=linux
-EOF
+DISKEOF
+partprobe "$disk"; sleep 1
+wipefs -a "${disk}1"; wipefs -a "${disk}2"
 
-partprobe "$disk"
-sleep 1
+echo "Select filesystem for root partition:"
+fs_options=("ext4" "xfs" "btrfs")
+select fs_choice in "${fs_options[@]}"; do
+  [[ "$fs_choice" =~ ^(ext4|xfs|btrfs)$ ]] && break
+done
 
-echo "--> Wiping old signatures..."
-wipefs -a "${disk}1"
-wipefs -a "${disk}2"
-
-echo "--> Formatting partitions..."
-mkfs.vfat -F32 "${disk}1"
-case "$fs_choice" in
-    ext4) mkfs.ext4 -F "${disk}2";;
-    xfs) mkfs.xfs -f "${disk}2";;
-    btrfs) mkfs.btrfs -f "${disk}2";;
+mkfs.vfat -F 32 "${disk}1"
+case $fs_choice in
+  ext4) mkfs.ext4 -F "${disk}2";;
+  xfs) mkfs.xfs -f "${disk}2";;
+  btrfs) mkfs.btrfs -f "${disk}2";;
 esac
 
-echo "--> Mounting partitions..."
 mkdir -p /mnt/gentoo
 mount "${disk}2" /mnt/gentoo
 mkdir -p /mnt/gentoo/efi
 mount "${disk}1" /mnt/gentoo/efi
-
 cd /mnt/gentoo
 
-echo "--> Downloading Stage3..."
-wget "$FASTEST_MIRROR/releases/amd64/autobuilds/$STAGE3_FILE"
-tar xpvf stage3-*.tar.* --xattrs-include='*.*' --numeric-owner
+# --- Mirror selection with fallback ---
+COUNTRY=$(curl -s https://ipapi.co/country/)
+declare -a MIRRORS
+case "$COUNTRY" in
+  "RU") MIRRORS=("https://mirror.yandex.ru/gentoo/" "https://mirror.mos.ru/gentoo/" "https://mirror.kaspersky.com/gentoo/") ;;
+  *) MIRRORS=("https://distfiles.gentoo.org/") ;;
+esac
+
+STAGE3_URL=""
+for MIRROR in "${MIRRORS[@]}"; do
+  TXT_URL="${MIRROR}releases/amd64/autobuilds/latest-stage3-amd64-openrc.txt"
+  if curl -s --head --fail --max-time 10 "$TXT_URL" >/dev/null; then
+    STAGE3_FILE=$(curl -s "$TXT_URL" | grep -v "^#" | grep 'stage3' | head -n1 | cut -d' ' -f1)
+    FULL_URL="${MIRROR}releases/amd64/autobuilds/$STAGE3_FILE"
+    if curl -s --head --fail --max-time 10 "$FULL_URL" >/dev/null; then
+      STAGE3_URL="$FULL_URL"
+      break
+    fi
+  fi
+done
+[[ -z "$STAGE3_URL" ]] && { echo "Failed to detect Stage3 mirror. Exiting."; exit 1; }
+
+wget "$STAGE3_URL"
+tar xpvf stage3-*.tar.xz --xattrs-include='*.*' --numeric-owner
 
 # --- make.conf ---
 case $de_choice in
-    GNOME) DE_USE_FLAGS="gtk gnome -qt5 -kde";;
-    KDE\ Plasma) DE_USE_FLAGS="qt5 plasma kde -gtk -gnome";;
-    XFCE) DE_USE_FLAGS="gtk xfce -qt5 -kde -gnome";;
-    LXQt) DE_USE_FLAGS="qt5 lxqt -gtk -gnome -kde";;
-    MATE) DE_USE_FLAGS="gtk mate -qt5 -kde -gnome";;
-    Cinnamon) DE_USE_FLAGS="gtk cinnamon -qt5 -kde -gnome";;
+  "GNOME") DE_USE_FLAGS="gtk gnome -qt5 -kde";;
+  "KDE Plasma") DE_USE_FLAGS="qt5 plasma kde -gtk -gnome";;
+  "XFCE") DE_USE_FLAGS="gtk xfce -qt5 -kde -gnome";;
+  "LXQt") DE_USE_FLAGS="qt5 lxqt -gnome -kde";;
+  "MATE") DE_USE_FLAGS="gtk mate -qt5 -kde -gnome";;
 esac
 
-cat > /mnt/gentoo/etc/portage/make.conf << EOF
+cat > /mnt/gentoo/etc/portage/make.conf <<MAKECONF
 COMMON_FLAGS="-march=native -O2 -pipe"
 CFLAGS="\${COMMON_FLAGS}"
 CXXFLAGS="\${COMMON_FLAGS}"
@@ -174,102 +127,96 @@ ACCEPT_LICENSE="@FREE"
 VIDEO_CARDS="amdgpu intel nouveau"
 INPUT_DEVICES="libinput"
 GRUB_PLATFORMS="efi-64"
-EOF
+MAKECONF
 
-# --- Chroot environment ---
+# --- Chroot prep ---
 cp --dereference /etc/resolv.conf /mnt/gentoo/etc/
 mount --types proc /proc /mnt/gentoo/proc
-mount --rbind /sys /mnt/gentoo/sys
-mount --make-rslave /mnt/gentoo/sys
-mount --rbind /dev /mnt/gentoo/dev
-mount --make-rslave /mnt/gentoo/dev
-mount --bind /run /mnt/gentoo/run
-mount --make-slave /mnt/gentoo/run
+mount --rbind /sys /mnt/gentoo/sys; mount --make-rslave /mnt/gentoo/sys
+mount --rbind /dev /mnt/gentoo/dev; mount --make-rslave /mnt/gentoo/dev
+mount --bind /run /mnt/gentoo/run; mount --make-slave /mnt/gentoo/run
 
 # --- Chroot script ---
-cat > /mnt/gentoo/tmp/chroot.sh << 'CHROOTEOF'
-#!/bin/bash
+cat > /mnt/gentoo/tmp/chroot.sh <<'CHROOTEOF'
 set -e
 source /etc/profile
 
 healing_emerge() {
-    local emerge_args=("$@")
-    local max_retries=5
-    local attempt=1
-
-    while [ $attempt -le $max_retries ]; do
-        echo "--> Emerge attempt $attempt/$max_retries for: ${emerge_args[@]}"
-        emerge --verbose "${emerge_args[@]}" &> /tmp/emerge.log && return 0
-        cat /tmp/emerge.log
-        if grep -q "circular dependencies" /tmp/emerge.log; then
-            echo "--> Circular dependencies detected. Applying USE fixes..."
-            mkdir -p /etc/portage/package.use
-            echo "*/*" >> /etc/portage/package.use/99_autofix
-        fi
-        attempt=$((attempt + 1))
-    done
+  local args=("$@"); local max=5; local n=1
+  while [[ $n -le $max ]]; do
+    echo "Emerge attempt $n/$max: ${args[*]}"
+    emerge --verbose "${args[@]}" &> /tmp/emerge.log && { cat /tmp/emerge.log; return 0; }
+    cat /tmp/emerge.log
+    if grep -q "circular dependencies" /tmp/emerge.log; then
+      fix=$(grep "Change USE:" /tmp/emerge.log | head -n1)
+      if [[ -n "$fix" ]]; then
+        pkg=$(echo "$fix" | awk '{print $2}' | sed 's/-[0-9].*//')
+        use_change=$(echo "$fix" | awk -F 'Change USE: ' '{print $2}' | sed 's/)//')
+        mkdir -p /etc/portage/package.use
+        echo "$pkg $use_change" >> /etc/portage/package.use/99_autofix
+        n=$((n+1))
+        continue
+      fi
+    fi
     return 1
+  done
+  return 1
 }
 
-# Sync Portage
 emerge-webrsync
+PROFILE=$(eselect profile list | grep -E 'amd64.*openrc' | awk '{print $1}' | tail -n1)
+eselect profile set $PROFILE
 
-# Profile selection (merged-usr)
-eselect profile list | grep -v 'systemd' | tail -n1 | xargs -n1 eselect profile set
-
-# Stage 1: Base system
 healing_emerge --update --deep --newuse @system
 
-# Stage 2: Desktop environment
-case "${DE}" in
-    GNOME) healing_emerge gnome-shell/gnome;;
-    KDE) healing_emerge kde-plasma/plasma-meta;;
-    XFCE) healing_emerge xfce-base/xfce4-meta;;
-    LXQt) healing_emerge lxqt-base/lxqt-meta;;
-    MATE) healing_emerge mate-base/mate-meta;;
-    Cinnamon) healing_emerge cinnamon/cinnamon-meta;;
+case "${de_choice}" in
+  "GNOME") healing_emerge gnome-shell/gnome;;
+  "KDE Plasma") healing_emerge kde-plasma/plasma-meta;;
+  "XFCE") healing_emerge xfce-base/xfce4-meta;;
+  "LXQt") healing_emerge lxqt-meta;;
+  "MATE") healing_emerge mate-meta;;
 esac
 
-# Stage 3: World update
 healing_emerge --update --deep --newuse @world --keep-going=y
-
-# CPU flags
 emerge -q app-portage/cpuid2cpuflags
 echo "*/* $(cpuid2cpuflags)" > /etc/portage/package.use/00cpu-flags
 
-# Locale and hostname
 echo "en_US.UTF-8 UTF-8" >> /etc/locale.gen
 locale-gen
 eselect locale set en_US.UTF-8
 env-update && source /etc/profile
-echo "${HOSTNAME}" > /etc/hostname
 
-# Root and user password
-echo "root:${ROOT_PASSWORD}" | chpasswd
-useradd -m -G users,wheel,audio,video -s /bin/bash ${USERNAME}
-echo "${USERNAME}:${USER_PASSWORD}" | chpasswd
+echo "sys-kernel/installkernel grub dracut" > /etc/portage/package.use/installkernel
+emerge -q sys-kernel/gentoo-kernel-bin
 
-# Networking
+echo "${hostname}" > /etc/hostname
+echo "root:${root_password}" | chpasswd
+
+ln -sf /usr/share/zoneinfo/${timezone} /etc/localtime
+hwclock --systohc
+
+emerge -q app-admin/sysklogd net-misc/chrony sys-process/cronie app-shells/bash-completion sys-apps/mlocate
+rc-update add sysklogd default
+rc-update add chronyd default
+rc-update add cronie default
+
 emerge -q net-misc/networkmanager
 rc-update add NetworkManager default
-
-# SSH
 rc-update add sshd default
 
-# X11 and Display Manager
 emerge -q x11-base/xorg-server
-case "${DE}" in
-    GNOME) rc-update add gdm default;;
-    KDE) emerge -q sys-boot/sddm; rc-update add sddm default;;
-    XFCE) emerge -q app-admin/lightdm x11-wm/lightdm-gtk-greeter; rc-update add lightdm default;;
-    LXQt|MATE|Cinnamon) rc-update add lightdm default;;
+case "${de_choice}" in
+  "GNOME") rc-update add gdm default;;
+  "KDE Plasma") emerge -q sys-boot/sddm; rc-update add sddm default;;
+  "XFCE"|"LXQt"|"MATE") emerge -q lightdm lightdm-gtk-greeter; rc-update add lightdm default;;
 esac
 
-# GRUB installation
+useradd -m -G users,wheel,audio,video -s /bin/bash ${username}
+echo "${username}:${user_password}" | chpasswd
+
 emerge -q sys-boot/grub
 grub-install --target=x86_64-efi --efi-directory=/efi
 grub-mkconfig -o /boot/grub/grub.cfg
-
 exit
 CHROOTEOF
 
@@ -277,10 +224,9 @@ chmod +x /mnt/gentoo/tmp/chroot.sh
 chroot /mnt/gentoo /tmp/chroot.sh
 rm /mnt/gentoo/tmp/chroot.sh
 
-# --- Cleanup ---
 cd /
 umount -l /mnt/gentoo/dev{/shm,/pts,} || true
 umount -R /mnt/gentoo || true
 
 echo "--- Installation Complete ---"
-echo "System ready to reboot. Type 'reboot' to enter new Gentoo system."
+echo "Reboot to enter the new Gentoo system or Ctrl+C to stay in LiveCD"
