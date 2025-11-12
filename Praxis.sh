@@ -1,6 +1,6 @@
-#!/bin/bash
+#!/bin.bash
 
-# Exit immediately if a command exits with a non-zero status.
+# Немедленно выходить, если команда завершается с ошибкой.
 set -e
 
 echo "---= Autotoo: The Wise Gentoo Installer =---"
@@ -8,15 +8,15 @@ echo "This script will erase ALL DATA on the selected disk."
 echo "Please ensure you have selected the correct one."
 echo ""
 
-# --- Gather information from the user ---
+# --- Сбор информации от пользователя ---
 
-# Select disk
+# Выбор диска
 lsblk -dno NAME,SIZE,MODEL
 echo ""
 read -p "Enter the name of the disk for installation (e.g., sda or nvme0n1): " disk
 disk="/dev/${disk}"
 
-# Select Desktop Environment (DE)
+# Выбор графического окружения (DE)
 echo "Select a desktop environment to install:"
 options=("GNOME" "KDE Plasma" "XFCE" "Exit")
 select de_choice in "${options[@]}"; do
@@ -32,7 +32,7 @@ done
 read -p "Enter the hostname (computer name): " hostname
 read -p "Enter a username for the new user: " username
 
-# Get passwords (hidden input)
+# Ввод паролей (скрытый)
 while true; do
     read -sp "Enter the root password: " root_password
     echo
@@ -61,7 +61,7 @@ echo "------------------------------------"
 echo "Press Enter to begin the installation or Ctrl+C to cancel."
 read
 
-# --- Phase 1: System Preparation ---
+# --- Фаза 1: Подготовка системы ---
 
 echo "--> Partitioning disk $disk..."
 sfdisk "$disk" << DISKEOF
@@ -92,7 +92,7 @@ echo "--> Unpacking Stage3..."
 tar xpvf stage3-*.tar.xz --xattrs-include='*.*' --numeric-owner
 
 echo "--> Generating make.conf..."
-# Set variables for the chosen DE
+# Установка переменных для DE
 case $de_choice in
     "GNOME")
         DE_USE_FLAGS="gtk gnome -qt5 -kde"
@@ -104,7 +104,7 @@ case $de_choice in
         ;;
     "XFCE")
         DE_USE_FLAGS="gtk xfce -qt5 -kde -gnome"
-        DE_PROFILE="default/linux/amd64/17.1/desktop" # XFCE works well with the base desktop profile
+        DE_PROFILE="default/linux/amd64/17.1/desktop" # XFCE хорошо работает с базовым desktop профилем
         ;;
 esac
 
@@ -115,17 +115,17 @@ CXXFLAGS="\${COMMON_FLAGS}"
 RUSTFLAGS="-C target-cpu=native"
 MAKEOPTS="-j$(nproc)"
 
-# Settings for the selected DE
+# Настройки для выбранного DE
 USE="${DE_USE_FLAGS} dbus elogind pulseaudio"
 
-# Licenses
+# Лицензии
 ACCEPT_LICENSE="@FREE"
 
-# Settings for video and input devices
-VIDEO_CARDS="amdgpu intel nouveau" # Add nvidia if needed
+# Настройки для видео и устройств ввода
+VIDEO_CARDS="amdgpu intel nouveau" # Добавь nvidia, если нужно
 INPUT_DEVICES="libinput"
 
-# Enable GRUB support for EFI
+# Включаем поддержку GRUB для EFI
 GRUB_PLATFORMS="efi-64"
 MAKECONF
 
@@ -159,6 +159,8 @@ echo "*/* \$(cpuid2cpuflags)" > /etc/portage/package.use/00cpu-flags
 
 echo "--> Configuring locales..."
 echo "en_US.UTF-8 UTF-8" >> /etc/locale.gen
+# Если хочешь русскую локаль в системе, раскомментируй следующую строку
+# echo "ru_RU.UTF-8 UTF-8" >> /etc/locale.gen
 locale-gen
 eselect locale set en_US.UTF-8
 env-update && source /etc/profile
@@ -193,7 +195,7 @@ rc-update add sshd default
 echo "--> Installing the graphical subsystem..."
 emerge -q x11-base/xorg-server
 
-# Install the DE
+# Установка DE
 case "${de_choice}" in
     "GNOME")
         echo "--> Installing GNOME..."
