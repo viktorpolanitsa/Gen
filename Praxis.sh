@@ -1,6 +1,6 @@
-#!/bin.bash
+#!/bin/bash
 
-# Немедленно выходить, если команда завершается с ошибкой.
+# Exit immediately if a command exits with a non-zero status.
 set -e
 
 echo "---= Autotoo: The Wise Gentoo Installer =---"
@@ -8,15 +8,15 @@ echo "This script will erase ALL DATA on the selected disk."
 echo "Please ensure you have selected the correct one."
 echo ""
 
-# --- Сбор информации от пользователя ---
+# --- Gather information from the user ---
 
-# Выбор диска
+# Select disk
 lsblk -dno NAME,SIZE,MODEL
 echo ""
 read -p "Enter the name of the disk for installation (e.g., sda or nvme0n1): " disk
 disk="/dev/${disk}"
 
-# Выбор графического окружения (DE)
+# Select Desktop Environment (DE)
 echo "Select a desktop environment to install:"
 options=("GNOME" "KDE Plasma" "XFCE" "Exit")
 select de_choice in "${options[@]}"; do
@@ -32,7 +32,7 @@ done
 read -p "Enter the hostname (computer name): " hostname
 read -p "Enter a username for the new user: " username
 
-# Ввод паролей (скрытый)
+# Get passwords (hidden input)
 while true; do
     read -sp "Enter the root password: " root_password
     echo
@@ -61,13 +61,14 @@ echo "------------------------------------"
 echo "Press Enter to begin the installation or Ctrl+C to cancel."
 read
 
-# --- Фаза 1: Подготовка системы ---
+# --- Phase 1: System Preparation ---
 
 echo "--> Partitioning disk $disk..."
+# --- ИСПРАВЛЕННЫЙ БЛОК ---
+# Убрана лишняя строка ",1M,U", которая создавала ненужный BIOS boot раздел
+# и приводила к ошибке "Numerical result out of range".
 sfdisk "$disk" << DISKEOF
 label: gpt
-unit: sectors
-,1M,U
 ${disk}1 : size=512MiB, type=uefi
 ${disk}2 : type=linux
 DISKEOF
@@ -166,7 +167,7 @@ eselect locale set en_US.UTF-8
 env-update && source /etc/profile
 
 echo "--> Installing the binary kernel..."
-echo "sys-kernel/installkernel grub dracut" > /etc/portage/package.use/installkernel
+echo "sys-kernel/installkernel grub drut" > /etc/portage/package.use/installkernel
 emerge -q sys-kernel/gentoo-kernel-bin
 
 echo "--> Generating fstab..."
