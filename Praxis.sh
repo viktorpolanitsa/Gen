@@ -1,61 +1,42 @@
 #!/bin/bash
 
+# Exit immediately if a command exits with a non-zero status
 set -e
 
+# --- Initial Setup ---
 cd /
 
-echo "---= AutoGentoo: Advanced Gentoo Installer =---"
+echo "---= Autotoo: The Wise Gentoo Installer =---"
 echo "WARNING: This script will erase ALL DATA on the selected disk."
 echo "Ensure the correct disk is selected before proceeding."
 echo ""
 
-# --- Gather information from the user ---
-
-# Select disk
+# --- Disk Selection ---
 lsblk -dno NAME,SIZE,MODEL
 echo ""
-read -p "Enter the name of the disk for installation (e.g., sda or nvme0n1): " disk
+read -p "Enter the disk for installation (e.g., sda or nvme0n1): " disk
 disk="/dev/${disk}"
 
-# Select Init System
-echo "Select init system:"
-init_options=("OpenRC" "Systemd" "Exit")
-select init_choice in "${init_options[@]}"; do
-    case $init_choice in
-        "OpenRC") break;;
-        "Systemd") break;;
-        "Exit") exit;;
-        *) echo "Invalid choice. Try again.";;
-    esac
-done
-
-# Select Desktop Environment
-echo "Select a desktop environment:"
-de_options=("GNOME" "KDE Plasma" "XFCE" "LXQt" "MATE" "Cinnamon" "Exit")
-select de_choice in "${de_options[@]}"; do
+# --- Desktop Environment Selection ---
+echo "Select a desktop environment to install:"
+options=("GNOME" "KDE Plasma" "XFCE" "LXQt" "MATE" "Exit")
+select de_choice in "${options[@]}"; do
     case $de_choice in
-        "GNOME"|"KDE Plasma"|"XFCE"|"LXQt"|"MATE"|"Cinnamon") break;;
+        "GNOME") break;;
+        "KDE Plasma") break;;
+        "XFCE") break;;
+        "LXQt") break;;
+        "MATE") break;;
         "Exit") exit;;
-        *) echo "Invalid choice. Try again.";;
+        *) echo "Invalid choice. Please try again.";;
     esac
 done
 
-# Binary or Source Packages
-echo "Do you want to install all packages as binary or source?"
-pkg_type_options=("Binary" "Source")
-select pkg_choice in "${pkg_type_options[@]}"; do
-    case $pkg_choice in
-        "Binary") USE_BIN="1"; break;;
-        "Source") USE_BIN="0"; break;;
-        *) echo "Invalid choice. Try again.";;
-    esac
-done
+# --- Hostname and User ---
+read -p "Enter hostname: " hostname
+read -p "Enter username for the new user: " username
 
-# Hostname and user
-read -p "Enter the hostname: " hostname
-read -p "Enter username: " username
-
-# Root password
+# --- Passwords ---
 while true; do
     read -sp "Enter root password: " root_password
     echo
@@ -65,7 +46,6 @@ while true; do
     echo "Passwords do not match. Try again."
 done
 
-# User password
 while true; do
     read -sp "Enter password for user $username: " user_password
     echo
@@ -76,15 +56,14 @@ while true; do
 done
 
 echo ""
-echo "--- Installation Configuration ---"
+echo "---= Installation Configuration =---"
 echo "Disk: $disk"
-echo "Init System: $init_choice"
 echo "Desktop Environment: $de_choice"
-echo "Package Type: $pkg_choice"
 echo "Hostname: $hostname"
 echo "User: $username"
-echo "---------------------------------"
-read -p "Press Enter to start installation or Ctrl+C to cancel..."
+echo "------------------------------------"
+echo "Press Enter to begin installation or Ctrl+C to cancel."
+read
 
 # --- Phase 1: System Preparation ---
 swapoff -a || true
@@ -93,12 +72,12 @@ umount -R ${disk}* || true
 blockdev --flushbufs "$disk" || true
 sleep 3
 
-# Partition
-sfdisk --force --wipe always --wipe-partitions always "$disk" << DISKEOF
+echo "--> Partitioning disk $disk..."
+sfdisk --force --wipe always --wipe-partitions always "$disk" << DISKCFG
 label: gpt
 ${disk}1 : size=512MiB, type=uefi
 ${disk}2 : type=linux
-DISKEOF
+DISKCFG
 
 partprobe "$disk"
 sleep 1
@@ -106,6 +85,7 @@ sleep 1
 wipefs -a "${disk}1"
 wipefs -a "${disk}2"
 
+echo "--> Formatting partitions..."
 mkfs.vfat -F 32 "${disk}1"
 mkfs.xfs -f "${disk}2"
 
@@ -116,20 +96,21 @@ mount "${disk}1" /mnt/gentoo/efi
 
 cd /mnt/gentoo
 
-# Download stage3
-STAGE3_PATH=$(wget -q -O - https://distfiles.gentoo.org/releases/amd64/autobuilds/latest-stage3-amd64-openrc.txt | grep -v "^#" | grep 'stage3' | head -n 1 | cut -d' ' -f1)
+echo "--> Downloading latest Stage3 tarball..."
+STAGE3_PATH=$(wget -q -O - https://distfiles.gentoo.org/releases/amd64/autobuilds/latest-stage3-amd64-openrc.txt \
+    | grep -v "^#" | grep 'stage3' | head -n1 | cut -d' ' -f1)
 wget "https://distfiles.gentoo.org/releases/amd64/autobuilds/${STAGE3_PATH}"
 
+echo "--> Extracting Stage3..."
 tar xpvf stage3-*.tar.xz --xattrs-include='*.*' --numeric-owner
 
-# make.conf
+# --- make.conf Setup ---
 case $de_choice in
     "GNOME") DE_USE_FLAGS="gtk gnome -qt5 -kde";;
     "KDE Plasma") DE_USE_FLAGS="qt5 plasma kde -gtk -gnome";;
     "XFCE") DE_USE_FLAGS="gtk xfce -qt5 -kde -gnome";;
-    "LXQt") DE_USE_FLAGS="lxqt qt5 -gtk -gnome";;
-    "MATE") DE_USE_FLAGS="mate gtk -qt5 -kde -gnome";;
-    "Cinnamon") DE_USE_FLAGS="cinnamon gtk -qt5 -kde -gnome";;
+    "LXQt") DE_USE_FLAGS="lxqt qt5 -gnome -kde";;
+    "MATE") DE_USE_FLAGS="gtk mate -qt5 -kde -gnome";;
 esac
 
 cat > /mnt/gentoo/etc/portage/make.conf << MAKECONF
@@ -145,7 +126,7 @@ INPUT_DEVICES="libinput"
 GRUB_PLATFORMS="efi-64"
 MAKECONF
 
-# chroot preparation
+# --- Prepare chroot environment ---
 cp --dereference /etc/resolv.conf /mnt/gentoo/etc/
 mount --types proc /proc /mnt/gentoo/proc
 mount --rbind /sys /mnt/gentoo/sys
@@ -155,137 +136,127 @@ mount --make-rslave /mnt/gentoo/dev
 mount --bind /run /mnt/gentoo/run
 mount --make-slave /mnt/gentoo/run
 
-# chroot script
+# --- Generate chroot script ---
 cat > /mnt/gentoo/tmp/chroot.sh << CHROOTEOF
+#!/bin/bash
 set -e
 source /etc/profile
 
+# --- Emergence helper ---
 healing_emerge() {
-    local emerge_args=("\$@")
+    local args=(\$@)
     local max_retries=5
     local attempt=1
     while [ \$attempt -le \$max_retries ]; do
-        echo "--> Healing Emerge: Attempt \$attempt/\$max_retries"
-        emerge --verbose "\${emerge_args[@]}" &> /tmp/emerge.log && {
-            cat /tmp/emerge.log
-            return 0
-        }
-        cat /tmp/emerge.log
+        emerge --verbose "\${args[@]}" &> /tmp/emerge.log && return 0
         if grep -q "circular dependencies" /tmp/emerge.log; then
-            local fix=\$(grep "Change USE:" /tmp/emerge.log | head -n 1)
+            # Attempt automatic fix
+            local fix=\$(grep "Change USE:" /tmp/emerge.log | head -n1)
             if [ -n "\$fix" ]; then
-                local full_package=\$(echo "\$fix" | awk '{print \$2}')
-                local clean_package=\$(echo "\$full_package" | sed 's/-[0-9].*//')
+                local pkg=\$(echo "\$fix" | awk '{print \$2}' | sed 's/-[0-9].*//')
                 local use_change=\$(echo "\$fix" | awk -F 'Change USE: ' '{print \$2}' | sed 's/)//')
                 mkdir -p /etc/portage/package.use
-                echo "\$clean_package \$use_change" >> /etc/portage/package.use/99_autofix
+                echo "\$pkg \$use_change" >> /etc/portage/package.use/99_autofix
                 attempt=\$((attempt + 1))
                 continue
             fi
         fi
-        return 1
+        attempt=\$((attempt + 1))
     done
     return 1
 }
 
 emerge-webrsync
 
-# Init system
-case "$init_choice" in
-    "OpenRC") USE_INIT="";;
-    "Systemd") USE_INIT="systemd";;
-esac
+# --- Profile selection dynamically ---
+DE_PROFILE=\$(eselect profile list | awk -v de="$de_choice" '/desktop/ && \$0 ~ de && \$0 !~ /systemd/ {gsub(/^[0-9]+:/,""); print \$1}' | tail -n1)
+eselect profile set "\$DE_PROFILE"
 
-# Profile selection
-eselect profile set default/linux/amd64/17.${USE_INIT}
-
+# --- Stage 1: System foundation ---
 healing_emerge --update --deep --newuse @system
 
-# Desktop
+# --- Stage 2: Desktop Environment ---
 case "$de_choice" in
     "GNOME") healing_emerge gnome-shell/gnome;;
     "KDE Plasma") healing_emerge kde-plasma/plasma-meta;;
     "XFCE") healing_emerge xfce-base/xfce4-meta;;
     "LXQt") healing_emerge lxqt-base/lxqt-meta;;
     "MATE") healing_emerge mate-base/mate-meta;;
-    "Cinnamon") healing_emerge cinnamon-meta/cinnamon;;
 esac
 
 rm -f /etc/portage/package.use/99_autofix
 
+# --- Stage 3: Final update ---
 healing_emerge --update --deep --newuse @world --keep-going=y
 
-# CPU flags
+# --- CPU Flags ---
 emerge -q app-portage/cpuid2cpuflags
 echo "*/* \$(cpuid2cpuflags)" > /etc/portage/package.use/00cpu-flags
 
-# Locale
-echo "en_US.UTF-8 UTF-8" >> /etc/locale.gen
+# --- Locale ---
+grep -q "^en_US.UTF-8 UTF-8" /etc/locale.gen || echo "en_US.UTF-8 UTF-8" >> /etc/locale.gen
 locale-gen
 eselect locale set en_US.UTF-8
 env-update && source /etc/profile
 
-# Kernel
-if [ "$USE_BIN" -eq 1 ]; then
-    echo "sys-kernel/installkernel grub dracut" > /etc/portage/package.use/installkernel
-    emerge -q sys-kernel/gentoo-kernel-bin
-else
-    emerge -q sys-kernel/gentoo-sources
-    emerge -q sys-kernel/genkernel
-    genkernel all
-fi
+# --- Kernel ---
+emerge -q sys-kernel/gentoo-kernel-bin || emerge sys-kernel/gentoo-sources
 
-# Fstab
+# --- Fstab ---
 emerge -q sys-fs/genfstab
 genfstab -U / > /etc/fstab
 
-# Hostname
-echo "${hostname}" > /etc/hostname
+# --- Hostname ---
+echo "$hostname" > /etc/hostname
 
-# Passwords
-echo "root:${root_password}" | chpasswd
-useradd -m -G users,wheel,audio,video -s /bin/bash ${username}
-echo "${username}:${user_password}" | chpasswd
+# --- Root password ---
+echo "root:$root_password" | chpasswd
 
-# Base utilities
+# --- Base utilities ---
 emerge -q app-admin/sysklogd net-misc/chrony sys-process/cronie app-shells/bash-completion sys-apps/mlocate
 rc-update add sysklogd default
 rc-update add chronyd default
 rc-update add cronie default
 
-# Networking and SSH
+# --- Networking ---
 emerge -q net-misc/networkmanager
 rc-update add NetworkManager default
+
+# --- SSH ---
 rc-update add sshd default
 
-# X and DM
+# --- X11 and Display Manager ---
 emerge -q x11-base/xorg-server
-case "${de_choice}" in
+case "$de_choice" in
     "GNOME") rc-update add gdm default;;
     "KDE Plasma") emerge -q sys-boot/sddm; rc-update add sddm default;;
-    "XFCE") emerge -q app-admin/lightdm x11-wm/lightdm-gtk-greeter; rc-update add lightdm default;;
-    "LXQt") emerge -q lightdm x11-wm/lightdm-qt-greeter; rc-update add lightdm default;;
-    "MATE") emerge -q lightdm x11-wm/lightdm-gtk-greeter; rc-update add lightdm default;;
-    "Cinnamon") emerge -q lightdm x11-wm/lightdm-gtk-greeter; rc-update add lightdm default;;
+    "XFCE"|"LXQt"|"MATE") emerge -q app-admin/lightdm x11-wm/lightdm-gtk-greeter; rc-update add lightdm default;;
 esac
 
-# GRUB
+# --- Create user ---
+useradd -m -G users,wheel,audio,video -s /bin/bash "$username"
+echo "$username:$user_password" | chpasswd
+
+# --- GRUB ---
 emerge -q sys-boot/grub
 grub-install --target=x86_64-efi --efi-directory=/efi
 grub-mkconfig -o /boot/grub/grub.cfg
 
+echo "--> Chroot installation complete."
 exit
 CHROOTEOF
 
 chmod +x /mnt/gentoo/tmp/chroot.sh
+
+# --- Phase 2: Enter chroot ---
 chroot /mnt/gentoo /tmp/chroot.sh
 rm /mnt/gentoo/tmp/chroot.sh
 
-# Unmount
+echo "--- Installation Complete! ---"
+echo "--> Unmounting filesystems..."
 cd /
-umount -l /mnt/gentoo/dev{/shm,/pts,}
-umount -R /mnt/gentoo
+umount -l /mnt/gentoo/dev{/shm,/pts,} || true
+umount -lR /mnt/gentoo || true
 
-echo "--- Installation Complete ---"
-echo "Type 'reboot' to start your new Gentoo system."
-echo "Press Ctrl+C to remain in LiveCD environment."
+echo "The system is ready to reboot. Type 'reboot' to enter your new Gentoo system."
+echo "Press Ctrl+C to remain in the LiveCD environment."
