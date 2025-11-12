@@ -64,7 +64,7 @@ read
 # --- Phase 1: System Preparation ---
 
 echo "--> Partitioning disk $disk..."
-sfdisk "$disk" << DISKEOF
+sfdisk --wipe always --wipe-partitions always "$disk" << DISKEOF
 label: gpt
 ${disk}1 : size=512MiB, type=uefi
 ${disk}2 : type=linux
@@ -73,18 +73,12 @@ DISKEOF
 echo "--> Forcing kernel to re-read partition table..."
 partprobe "$disk"
 
-# --- ИСПРАВЛЕНИЕ ---
-# Исполняем очищающее заклинание. `wipefs` стирает все старые сигнатуры
-# файловых систем (btrfs, ext4 и т.д.) с новых разделов.
-# Это гарантирует, что `mkfs` не будет жаловаться на существующие данные.
 echo "--> Wiping old filesystem signatures..."
 wipefs -a "${disk}1"
 wipefs -a "${disk}2"
 
 echo "--> Formatting partitions..."
 mkfs.vfat -F 32 "${disk}1"
-# Добавляем ключ -f (force) для mkfs.xfs как дополнительную меру,
-# хотя wipefs уже должен был решить проблему.
 mkfs.xfs -f "${disk}2"
 
 echo "--> Mounting filesystems..."
@@ -96,7 +90,10 @@ mount "${disk}1" /mnt/gentoo/efi
 cd /mnt/gentoo
 
 echo "--> Downloading the latest Stage3 tarball..."
-STAGE3_PATH=$(wget -q -O - https://distfiles.gentoo.org/releases/amd64/autobuilds/latest-stage3-amd64-openrc.txt | grep -v "^#" | cut -d' ' -f1)
+# --- ИСПРАВЛЕНИЕ ---
+# Добавлена `head -n 1` для защиты от парсинга лишних строк (например, PGP-подписей),
+# что предотвращает ошибку 404 Not Found.
+STAGE3_PATH=$(wget -q -O - https://distfiles.gentoo.org/releases/amd64/autobuilds/latest-stage3-amd64-openrc.txt | head -n 1 | cut -d' ' -f1)
 wget "https://distfiles.gentoo.org/releases/amd64/autobuilds/${STAGE3_PATH}"
 
 echo "--> Unpacking Stage3..."
@@ -115,7 +112,7 @@ case $de_choice in
         ;;
     "XFCE")
         DE_USE_FLAGS="gtk xfce -qt5 -kde -gnome"
-        DE_PROFILE="default/linux/amd64/17.1/desktop" # XFCE хорошо работает с базовым desktop профилем
+        DE_PROFILE="default/linux/amd64/17.1/desktop"
         ;;
 esac
 
@@ -170,8 +167,6 @@ echo "*/* \$(cpuid2cpuflags)" > /etc/portage/package.use/00cpu-flags
 
 echo "--> Configuring locales..."
 echo "en_US.UTF-8 UTF-8" >> /etc/locale.gen
-# Если хочешь русскую локаль в системе, раскомментируй следующую строку
-# echo "ru_RU.UTF-8 UTF-8" >> /etc/locale.gen
 locale-gen
 eselect locale set en_US.UTF-8
 env-update && source /etc/profile
@@ -206,22 +201,25 @@ rc-update add sshd default
 echo "--> Installing the graphical subsystem..."
 emerge -q x11-base/xorg-server
 
-# Установка DE
+# Установка DE и Display Manager
 case "${de_choice}" in
     "GNOME")
-        echo "--> Installing GNOME..."
+        echo "--> Installing GNOME and GDM..."
         emerge -q gnome-shell/gnome
         rc-update add gdm default
         ;;
     "KDE Plasma")
-        echo "--> Installing KDE Plasma..."
+        echo "--> Installing KDE Plasma and SDDM..."
         emerge -q kde-plasma/plasma-meta
         rc-update add sddm default
         ;;
     "XFCE")
-        echo "--> Installing XFCE..."
-        emerge -q xfce-base/xfce4-meta x11-terms/xfce4-terminal sys-boot/sddm
-        rc-update add sddm default
+        echo "--> Installing XFCE and LightDM..."
+        # --- УЛУЧШЕНИЕ ---
+        # Устанавливаем LightDM и GTK-тему для него, как более подходящий
+        # выбор для XFCE.
+        emerge -q xfce-base/xfce4-meta x11-terms/xfce4-terminal app-admin/lightdm x11-wm/lightdm-gtk-greeter
+        rc-update add lightdm default
         ;;
 esac
 
