@@ -4,7 +4,6 @@
 set -e
 
 # --- Изгнание ---
-# Первым делом, мы покидаем любую текущую директорию.
 cd /
 
 echo "---= Autotoo: The Wise Gentoo Installer =---"
@@ -147,25 +146,31 @@ source /etc/profile
 echo "--> Syncing Portage..."
 emerge-webrsync
 
-# --- ФИНАЛЬНЫЙ УДАР: РАЗ И НАВСЕГДА ---
-# Мы меняем awk '{print $1}' на awk '{print $2}', чтобы получить ИМЯ профиля, а не его НОМЕР.
 echo "--> Dynamically selecting the best profile for ${de_choice}..."
 case "${de_choice}" in
-    "GNOME")
-        DE_PROFILE=\$(eselect profile list | grep 'desktop/gnome' | grep -v 'systemd' | awk '{print \$2}' | tail -n 1)
-        ;;
-    "KDE Plasma")
-        DE_PROFILE=\$(eselect profile list | grep 'desktop/plasma' | grep -v 'systemd' | awk '{print \$2}' | tail -n 1)
-        ;;
-    "XFCE")
-        DE_PROFILE=\$(eselect profile list | grep 'desktop' | grep -v 'gnome' | grep -v 'plasma' | grep -v 'systemd' | awk '{print \$2}' | tail -n 1)
-        ;;
+    "GNOME") DE_PROFILE=\$(eselect profile list | grep 'desktop/gnome' | grep -v 'systemd' | awk '{print \$2}' | tail -n 1);;
+    "KDE Plasma") DE_PROFILE=\$(eselect profile list | grep 'desktop/plasma' | grep -v 'systemd' | awk '{print \$2}' | tail -n 1);;
+    "XFCE") DE_PROFILE=\$(eselect profile list | grep 'desktop' | grep -v 'gnome' | grep -v 'plasma' | grep -v 'systemd' | awk '{print \$2}' | tail -n 1);;
 esac
 
 echo "--> Profile found: \${DE_PROFILE}"
 eselect profile set "\${DE_PROFILE}"
 
-echo "--> Updating the world set with new USE flags..."
+# --- ФИНАЛЬНЫЙ УДАР: СТУПЕНЧАТАЯ СБОРКА ---
+# Мы больше не обновляем @world сразу. Мы делаем это в три этапа,
+# чтобы избежать циклических зависимостей и других сложных проблем.
+
+echo "--> Stage 1/3: Building the system foundation..."
+emerge --verbose --update --deep --newuse @system
+
+echo "--> Stage 2/3: Building the desktop environment..."
+case "${de_choice}" in
+    "GNOME") emerge -q gnome-shell/gnome;;
+    "KDE Plasma") emerge -q kde-plasma/plasma-meta;;
+    "XFCE") emerge -q xfce-base/xfce4-meta;;
+esac
+
+echo "--> Stage 3/3: Final world update and cleanup..."
 emerge --verbose --update --deep --newuse @world
 
 echo "--> Configuring CPU flags..."
@@ -205,13 +210,12 @@ rc-update add NetworkManager default
 echo "--> Installing and configuring SSH..."
 rc-update add sshd default
 
-echo "--> Installing the graphical subsystem..."
+echo "--> Installing the graphical subsystem and Display Manager..."
 emerge -q x11-base/xorg-server
-
 case "${de_choice}" in
-    "GNOME") echo "--> Installing GNOME and GDM..."; emerge -q gnome-shell/gnome; rc-update add gdm default;;
-    "KDE Plasma") echo "--> Installing KDE Plasma and SDDM..."; emerge -q kde-plasma/plasma-meta; rc-update add sddm default;;
-    "XFCE") echo "--> Installing XFCE and LightDM..."; emerge -q xfce-base/xfce4-meta x11-terms/xfce4-terminal app-admin/lightdm x11-wm/lightdm-gtk-greeter; rc-update add lightdm default;;
+    "GNOME") rc-update add gdm default;;
+    "KDE Plasma") emerge -q sys-boot/sddm; rc-update add sddm default;;
+    "XFCE") emerge -q app-admin/lightdm x11-wm/lightdm-gtk-greeter; rc-update add lightdm default;;
 esac
 
 echo "--> Creating user ${username}..."
