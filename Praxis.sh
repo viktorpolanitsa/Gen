@@ -3,9 +3,8 @@
 # Exit immediately if a command exits with a non-zero status.
 set -e
 
-# --- ФИНАЛЬНОЕ ИСПРАВЛЕНИЕ: ИЗГНАНИЕ ---
-# Первым делом, мы покидаем любую текущую директорию, которая может быть
-# на целевом диске. Это разрывает проклятие "target is busy".
+# --- Изгнание ---
+# Первым делом, мы покидаем любую текущую директорию.
 cd /
 
 echo "---= Autotoo: The Wise Gentoo Installer =---"
@@ -101,9 +100,6 @@ mount "${disk}2" /mnt/gentoo
 mkdir -p /mnt/gentoo/efi
 mount "${disk}1" /mnt/gentoo/efi
 
-# --- ФИНАЛЬНОЕ ИСПРАВЛЕНИЕ: ПРАВИЛЬНЫЙ ПОРЯДОК ---
-# Перемещаем 'cd /mnt/gentoo' сюда. Мы входим в директорию только ПОСЛЕ
-# того, как все операции с диском завершены и он безопасно смонтирован.
 cd /mnt/gentoo
 
 echo "--> Downloading the latest Stage3 tarball..."
@@ -151,11 +147,19 @@ source /etc/profile
 echo "--> Syncing Portage..."
 emerge-webrsync
 
+# --- ФИНАЛЬНЫЙ УДАР: РАЗ И НАВСЕГДА ---
+# Мы меняем awk '{print $1}' на awk '{print $2}', чтобы получить ИМЯ профиля, а не его НОМЕР.
 echo "--> Dynamically selecting the best profile for ${de_choice}..."
 case "${de_choice}" in
-    "GNOME") DE_PROFILE=\$(eselect profile list | grep 'desktop/gnome' | grep -v 'systemd' | awk '{print \$1}' | tail -n 1);;
-    "KDE Plasma") DE_PROFILE=\$(eselect profile list | grep 'desktop/plasma' | grep -v 'systemd' | awk '{print \$1}' | tail -n 1);;
-    "XFCE") DE_PROFILE=\$(eselect profile list | grep 'desktop' | grep -v 'gnome' | grep -v 'plasma' | grep -v 'systemd' | awk '{print \$1}' | tail -n 1);;
+    "GNOME")
+        DE_PROFILE=\$(eselect profile list | grep 'desktop/gnome' | grep -v 'systemd' | awk '{print \$2}' | tail -n 1)
+        ;;
+    "KDE Plasma")
+        DE_PROFILE=\$(eselect profile list | grep 'desktop/plasma' | grep -v 'systemd' | awk '{print \$2}' | tail -n 1)
+        ;;
+    "XFCE")
+        DE_PROFILE=\$(eselect profile list | grep 'desktop' | grep -v 'gnome' | grep -v 'plasma' | grep -v 'systemd' | awk '{print \$2}' | tail -n 1)
+        ;;
 esac
 
 echo "--> Profile found: \${DE_PROFILE}"
@@ -231,7 +235,6 @@ rm /mnt/gentoo/tmp/chroot.sh
 
 echo "--- Installation Complete! ---"
 echo "--> Unmounting filesystems..."
-# Финальное отмонтирование перед перезагрузкой.
 cd /
 umount -l /mnt/gentoo/dev{/shm,/pts,}
 umount -R /mnt/gentoo
