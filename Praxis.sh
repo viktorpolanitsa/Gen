@@ -3,6 +3,11 @@
 # Exit immediately if a command exits with a non-zero status.
 set -e
 
+# --- ФИНАЛЬНОЕ ИСПРАВЛЕНИЕ: ИЗГНАНИЕ ---
+# Первым делом, мы покидаем любую текущую директорию, которая может быть
+# на целевом диске. Это разрывает проклятие "target is busy".
+cd /
+
 echo "---= Autotoo: The Wise Gentoo Installer =---"
 echo "This script will erase ALL DATA on the selected disk."
 echo "Please ensure you have selected the correct one."
@@ -63,18 +68,13 @@ read
 
 # --- Phase 1: System Preparation ---
 
-# --- ФИНАЛЬНЫЙ ЭКЗОРЦИЗМ: РАЗ И НАВСЕГДА ---
 echo "--> Performing exorcism on ${disk} to release all holds..."
-# 1. Отключаем все, что можно.
 swapoff -a || true
-# 2. Используем все известные методы отмонтирования.
 umount -R /mnt/gentoo || true
 umount -R ${disk}* || true
-# 3. Сбрасываем буферы ядра, заставляя его "забыть" о диске.
 blockdev --flushbufs "$disk" || true
-# 4. ДАЕМ ЯДРУ ВРЕМЯ. Это самый важный шаг.
 echo "--> Giving the kernel a moment to release the device..."
-sleep 2
+sleep 3
 
 echo "--> Partitioning disk $disk..."
 sfdisk --force --wipe always --wipe-partitions always "$disk" << DISKEOF
@@ -84,7 +84,6 @@ ${disk}2 : type=linux
 DISKEOF
 
 echo "--> Forcing kernel to re-read partition table..."
-# 5. Финальный удар, чтобы ядро точно обновило информацию.
 partprobe "$disk"
 sleep 1
 
@@ -102,6 +101,9 @@ mount "${disk}2" /mnt/gentoo
 mkdir -p /mnt/gentoo/efi
 mount "${disk}1" /mnt/gentoo/efi
 
+# --- ФИНАЛЬНОЕ ИСПРАВЛЕНИЕ: ПРАВИЛЬНЫЙ ПОРЯДОК ---
+# Перемещаем 'cd /mnt/gentoo' сюда. Мы входим в директорию только ПОСЛЕ
+# того, как все операции с диском завершены и он безопасно смонтирован.
 cd /mnt/gentoo
 
 echo "--> Downloading the latest Stage3 tarball..."
@@ -113,15 +115,9 @@ tar xpvf stage3-*.tar.xz --xattrs-include='*.*' --numeric-owner
 
 echo "--> Generating make.conf..."
 case $de_choice in
-    "GNOME")
-        DE_USE_FLAGS="gtk gnome -qt5 -kde"
-        ;;
-    "KDE Plasma")
-        DE_USE_FLAGS="qt5 plasma kde -gtk -gnome"
-        ;;
-    "XFCE")
-        DE_USE_FLAGS="gtk xfce -qt5 -kde -gnome"
-        ;;
+    "GNOME") DE_USE_FLAGS="gtk gnome -qt5 -kde";;
+    "KDE Plasma") DE_USE_FLAGS="qt5 plasma kde -gtk -gnome";;
+    "XFCE") DE_USE_FLAGS="gtk xfce -qt5 -kde -gnome";;
 esac
 
 cat > /mnt/gentoo/etc/portage/make.conf << MAKECONF
@@ -157,15 +153,9 @@ emerge-webrsync
 
 echo "--> Dynamically selecting the best profile for ${de_choice}..."
 case "${de_choice}" in
-    "GNOME")
-        DE_PROFILE=\$(eselect profile list | grep 'desktop/gnome' | grep -v 'systemd' | awk '{print \$1}' | tail -n 1)
-        ;;
-    "KDE Plasma")
-        DE_PROFILE=\$(eselect profile list | grep 'desktop/plasma' | grep -v 'systemd' | awk '{print \$1}' | tail -n 1)
-        ;;
-    "XFCE")
-        DE_PROFILE=\$(eselect profile list | grep 'desktop' | grep -v 'gnome' | grep -v 'plasma' | grep -v 'systemd' | awk '{print \$1}' | tail -n 1)
-        ;;
+    "GNOME") DE_PROFILE=\$(eselect profile list | grep 'desktop/gnome' | grep -v 'systemd' | awk '{print \$1}' | tail -n 1);;
+    "KDE Plasma") DE_PROFILE=\$(eselect profile list | grep 'desktop/plasma' | grep -v 'systemd' | awk '{print \$1}' | tail -n 1);;
+    "XFCE") DE_PROFILE=\$(eselect profile list | grep 'desktop' | grep -v 'gnome' | grep -v 'plasma' | grep -v 'systemd' | awk '{print \$1}' | tail -n 1);;
 esac
 
 echo "--> Profile found: \${DE_PROFILE}"
@@ -215,21 +205,9 @@ echo "--> Installing the graphical subsystem..."
 emerge -q x11-base/xorg-server
 
 case "${de_choice}" in
-    "GNOME")
-        echo "--> Installing GNOME and GDM..."
-        emerge -q gnome-shell/gnome
-        rc-update add gdm default
-        ;;
-    "KDE Plasma")
-        echo "--> Installing KDE Plasma and SDDM..."
-        emerge -q kde-plasma/plasma-meta
-        rc-update add sddm default
-        ;;
-    "XFCE")
-        echo "--> Installing XFCE and LightDM..."
-        emerge -q xfce-base/xfce4-meta x11-terms/xfce4-terminal app-admin/lightdm x11-wm/lightdm-gtk-greeter
-        rc-update add lightdm default
-        ;;
+    "GNOME") echo "--> Installing GNOME and GDM..."; emerge -q gnome-shell/gnome; rc-update add gdm default;;
+    "KDE Plasma") echo "--> Installing KDE Plasma and SDDM..."; emerge -q kde-plasma/plasma-meta; rc-update add sddm default;;
+    "XFCE") echo "--> Installing XFCE and LightDM..."; emerge -q xfce-base/xfce4-meta x11-terms/xfce4-terminal app-admin/lightdm x11-wm/lightdm-gtk-greeter; rc-update add lightdm default;;
 esac
 
 echo "--> Creating user ${username}..."
@@ -253,6 +231,8 @@ rm /mnt/gentoo/tmp/chroot.sh
 
 echo "--- Installation Complete! ---"
 echo "--> Unmounting filesystems..."
+# Финальное отмонтирование перед перезагрузкой.
+cd /
 umount -l /mnt/gentoo/dev{/shm,/pts,}
 umount -R /mnt/gentoo
 
