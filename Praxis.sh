@@ -58,7 +58,7 @@ echo "Environment: $de_choice"
 echo "Hostname: $hostname"
 echo "User: $username"
 echo "------------------------------------"
-echo "Press Enter to begin the installation or Ctrl C to cancel."
+echo "Press Enter to begin the installation or Ctrl+C to cancel."
 read
 
 # --- Phase 1: System Preparation ---
@@ -70,16 +70,22 @@ ${disk}1 : size=512MiB, type=uefi
 ${disk}2 : type=linux
 DISKEOF
 
-# --- ИСПРАВЛЕНИЕ ---
-# Принудительно заставляем ядро перечитать таблицу разделов и создать
-# файлы устройств (/dev/sda1, /dev/sda2) ПЕРЕД тем, как мы попытаемся их использовать.
-# Это решает ошибку "No such file or directory".
 echo "--> Forcing kernel to re-read partition table..."
 partprobe "$disk"
 
+# --- ИСПРАВЛЕНИЕ ---
+# Исполняем очищающее заклинание. `wipefs` стирает все старые сигнатуры
+# файловых систем (btrfs, ext4 и т.д.) с новых разделов.
+# Это гарантирует, что `mkfs` не будет жаловаться на существующие данные.
+echo "--> Wiping old filesystem signatures..."
+wipefs -a "${disk}1"
+wipefs -a "${disk}2"
+
 echo "--> Formatting partitions..."
 mkfs.vfat -F 32 "${disk}1"
-mkfs.xfs "${disk}2"
+# Добавляем ключ -f (force) для mkfs.xfs как дополнительную меру,
+# хотя wipefs уже должен был решить проблему.
+mkfs.xfs -f "${disk}2"
 
 echo "--> Mounting filesystems..."
 mkdir -p /mnt/gentoo
