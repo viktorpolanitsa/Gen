@@ -3,94 +3,94 @@ set -euo pipefail
 IFS=$'\n\t'
 
 # --- Root check ---
-[[ $EUID -eq 0 ]] || { echo "Скрипт должен запускаться от root!"; exit 1; }
+[[ $EUID -eq 0 ]] || { echo "This script must be run as root!"; exit 1; }
 
 cd /
 
 echo "---= Autotoo: Advanced Gentoo Installer =---"
-echo "Внимание! Скрипт сотрёт все данные на выбранном диске."
+echo "Warning! This script will erase all data on the selected disk."
 
 # --- Disk selection ---
 lsblk -dno NAME,SIZE,MODEL
-read -rp "Введите имя диска для установки (например, sda или nvme0n1): " disk_input
+read -rp "Enter the disk name for installation (e.g., sda or nvme0n1): " disk_input
 disk="/dev/${disk_input}"
 
 # --- Init system selection ---
 INIT_OPTIONS=("OpenRC" "Systemd" "Exit")
-echo "Выберите init систему:"
+echo "Select init system:"
 select init_choice in "${INIT_OPTIONS[@]}"; do
     case $init_choice in
         "OpenRC"|"Systemd") break;;
         "Exit") exit;;
-        *) echo "Неверный выбор. Попробуйте снова.";;
+        *) echo "Invalid choice. Try again.";;
     esac
 done
 
 # --- Desktop Environments ---
 DE_OPTIONS=("GNOME" "KDE Plasma" "XFCE" "LXQt" "MATE" "Cinnamon" "Minimal" "Exit")
-echo "Выберите Desktop Environment:"
+echo "Select a Desktop Environment:"
 select de_choice in "${DE_OPTIONS[@]}"; do
-    [[ " ${DE_OPTIONS[*]} " == *" $de_choice "* ]] || { echo "Неверный выбор."; continue; }
+    [[ " ${DE_OPTIONS[*]} " == *" $de_choice "* ]] || { echo "Invalid choice."; continue; }
     [[ $de_choice == "Exit" ]] && exit
     break
 done
 
 # --- Display Manager ---
 DM_OPTIONS=("GDM" "SDDM" "LightDM" "LXDM" "None")
-echo "Выберите Display Manager:"
+echo "Select a Display Manager:"
 select dm_choice in "${DM_OPTIONS[@]}"; do
-    [[ " ${DM_OPTIONS[*]} " == *" $dm_choice "* ]] || { echo "Неверный выбор."; continue; }
+    [[ " ${DM_OPTIONS[*]} " == *" $dm_choice "* ]] || { echo "Invalid choice."; continue; }
     break
 done
 
 # --- Kernel selection ---
 KERNEL_OPTIONS=("Gentoo Binary Kernel" "Custom Source Kernel")
-echo "Выберите ядро Linux:"
+echo "Select Linux kernel type:"
 select kernel_choice in "${KERNEL_OPTIONS[@]}"; do
-    [[ " ${KERNEL_OPTIONS[*]} " == *" $kernel_choice "* ]] || { echo "Неверный выбор."; continue; }
+    [[ " ${KERNEL_OPTIONS[*]} " == *" $kernel_choice "* ]] || { echo "Invalid choice."; continue; }
     break
 done
 
 # --- Audio ---
 AUDIO_OPTIONS=("Pulseaudio" "PipeWire" "None")
-echo "Выберите аудио систему:"
+echo "Select audio system:"
 select audio_choice in "${AUDIO_OPTIONS[@]}"; do
-    [[ " ${AUDIO_OPTIONS[*]} " == *" $audio_choice "* ]] || { echo "Неверный выбор."; continue; }
+    [[ " ${AUDIO_OPTIONS[*]} " == *" $audio_choice "* ]] || { echo "Invalid choice."; continue; }
     break
 done
 
 # --- Browser ---
 BROWSER_OPTIONS=("Firefox" "Chromium" "None")
-echo "Выберите браузер:"
+echo "Select browser:"
 select browser_choice in "${BROWSER_OPTIONS[@]}"; do
-    [[ " ${BROWSER_OPTIONS[*]} " == *" $browser_choice "* ]] || { echo "Неверный выбор."; continue; }
+    [[ " ${BROWSER_OPTIONS[*]} " == *" $browser_choice "* ]] || { echo "Invalid choice."; continue; }
     break
 done
 
 # --- Hostname and user ---
-read -rp "Введите hostname: " hostname
-read -rp "Введите имя пользователя: " username
+read -rp "Enter hostname: " hostname
+read -rp "Enter username: " username
 
 # --- Passwords ---
 while true; do
-    read -rsp "Пароль root: " root_password; echo
-    read -rsp "Подтвердите пароль root: " root_password2; echo
+    read -rsp "Root password: " root_password; echo
+    read -rsp "Confirm root password: " root_password2; echo
     [[ "$root_password" == "$root_password2" ]] && break
-    echo "Пароли не совпадают."
+    echo "Passwords do not match."
 done
 
 while true; do
-    read -rsp "Пароль пользователя $username: " user_password; echo
-    read -rsp "Подтвердите пароль пользователя $username: " user_password2; echo
+    read -rsp "Password for user $username: " user_password; echo
+    read -rsp "Confirm password for user $username: " user_password2; echo
     [[ "$user_password" == "$user_password2" ]] && break
-    echo "Пароли не совпадают."
+    echo "Passwords do not match."
 done
 
-echo "--- Конфигурация ---"
+echo "--- Installation Configuration ---"
 echo "Disk: $disk, DE: $de_choice, DM: $dm_choice, Kernel: $kernel_choice"
 echo "Audio: $audio_choice, Browser: $browser_choice, Init: $init_choice"
 echo "Hostname: $hostname, User: $username"
-read -rp "Нажмите Enter для начала установки."
+read -rp "Press Enter to begin installation."
 
 # --- Disk preparation ---
 swapoff -a || true
@@ -177,7 +177,7 @@ healing_emerge() {
     local retries=5
     local attempt=1
     while [[ $attempt -le $retries ]]; do
-        echo "--> Попытка emerge $attempt/$retries: ${args[*]}"
+        echo "--> Attempt $attempt/$retries: emerge ${args[*]}"
         if emerge --verbose "${args[@]}" &> /tmp/emerge_run.log; then
             cat /tmp/emerge_run.log
             return 0
@@ -275,4 +275,4 @@ rm -f /mnt/gentoo/tmp/chroot.sh
 
 umount -l /mnt/gentoo/dev{/shm,/pts,} || true
 umount -R /mnt/gentoo || true
-echo "Установка завершена. Введите 'reboot' для запуска новой системы."
+echo "Installation complete. Type 'reboot' to start your new system."
