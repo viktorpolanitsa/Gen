@@ -1,9 +1,7 @@
 #!/bin/bash
 
-# Exit immediately if a command exits with a non-zero status.
 set -e
 
-# --- Initialization ---
 cd /
 
 echo "---= Autotoo: The Wise Gentoo Installer =---"
@@ -22,11 +20,7 @@ echo "Select a desktop environment to install:"
 options=("GNOME" "KDE Plasma" "XFCE" "MATE" "LXQt" "Exit")
 select de_choice in "${options[@]}"; do
     case $de_choice in
-        "GNOME") break;;
-        "KDE Plasma") break;;
-        "XFCE") break;;
-        "MATE") break;;
-        "LXQt") break;;
+        "GNOME"|"KDE Plasma"|"XFCE"|"MATE"|"LXQt") break;;
         "Exit") exit;;
         *) echo "Invalid choice. Try again.";;
     esac
@@ -67,7 +61,6 @@ echo "Press Enter to begin or Ctrl+C to cancel."
 read
 
 # --- System Preparation ---
-echo "--> Unmounting any existing mounts..."
 swapoff -a || true
 umount -R /mnt/gentoo || true
 umount -R ${disk}* || true
@@ -75,7 +68,6 @@ blockdev --flushbufs "$disk" || true
 sleep 2
 
 # --- Partitioning ---
-echo "--> Partitioning disk $disk..."
 sfdisk --force --wipe always --wipe-partitions always "$disk" << DISK_END
 label: gpt
 ${disk}1 : size=512MiB, type=uefi
@@ -99,9 +91,16 @@ mount "${disk}1" /mnt/gentoo/efi
 
 cd /mnt/gentoo
 
-# --- Download Stage3 ---
-STAGE3_PATH=$(wget -q -O - https://distfiles.gentoo.org/releases/amd64/autobuilds/latest-stage3-amd64-openrc.txt | grep -v "^#" | grep 'stage3' | head -n1 | cut -d' ' -f1)
-wget "https://distfiles.gentoo.org/releases/amd64/autobuilds/${STAGE3_PATH}"
+# --- Find fastest Stage3 mirror ---
+MIRROR=$(curl -s https://www.gentoo.org/downloads/mirrors/ | grep -oP 'https://.*?gentoo.org' | head -n 5 | while read url; do
+    TIME=$(curl -o /dev/null -s -w "%{time_total}" "$url/releases/amd64/autobuilds/latest-stage3-amd64-openrc.txt")
+    echo "$TIME $url"
+done | sort -n | head -n1 | awk '{print $2}')
+
+echo "--> Using Stage3 mirror: $MIRROR"
+
+STAGE3_PATH=$(wget -q -O - "${MIRROR}/releases/amd64/autobuilds/latest-stage3-amd64-openrc.txt" | grep -v "^#" | grep 'stage3' | head -n1 | cut -d' ' -f1)
+wget "${MIRROR}/releases/amd64/autobuilds/${STAGE3_PATH}"
 tar xpvf stage3-*.tar.xz --xattrs-include='*.*' --numeric-owner
 
 # --- Generate make.conf ---
@@ -136,52 +135,40 @@ mount --make-rslave /mnt/gentoo/dev
 mount --bind /run /mnt/gentoo/run
 mount --make-slave /mnt/gentoo/run
 
-# --- Generate chroot script ---
+# --- Chroot script ---
 cat > /mnt/gentoo/tmp/chroot.sh << 'CHROOTEOF'
 #!/bin/bash
 set -e
 source /etc/profile
 
-# --- Healing emerge function ---
 healing_emerge() {
-    local emerge_args=("$@")
-    local max_retries=5
+    local args=("$@")
+    local max=5
     local attempt=1
-    while [ $attempt -le $max_retries ]; do
-        emerge --verbose "${emerge_args[@]}" &> /tmp/emerge.log && { cat /tmp/emerge.log; return 0; }
+    while [ $attempt -le $max ]; do
+        emerge --verbose "${args[@]}" &> /tmp/emerge.log && { cat /tmp/emerge.log; return 0; }
         cat /tmp/emerge.log
-        if grep -q "circular dependencies" /tmp/emerge.log; then
-            fix=$(grep "Change USE:" /tmp/emerge.log | head -n1)
-            if [ -n "$fix" ]; then
-                pkg=$(echo "$fix" | awk '{print $2}' | sed 's/-[0-9].*//')
-                use_change=$(echo "$fix" | awk -F 'Change USE: ' '{print $2}' | sed 's/)//')
-                mkdir -p /etc/portage/package.use
-                echo "$pkg $use_change" >> /etc/portage/package.use/99_autofix
-                attempt=$((attempt+1))
-                continue
-            fi
+        fix=$(grep "Change USE:" /tmp/emerge.log | head -n1)
+        if [ -n "$fix" ]; then
+            pkg=$(echo "$fix" | awk '{print $2}' | sed 's/-[0-9].*//')
+            use=$(echo "$fix" | awk -F 'Change USE: ' '{print $2}' | sed 's/)//')
+            mkdir -p /etc/portage/package.use
+            echo "$pkg $use" >> /etc/portage/package.use/99_autofix
+            attempt=$((attempt+1))
+            continue
         fi
         return 1
     done
     return 1
 }
 
-# --- Sync Portage ---
 emerge-webrsync
 
 # --- Profile selection ---
-case "$DE_CHOICE" in
-    "GNOME") PROFILE=$(eselect profile list | grep 'desktop/gnome' | grep 'merged-usr' | grep -v 'systemd' | awk '{print $2}' | tail -n1);;
-    "KDE Plasma") PROFILE=$(eselect profile list | grep 'desktop/plasma' | grep 'merged-usr' | grep -v 'systemd' | awk '{print $2}' | tail -n1);;
-    "XFCE") PROFILE=$(eselect profile list | grep 'desktop' | grep 'merged-usr' | grep -v 'gnome' | grep -v 'plasma' | grep -v 'systemd' | awk '{print $2}' | tail -n1);;
-    "MATE") PROFILE=$(eselect profile list | grep 'desktop/mate' | grep 'merged-usr' | grep -v 'systemd' | awk '{print $2}' | tail -n1);;
-    "LXQt") PROFILE=$(eselect profile list | grep 'desktop/lxqt' | grep 'merged-usr' | grep -v 'systemd' | awk '{print $2}' | tail -n1);;
-esac
-
+PROFILE=$(eselect profile list | grep 'desktop' | grep 'merged-usr' | grep -v 'systemd' | awk '{print $2}' | tail -n1)
 eselect profile set "$PROFILE"
 ln -sf "$PROFILE" /etc/portage/make.profile
 
-# --- System build ---
 healing_emerge --update --deep --newuse @system
 
 case "$DE_CHOICE" in
@@ -192,42 +179,32 @@ case "$DE_CHOICE" in
     "LXQt") healing_emerge lxqt-meta/lxqt-meta;;
 esac
 
-# --- Final world update ---
 healing_emerge --update --deep --newuse @world --keep-going=y
 
-# --- Kernel ---
 echo "sys-kernel/installkernel grub dracut" > /etc/portage/package.use/installkernel
 healing_emerge sys-kernel/gentoo-kernel-bin
 
-# --- Fstab and hostname ---
 genfstab -U / > /etc/fstab
 echo "$HOSTNAME" > /etc/hostname
-
-# --- Set passwords ---
 echo "root:$ROOT_PASSWORD" | chpasswd
 useradd -m -G users,wheel,audio,video -s /bin/bash $USER_NAME
 echo "$USER_NAME:$USER_PASSWORD" | chpasswd
 
-# --- Base system ---
 healing_emerge app-admin/sysklogd net-misc/chrony sys-process/cronie app-shells/bash-completion sys-apps/mlocate
-
 rc-update add sysklogd default
 rc-update add chronyd default
 rc-update add cronie default
 rc-update add NetworkManager default
 rc-update add sshd default
 
-# --- Graphical subsystem ---
 healing_emerge x11-base/xorg-server
 case "$DE_CHOICE" in
     "GNOME") rc-update add gdm default;;
     "KDE Plasma") healing_emerge sys-boot/sddm; rc-update add sddm default;;
-    "XFCE") healing_emerge x11-misc/lightdm x11-misc/lightdm-gtk-greeter; rc-update add lightdm default;;
-    "MATE") healing_emerge x11-misc/lightdm x11-misc/lightdm-gtk-greeter; rc-update add lightdm default;;
-    "LXQt") healing_emerge x11-misc/sddm; rc-update add sddm default;;
+    "XFCE"|"MATE") healing_emerge x11-misc/lightdm x11-misc/lightdm-gtk-greeter; rc-update add lightdm default;;
+    "LXQt") healing_emerge sys-boot/sddm; rc-update add sddm default;;
 esac
 
-# --- Bootloader ---
 healing_emerge sys-boot/grub
 grub-install --target=x86_64-efi --efi-directory=/efi
 grub-mkconfig -o /boot/grub/grub.cfg
@@ -237,7 +214,6 @@ CHROOTEOF
 
 chmod +x /mnt/gentoo/tmp/chroot.sh
 
-# --- Enter chroot and run ---
 DE_CHOICE="$de_choice"
 HOSTNAME="$hostname"
 USER_NAME="$username"
@@ -247,9 +223,7 @@ USER_PASSWORD="$user_password"
 chroot /mnt/gentoo /tmp/chroot.sh
 rm /mnt/gentoo/tmp/chroot.sh
 
-# --- Finish ---
 echo "--- Installation Complete! ---"
 umount -l /mnt/gentoo/dev{/shm,/pts,}
 umount -R /mnt/gentoo
-
 echo "System ready. Type 'reboot' to start your new Gentoo system."
