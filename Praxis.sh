@@ -3,7 +3,7 @@
 # Exit immediately if a command exits with a non-zero status.
 set -e
 
-echo "---= Autotoo: The Wise Gentoo Installer =---"
+echo "---= Praxis: The Wise Gentoo Installer =---"
 echo "This script will erase ALL DATA on the selected disk."
 echo "Please ensure you have selected the correct one."
 echo ""
@@ -63,18 +63,12 @@ read
 
 # --- Phase 1: System Preparation ---
 
-# --- ИСПРАВЛЕНИЕ ---
-# Добавляем этап принудительной очистки перед разметкой.
 echo "--> Ensuring target disk is not in use..."
-# Отключаем ВСЕ разделы подкачки. В LiveCD это безопасно.
 swapoff -a || true
-# Принудительно отмонтируем все, что может быть смонтировано с целевого диска.
-# `|| true` предотвращает ошибку, если ничего не было смонтировано.
 umount -R ${disk}* || true
 umount -f ${disk}* || true
 
 echo "--> Partitioning disk $disk..."
-# Добавляем флаг --force, чтобы гарантировать выполнение, как и советует сама утилита.
 sfdisk --force --wipe always --wipe-partitions always "$disk" << DISKEOF
 label: gpt
 ${disk}1 : size=512MiB, type=uefi
@@ -101,7 +95,11 @@ mount "${disk}1" /mnt/gentoo/efi
 cd /mnt/gentoo
 
 echo "--> Downloading the latest Stage3 tarball..."
-STAGE3_PATH=$(wget -q -O - https://distfiles.gentoo.org/releases/amd64/autobuilds/latest-stage3-amd64-openrc.txt | head -n 1 | cut -d' ' -f1)
+# --- ФИНАЛЬНОЕ ИСПРАВЛЕНИЕ ---
+# Это несокрушимое заклинание. Оно отфильтровывает комментарии и ищет строку,
+# содержащую 'stage3', что делает его невосприимчивым к мусору в файле.
+# Это решает ошибку 404 Not Found раз и навсегда.
+STAGE3_PATH=$(wget -q -O - https://distfiles.gentoo.org/releases/amd64/autobuilds/latest-stage3-amd64-openrc.txt | grep -v "^#" | grep 'stage3' | head -n 1 | cut -d' ' -f1)
 wget "https://distfiles.gentoo.org/releases/amd64/autobuilds/${STAGE3_PATH}"
 
 echo "--> Unpacking Stage3..."
