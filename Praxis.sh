@@ -63,8 +63,19 @@ read
 
 # --- Phase 1: System Preparation ---
 
+# --- ИСПРАВЛЕНИЕ ---
+# Добавляем этап принудительной очистки перед разметкой.
+echo "--> Ensuring target disk is not in use..."
+# Отключаем ВСЕ разделы подкачки. В LiveCD это безопасно.
+swapoff -a || true
+# Принудительно отмонтируем все, что может быть смонтировано с целевого диска.
+# `|| true` предотвращает ошибку, если ничего не было смонтировано.
+umount -R ${disk}* || true
+umount -f ${disk}* || true
+
 echo "--> Partitioning disk $disk..."
-sfdisk --wipe always --wipe-partitions always "$disk" << DISKEOF
+# Добавляем флаг --force, чтобы гарантировать выполнение, как и советует сама утилита.
+sfdisk --force --wipe always --wipe-partitions always "$disk" << DISKEOF
 label: gpt
 ${disk}1 : size=512MiB, type=uefi
 ${disk}2 : type=linux
@@ -90,9 +101,6 @@ mount "${disk}1" /mnt/gentoo/efi
 cd /mnt/gentoo
 
 echo "--> Downloading the latest Stage3 tarball..."
-# --- ИСПРАВЛЕНИЕ ---
-# Добавлена `head -n 1` для защиты от парсинга лишних строк (например, PGP-подписей),
-# что предотвращает ошибку 404 Not Found.
 STAGE3_PATH=$(wget -q -O - https://distfiles.gentoo.org/releases/amd64/autobuilds/latest-stage3-amd64-openrc.txt | head -n 1 | cut -d' ' -f1)
 wget "https://distfiles.gentoo.org/releases/amd64/autobuilds/${STAGE3_PATH}"
 
@@ -215,9 +223,6 @@ case "${de_choice}" in
         ;;
     "XFCE")
         echo "--> Installing XFCE and LightDM..."
-        # --- УЛУЧШЕНИЕ ---
-        # Устанавливаем LightDM и GTK-тему для него, как более подходящий
-        # выбор для XFCE.
         emerge -q xfce-base/xfce4-meta x11-terms/xfce4-terminal app-admin/lightdm x11-wm/lightdm-gtk-greeter
         rc-update add lightdm default
         ;;
