@@ -3,7 +3,7 @@
 # Exit immediately if a command exits with a non-zero status.
 set -e
 
-echo "---= Praxis: The Wise Gentoo Installer =---"
+echo "---= Autotoo: The Wise Gentoo Installer =---"
 echo "This script will erase ALL DATA on the selected disk."
 echo "Please ensure you have selected the correct one."
 echo ""
@@ -95,10 +95,6 @@ mount "${disk}1" /mnt/gentoo/efi
 cd /mnt/gentoo
 
 echo "--> Downloading the latest Stage3 tarball..."
-# --- ФИНАЛЬНОЕ ИСПРАВЛЕНИЕ ---
-# Это несокрушимое заклинание. Оно отфильтровывает комментарии и ищет строку,
-# содержащую 'stage3', что делает его невосприимчивым к мусору в файле.
-# Это решает ошибку 404 Not Found раз и навсегда.
 STAGE3_PATH=$(wget -q -O - https://distfiles.gentoo.org/releases/amd64/autobuilds/latest-stage3-amd64-openrc.txt | grep -v "^#" | grep 'stage3' | head -n 1 | cut -d' ' -f1)
 wget "https://distfiles.gentoo.org/releases/amd64/autobuilds/${STAGE3_PATH}"
 
@@ -110,15 +106,12 @@ echo "--> Generating make.conf..."
 case $de_choice in
     "GNOME")
         DE_USE_FLAGS="gtk gnome -qt5 -kde"
-        DE_PROFILE="default/linux/amd64/17.1/desktop/gnome"
         ;;
     "KDE Plasma")
         DE_USE_FLAGS="qt5 plasma kde -gtk -gnome"
-        DE_PROFILE="default/linux/amd64/17.1/desktop/plasma"
         ;;
     "XFCE")
         DE_USE_FLAGS="gtk xfce -qt5 -kde -gnome"
-        DE_PROFILE="default/linux/amd64/17.1/desktop"
         ;;
 esac
 
@@ -161,8 +154,27 @@ source /etc/profile
 echo "--> Syncing Portage..."
 emerge-webrsync
 
-echo "--> Selecting profile: ${DE_PROFILE}"
-eselect profile set ${DE_PROFILE}
+# --- ФИНАЛЬНОЕ ИСПРАВЛЕНИЕ: РАЗ И НАВСЕГДА ---
+# Скрипт больше не использует жестко заданные имена профилей.
+# Он сам находит самый подходящий и свежий профиль в системе.
+echo "--> Dynamically selecting the best profile for ${de_choice}..."
+case "${de_choice}" in
+    "GNOME")
+        # Ищем последний desktop/gnome профиль без systemd
+        DE_PROFILE=\$(eselect profile list | grep 'desktop/gnome' | grep -v 'systemd' | awk '{print \$1}' | tail -n 1)
+        ;;
+    "KDE Plasma")
+        # Ищем последний desktop/plasma профиль без systemd
+        DE_PROFILE=\$(eselect profile list | grep 'desktop/plasma' | grep -v 'systemd' | awk '{print \$1}' | tail -n 1)
+        ;;
+    "XFCE")
+        # Ищем последний desktop профиль, который не является ни gnome, ни plasma, ни systemd
+        DE_PROFILE=\$(eselect profile list | grep 'desktop' | grep -v 'gnome' | grep -v 'plasma' | grep -v 'systemd' | awk '{print \$1}' | tail -n 1)
+        ;;
+esac
+
+echo "--> Profile found: \${DE_PROFILE}"
+eselect profile set "\${DE_PROFILE}"
 
 echo "--> Updating the world set with new USE flags..."
 emerge --verbose --update --deep --newuse @world
