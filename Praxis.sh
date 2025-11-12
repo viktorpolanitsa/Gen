@@ -143,8 +143,7 @@ cat > /mnt/gentoo/tmp/chroot.sh << CHROOTEOF
 set -e
 source /etc/profile
 
-# --- ФИНАЛЬНЫЙ УДАР: ПРОСВЕТЛЕННЫЙ EMERGE ---
-# Эта функция - разум нашего скрипта. Она сама лечит циклические зависимости.
+# --- Просветленный Emerge ---
 healing_emerge() {
     local emerge_args=("\$@")
     local max_retries=5
@@ -163,11 +162,7 @@ healing_emerge() {
             echo "--> Circular dependency detected. Attempting to apply fix..."
             local fix=\$(grep "Change USE:" /tmp/emerge.log | head -n 1)
             if [ -n "\$fix" ]; then
-                # --- АБСОЛЮТНОЕ ПРОСВЕТЛЕНИЕ ---
-                # Мы извлекаем ПОЛНЫЙ атом пакета (например, media-libs/tiff-4.7.0-r1)
                 local full_package=\$(echo "\$fix" | awk '{print \$2}')
-                # И затем, с помощью магии sed, мы ОЧИЩАЕМ его от версии,
-                # оставляя только то, что понимает package.use (media-libs/tiff).
                 local clean_package=\$(echo "\$full_package" | sed 's/-[0-9].*//')
                 local use_change=\$(echo "\$fix" | awk -F 'Change USE: ' '{print \$2}' | sed 's/)//')
                 
@@ -191,11 +186,21 @@ healing_emerge() {
 echo "--> Syncing Portage..."
 emerge-webrsync
 
+# --- ФИНАЛЬНЫЙ УДАР: РАЗ И НАВСЕГДА ---
+# Мы добавляем `grep 'merged-usr'` в поиск профиля. Это гарантирует,
+# что мы выберем профиль, соответствующий современному Stage3.
+# Это конец войне идеологий.
 echo "--> Dynamically selecting the best profile for ${de_choice}..."
 case "${de_choice}" in
-    "GNOME") DE_PROFILE=\$(eselect profile list | grep 'desktop/gnome' | grep -v 'systemd' | awk '{print \$2}' | tail -n 1);;
-    "KDE Plasma") DE_PROFILE=\$(eselect profile list | grep 'desktop/plasma' | grep -v 'systemd' | awk '{print \$2}' | tail -n 1);;
-    "XFCE") DE_PROFILE=\$(eselect profile list | grep 'desktop' | grep -v 'gnome' | grep -v 'plasma' | grep -v 'systemd' | awk '{print \$2}' | tail -n 1);;
+    "GNOME")
+        DE_PROFILE=\$(eselect profile list | grep 'desktop/gnome' | grep 'merged-usr' | grep -v 'systemd' | awk '{print \$2}' | tail -n 1)
+        ;;
+    "KDE Plasma")
+        DE_PROFILE=\$(eselect profile list | grep 'desktop/plasma' | grep 'merged-usr' | grep -v 'systemd' | awk '{print \$2}' | tail -n 1)
+        ;;
+    "XFCE")
+        DE_PROFILE=\$(eselect profile list | grep 'desktop' | grep 'merged-usr' | grep -v 'gnome' | grep -v 'plasma' | grep -v 'systemd' | awk '{print \$2}' | tail -n 1)
+        ;;
 esac
 
 echo "--> Profile found: \${DE_PROFILE}"
