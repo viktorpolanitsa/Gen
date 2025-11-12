@@ -156,11 +156,16 @@ esac
 echo "--> Profile found: \${DE_PROFILE}"
 eselect profile set "\${DE_PROFILE}"
 
-# --- ФИНАЛЬНЫЙ УДАР: СТУПЕНЧАТАЯ СБОРКА ---
-# Мы больше не обновляем @world сразу. Мы делаем это в три этапа,
-# чтобы избежать циклических зависимостей и других сложных проблем.
+# --- ФИНАЛЬНЫЙ УДАР: ХИРУРГИЧЕСКОЕ ВМЕШАТЕЛЬСТВО ---
+# Мы больше не полагаемся на случай. Мы сами разрываем цикл.
+
+echo "--> Applying temporary fix for circular dependencies..."
+mkdir -p /etc/portage/package.use
+# 1. Анестезия: Временно отключаем webp для tiff.
+echo "media-libs/tiff -webp" > /etc/portage/package.use/99_autofix
 
 echo "--> Stage 1/3: Building the system foundation..."
+# 2. Операция: Собираем базу. tiff соберется без webp, разрывая цикл.
 emerge --verbose --update --deep --newuse @system
 
 echo "--> Stage 2/3: Building the desktop environment..."
@@ -170,7 +175,12 @@ case "${de_choice}" in
     "XFCE") emerge -q xfce-base/xfce4-meta;;
 esac
 
-echo "--> Stage 3/3: Final world update and cleanup..."
+echo "--> Removing temporary fix..."
+# 3. Снятие швов: Удаляем наш костыль.
+rm -f /etc/portage/package.use/99_autofix
+
+echo "--> Stage 3/3: Final world update and healing..."
+# 4. Исцеление: Portage видит, что tiff должен иметь webp, и пересобирает его правильно.
 emerge --verbose --update --deep --newuse @world
 
 echo "--> Configuring CPU flags..."
