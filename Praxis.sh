@@ -143,6 +143,52 @@ cat > /mnt/gentoo/tmp/chroot.sh << CHROOTEOF
 set -e
 source /etc/profile
 
+# --- ФИНАЛЬНЫЙ УДАР: САМОИСЦЕЛЯЮЩИЙСЯ EMERGE ---
+# Эта функция - разум нашего скрипта. Она сама лечит циклические зависимости.
+healing_emerge() {
+    local emerge_args=("\$@")
+    local max_retries=5
+    local attempt=1
+
+    while [ \$attempt -le \$max_retries ]; do
+        echo "--> Healing Emerge: Attempt \$attempt/\$max_retries for: emerge \${emerge_args[@]}"
+        # Запускаем emerge, сохраняя весь вывод в лог
+        emerge --verbose "\${emerge_args[@]}" &> /tmp/emerge.log && {
+            echo "--> Emerge successful."
+            cat /tmp/emerge.log
+            return 0
+        }
+
+        # Если команда провалилась, анализируем лог
+        cat /tmp/emerge.log
+        if grep -q "circular dependencies" /tmp/emerge.log; then
+            echo "--> Circular dependency detected. Attempting to apply fix..."
+            # Ищем первую предложенную правку
+            local fix=\$(grep "Change USE:" /tmp/emerge.log | head -n 1)
+            if [ -n "\$fix" ]; then
+                # Извлекаем пакет и флаги
+                local package=\$(echo "\$fix" | awk '{print \$2}')
+                local use_change=\$(echo "\$fix" | awk -F 'Change USE: ' '{print \$2}' | sed 's/)//')
+                
+                echo "--> Applying temporary fix: echo \"\$package \$use_change\""
+                mkdir -p /etc/portage/package.use
+                echo "\$package \$use_change" >> /etc/portage/package.use/99_autofix
+                
+                # Увеличиваем счетчик и пробуем снова
+                attempt=\$((attempt + 1))
+                continue
+            fi
+        fi
+
+        # Если это не циклическая зависимость или мы не нашли фикс, выходим с ошибкой
+        echo "--> Emerge failed with an unrecoverable error."
+        return 1
+    done
+
+    echo "--> Failed to resolve dependencies after \$max_retries attempts."
+    return 1
+}
+
 echo "--> Syncing Portage..."
 emerge-webrsync
 
@@ -156,32 +202,22 @@ esac
 echo "--> Profile found: \${DE_PROFILE}"
 eselect profile set "\${DE_PROFILE}"
 
-# --- ФИНАЛЬНЫЙ УДАР: ХИРУРГИЧЕСКОЕ ВМЕШАТЕЛЬСТВО ---
-# Мы больше не полагаемся на случай. Мы сами разрываем цикл.
-
-echo "--> Applying temporary fix for circular dependencies..."
-mkdir -p /etc/portage/package.use
-# 1. Анестезия: Временно отключаем webp для tiff.
-echo "media-libs/tiff -webp" > /etc/portage/package.use/99_autofix
-
+# --- Ступенчатая сборка с использованием нашего разумного emerge ---
 echo "--> Stage 1/3: Building the system foundation..."
-# 2. Операция: Собираем базу. tiff соберется без webp, разрывая цикл.
-emerge --verbose --update --deep --newuse @system
+healing_emerge --update --deep --newuse @system
 
 echo "--> Stage 2/3: Building the desktop environment..."
 case "${de_choice}" in
-    "GNOME") emerge -q gnome-shell/gnome;;
-    "KDE Plasma") emerge -q kde-plasma/plasma-meta;;
-    "XFCE") emerge -q xfce-base/xfce4-meta;;
+    "GNOME") healing_emerge gnome-shell/gnome;;
+    "KDE Plasma") healing_emerge kde-plasma/plasma-meta;;
+    "XFCE") healing_emerge xfce-base/xfce4-meta;;
 esac
 
-echo "--> Removing temporary fix..."
-# 3. Снятие швов: Удаляем наш костыль.
+echo "--> Removing temporary fixes..."
 rm -f /etc/portage/package.use/99_autofix
 
 echo "--> Stage 3/3: Final world update and healing..."
-# 4. Исцеление: Portage видит, что tiff должен иметь webp, и пересобирает его правильно.
-emerge --verbose --update --deep --newuse @world
+healing_emerge --update --deep --newuse @world --keep-going=y
 
 echo "--> Configuring CPU flags..."
 emerge -q app-portage/cpuid2cpuflags
