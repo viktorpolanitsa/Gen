@@ -58,20 +58,24 @@ echo "Environment: $de_choice"
 echo "Hostname: $hostname"
 echo "User: $username"
 echo "------------------------------------"
-echo "Press Enter to begin the installation or Ctrl+C to cancel."
+echo "Press Enter to begin the installation or Ctrl C to cancel."
 read
 
 # --- Phase 1: System Preparation ---
 
 echo "--> Partitioning disk $disk..."
-# --- ИСПРАВЛЕННЫЙ БЛОК ---
-# Убрана лишняя строка ",1M,U", которая создавала ненужный BIOS boot раздел
-# и приводила к ошибке "Numerical result out of range".
 sfdisk "$disk" << DISKEOF
 label: gpt
 ${disk}1 : size=512MiB, type=uefi
 ${disk}2 : type=linux
 DISKEOF
+
+# --- ИСПРАВЛЕНИЕ ---
+# Принудительно заставляем ядро перечитать таблицу разделов и создать
+# файлы устройств (/dev/sda1, /dev/sda2) ПЕРЕД тем, как мы попытаемся их использовать.
+# Это решает ошибку "No such file or directory".
+echo "--> Forcing kernel to re-read partition table..."
+partprobe "$disk"
 
 echo "--> Formatting partitions..."
 mkfs.vfat -F 32 "${disk}1"
@@ -167,7 +171,7 @@ eselect locale set en_US.UTF-8
 env-update && source /etc/profile
 
 echo "--> Installing the binary kernel..."
-echo "sys-kernel/installkernel grub drut" > /etc/portage/package.use/installkernel
+echo "sys-kernel/installkernel grub dracut" > /etc/portage/package.use/installkernel
 emerge -q sys-kernel/gentoo-kernel-bin
 
 echo "--> Generating fstab..."
