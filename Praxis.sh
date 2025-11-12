@@ -63,10 +63,18 @@ read
 
 # --- Phase 1: System Preparation ---
 
-echo "--> Ensuring target disk is not in use..."
+# --- ФИНАЛЬНЫЙ ЭКЗОРЦИЗМ: РАЗ И НАВСЕГДА ---
+echo "--> Performing exorcism on ${disk} to release all holds..."
+# 1. Отключаем все, что можно.
 swapoff -a || true
+# 2. Используем все известные методы отмонтирования.
+umount -R /mnt/gentoo || true
 umount -R ${disk}* || true
-umount -f ${disk}* || true
+# 3. Сбрасываем буферы ядра, заставляя его "забыть" о диске.
+blockdev --flushbufs "$disk" || true
+# 4. ДАЕМ ЯДРУ ВРЕМЯ. Это самый важный шаг.
+echo "--> Giving the kernel a moment to release the device..."
+sleep 2
 
 echo "--> Partitioning disk $disk..."
 sfdisk --force --wipe always --wipe-partitions always "$disk" << DISKEOF
@@ -76,7 +84,9 @@ ${disk}2 : type=linux
 DISKEOF
 
 echo "--> Forcing kernel to re-read partition table..."
+# 5. Финальный удар, чтобы ядро точно обновило информацию.
 partprobe "$disk"
+sleep 1
 
 echo "--> Wiping old filesystem signatures..."
 wipefs -a "${disk}1"
@@ -102,7 +112,6 @@ echo "--> Unpacking Stage3..."
 tar xpvf stage3-*.tar.xz --xattrs-include='*.*' --numeric-owner
 
 echo "--> Generating make.conf..."
-# Установка переменных для DE
 case $de_choice in
     "GNOME")
         DE_USE_FLAGS="gtk gnome -qt5 -kde"
@@ -121,18 +130,10 @@ CFLAGS="\${COMMON_FLAGS}"
 CXXFLAGS="\${COMMON_FLAGS}"
 RUSTFLAGS="-C target-cpu=native"
 MAKEOPTS="-j$(nproc)"
-
-# Настройки для выбранного DE
 USE="${DE_USE_FLAGS} dbus elogind pulseaudio"
-
-# Лицензии
 ACCEPT_LICENSE="@FREE"
-
-# Настройки для видео и устройств ввода
-VIDEO_CARDS="amdgpu intel nouveau" # Добавь nvidia, если нужно
+VIDEO_CARDS="amdgpu intel nouveau"
 INPUT_DEVICES="libinput"
-
-# Включаем поддержку GRUB для EFI
 GRUB_PLATFORMS="efi-64"
 MAKECONF
 
@@ -154,21 +155,15 @@ source /etc/profile
 echo "--> Syncing Portage..."
 emerge-webrsync
 
-# --- ФИНАЛЬНОЕ ИСПРАВЛЕНИЕ: РАЗ И НАВСЕГДА ---
-# Скрипт больше не использует жестко заданные имена профилей.
-# Он сам находит самый подходящий и свежий профиль в системе.
 echo "--> Dynamically selecting the best profile for ${de_choice}..."
 case "${de_choice}" in
     "GNOME")
-        # Ищем последний desktop/gnome профиль без systemd
         DE_PROFILE=\$(eselect profile list | grep 'desktop/gnome' | grep -v 'systemd' | awk '{print \$1}' | tail -n 1)
         ;;
     "KDE Plasma")
-        # Ищем последний desktop/plasma профиль без systemd
         DE_PROFILE=\$(eselect profile list | grep 'desktop/plasma' | grep -v 'systemd' | awk '{print \$1}' | tail -n 1)
         ;;
     "XFCE")
-        # Ищем последний desktop профиль, который не является ни gnome, ни plasma, ни systemd
         DE_PROFILE=\$(eselect profile list | grep 'desktop' | grep -v 'gnome' | grep -v 'plasma' | grep -v 'systemd' | awk '{print \$1}' | tail -n 1)
         ;;
 esac
@@ -219,7 +214,6 @@ rc-update add sshd default
 echo "--> Installing the graphical subsystem..."
 emerge -q x11-base/xorg-server
 
-# Установка DE и Display Manager
 case "${de_choice}" in
     "GNOME")
         echo "--> Installing GNOME and GDM..."
