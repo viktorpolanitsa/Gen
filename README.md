@@ -91,7 +91,7 @@ sudo -i
 ```
 Скачайте последнюю версию скрипта из этого репозитория:
 ```bash
-wget -O Praxis https://raw.githubusercontent.com/viktorpolanitsa/Gen/refs/heads/main/Praxis.sh
+wget -O Praxis.sh https://raw.githubusercontent.com/viktorpolanitsa/Gen/refs/heads/main/Praxis.sh
 ```
 
 Сделайте скрипт исполняемым:
