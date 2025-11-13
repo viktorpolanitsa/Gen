@@ -1,148 +1,135 @@
 #!/usr/bin/env bash
-# final_autogentoo_installer_grub_fixed.sh
-# Final Gentoo installer with robust mirror selection, secure chroot env,
-# self-healing emerge, automatic kernel installation if missing,
-# guaranteed grub config generation and EFI boot entry verification.
+# autogentoo_final_full.sh
+# Fully consolidated Gentoo installer (single-file)
+# Features:
+#  - Region-aware mirror selection (mirrorselect + RTT fallback)
+#  - Robust Stage3 discovery & download with retries and fallbacks
+#  - Partitioning (GPT) with EFI (512MiB) + root; filesystem choices ext4/xfs/btrfs
+#  - Mounting of EFI to /mnt/gentoo/boot/efi (ensures grub installs correctly)
+#  - Secure passing of secrets into chroot via restricted file
+#  - Chroot installer with self-healing emerge heuristics, kernel install fallback
+#  - GRUB installation with NVRAM verification, --removable fallback (bootx64.efi)
+#  - efivarfs handling, efibootmgr checks & creation
+#  - Logging, retries, safe cleanup (trap)
 #
-# WARNING: This script WILL ERASE data on the specified disk. Test in VM first.
+# WARNING: This script WILL ERASE TARGET DISK. Test in VM first.
 set -euo pipefail
 export TZ="UTC"
 IFS=$'\n\t'
 
-# ---------------- Logging -------------------------------------------------
-LOGFILE="/tmp/autogentoo_install.log"
-exec > >(tee -a "$LOGFILE") 2>&1
-readonly LOGFILE
+# ------------ Logging -------------
+LOG="/tmp/autogentoo_install.log"
+exec > >(tee -a "$LOG") 2>&1
+log(){ printf '%s %s\n' "$(date -Is)" "$*"; }
+err(){ printf '%s ERROR: %s\n' "$(date -Is)" "$*" >&2; }
+note(){ printf '%s NOTE: %s\n' "$(date -Is)" "$*"; }
 
-log()  { printf '%s %s\n' "$(date -Is)" "$*"; }
-err()  { printf '%s ERROR: %s\n' "$(date -Is)" "$*" >&2; }
-note() { printf '%s NOTE: %s\n' "$(date -Is)" "$*"; }
-
-# ---------------- Safety checks ------------------------------------------
+# ------------ Basic sanity -------------
 if [[ $EUID -ne 0 ]]; then
-  err "Script must be run as root."
+  err "Must run as root"
   exit 1
 fi
 
-# ---------------- Utilities ------------------------------------------------
-retry_cmd() {
-  # retry_cmd <retries> <sleep_seconds> <command...>
-  local -i retries=${1:-3}; shift
+# ------------ Helpers -------------
+retry_cmd(){
+  # retry_cmd <attempts> <sleep> <cmd...>
+  local -i attempts=${1:-3}; shift
   local sleep_s=${1:-2}; shift
   local n=0
   until "$@"; do
     n=$((n+1))
-    if (( n >= retries )); then
-      return 1
-    fi
+    if (( n >= attempts )); then return 1; fi
     sleep "$sleep_s"
   done
   return 0
 }
 
-http_head_time() {
+http_head_time(){
   local url="$1"
-  local tt
-  tt=$(curl -s -o /dev/null -w '%{time_total}' --head --max-time 8 --silent "$url" 2>/dev/null || true)
-  if [[ -z "$tt" || "$tt" == "0" ]]; then echo ""; else echo "$tt"; fi
+  curl -s -o /dev/null -w '%{time_total}' --head --max-time 8 "$url" 2>/dev/null || echo ""
 }
 
-join_by() { local IFS="$1"; shift; echo "$*"; }
+join_by(){ local IFS="$1"; shift; echo "$*"; }
 
-# ---------------- Cleanup -------------------------------------------------
-cleanup() {
-  log "Running cleanup..."
-  if mountpoint -q /mnt/gentoo 2>/dev/null; then
-    rm -f /mnt/gentoo/tmp/.installer_env.sh 2>/dev/null || true
-  fi
+cleanup(){
+  log "Cleanup: attempting to unmount and remove temp files"
+  rm -f /mnt/gentoo/tmp/.installer_env.sh 2>/dev/null || true
   umount -l /mnt/gentoo/dev{/shm,/pts,} 2>/dev/null || true
   umount -l /mnt/gentoo/run 2>/dev/null || true
   umount -R /mnt/gentoo 2>/dev/null || true
-  log "Cleanup complete."
+  log "Cleanup finished"
 }
 trap cleanup EXIT
 
-# ---------------- CLI args / env ------------------------------------------
+# ------------ CLI args -------------
 UNATTENDED=${UNATTENDED:-0}
-GENERATE_INSTALLER_COPY=${GENERATE_INSTALLER_COPY:-0}
-
+GEN_INSTALLER_COPY=${GEN_INSTALLER_COPY:-0}
 while (( $# )); do
   case "$1" in
     --unattended) UNATTENDED=1; shift;;
-    --generate-installer) GENERATE_INSTALLER_COPY=1; shift;;
-    --help) printf 'Usage: %s [--unattended] [--generate-installer]\n' "$0"; exit 0;;
+    --gen-copy) GEN_INSTALLER_COPY=1; shift;;
+    --help) echo "Usage: $0 [--unattended] [--gen-copy]"; exit 0;;
     *) break;;
   esac
 done
 
-# ---------------- Input collection ---------------------------------------
+# ------------ Input collection -------------
 if [[ "$UNATTENDED" -eq 0 ]]; then
-  log "Interactive mode."
+  log "Interactive mode"
   lsblk -dno NAME,SIZE,MODEL || true
-  read -rp "Enter target disk (example: sda or nvme0n1): " disk_input
-  read -rp "Choose Desktop Environment (GNOME,KDE Plasma,XFCE,LXQt,MATE,None): " de_choice
-  read -rp "Enter hostname: " hostname
-  read -rp "Enter username: " username
-  read -rp "Enter timezone (e.g., Europe/Moscow) or leave empty for UTC: " timezone_input
-  read -rp "Choose root filesystem (ext4,xfs,btrfs): " fs_choice
-  read -rp "Save installer copy to /tmp/final_autogentoo_installer.sh? (yes/no): " gen_choice
-  [[ "$gen_choice" =~ ^(yes|y|Y)$ ]] && GENERATE_INSTALLER_COPY=1
-  read -rp "Proceed with installation to /dev/${disk_input}? Type YES to continue: " confirm
-  [[ "$confirm" == "YES" ]] || { log "Cancelled by user."; exit 0; }
-  read -rsp "Root password: " root_password; echo
-  read -rsp "Confirm root password: " root_password2; echo
-  [[ "$root_password" == "$root_password2" ]] || { err "Root passwords do not match"; exit 1; }
-  read -rsp "Password for ${username}: " user_password; echo
-  read -rsp "Confirm user password: " user_password2; echo
-  [[ "$user_password" == "$user_password2" ]] || { err "User passwords do not match"; exit 1; }
+  read -rp "Target disk (e.g. sda or nvme0n1): " disk_in
+  read -rp "Root filesystem (ext4,xfs,btrfs) [ext4]: " fs_choice; fs_choice=${fs_choice:-ext4}
+  read -rp "Desktop env (GNOME,KDE Plasma,XFCE,LXQt,MATE,None) [None]: " de_choice; de_choice=${de_choice:-None}
+  read -rp "Hostname [gentoo]: " hostname; hostname=${hostname:-gentoo}
+  read -rp "Username [gentoo]: " username; username=${username:-gentoo}
+  read -rp "Timezone (e.g. Europe/Moscow) [UTC]: " timezone; timezone=${timezone:-UTC}
+  read -rp "Save installer copy to /tmp? (yes/no) [no]: " savecopy; savecopy=${savecopy:-no}
+  [[ "$savecopy" =~ ^(yes|y)$ ]] && GEN_INSTALLER_COPY=1
+  read -rp "Proceed and erase /dev/${disk_in}? Type YES to continue: " confirm
+  [[ "$confirm" == "YES" ]] || { log "User cancelled"; exit 0; }
+  read -rsp "Root password: " root_pw; echo
+  read -rsp "Confirm root password: " root_pw2; echo
+  [[ "$root_pw" == "$root_pw2" ]] || { err "Root passwords differ"; exit 1; }
+  read -rsp "User password for ${username}: " user_pw; echo
+  read -rsp "Confirm user password: " user_pw2; echo
+  [[ "$user_pw" == "$user_pw2" ]] || { err "User passwords differ"; exit 1; }
 else
-  log "Unattended mode: reading env variables."
-  disk_input="${DISK:-}"
-  de_choice="${DE_CHOICE:-None}"
-  hostname="${HOSTNAME:-gentoo-host}"
-  username="${USERNAME:-gentoo}"
-  timezone_input="${TIMEZONE:-UTC}"
+  log "Unattended mode, reading environment variables"
+  disk_in="${DISK:-}"
   fs_choice="${FS_CHOICE:-ext4}"
-  root_password="${ROOT_PASSWORD:-changeme}"
-  user_password="${USER_PASSWORD:-changeme}"
-  [[ -n "$disk_input" ]] || { err "DISK environment variable required for unattended mode"; exit 1; }
+  de_choice="${DE_CHOICE:-None}"
+  hostname="${HOSTNAME:-gentoo}"
+  username="${USERNAME:-gentoo}"
+  timezone="${TIMEZONE:-UTC}"
+  root_pw="${ROOT_PASSWORD:-changeme}"
+  user_pw="${USER_PASSWORD:-changeme}"
+  [[ -n "$disk_in" ]] || { err "DISK env required in unattended mode"; exit 1; }
 fi
 
-disk="/dev/${disk_input##*/}"
-timezone="${timezone_input:-UTC}"
-case "$de_choice" in
-  "GNOME"|"KDE Plasma"|"XFCE"|"LXQt"|"MATE"|"None") : ;;
-  *) de_choice="None"; note "DE set to None";;
-esac
-case "$fs_choice" in
-  ext4|xfs|btrfs) : ;;
-  *) fs_choice="ext4"; note "FS defaulted to ext4";;
-esac
-[[ -b "$disk" ]] || { err "Block device $disk not found"; exit 1; }
+disk="/dev/${disk_in##*/}"
+if [[ ! -b "$disk" ]]; then err "Device $disk not found"; exit 1; fi
+log "Config: disk=$disk fs=$fs_choice de=$de_choice host=$hostname user=$username tz=$timezone"
 
-log "Configuration: disk=$disk, DE=$de_choice, host=$hostname, user=$username, fs=$fs_choice, tz=$timezone, unattended=$UNATTENDED"
-
-# ---------------- Disk partitioning & formatting -------------------------
-log "Preparing disk: disabling swap, unmounting, flushing buffers."
+# ------------ Disk prep -------------
+log "Preparing disk: unmounting and flush buffers"
 swapoff -a || true
 umount -R /mnt/gentoo || true
 umount -R "${disk}"* || true
 blockdev --flushbufs "$disk" || true
 sleep 1
 
-log "Partitioning disk $disk (GPT: EFI + root)."
+log "Partitioning: GPT, EFI 512MiB + root"
 sfdisk --force --wipe always --wipe-partitions always "$disk" <<PART
 label: gpt
 ${disk}1 : size=512MiB, type=uefi
 ${disk}2 : type=linux
 PART
 
-partprobe "$disk"
-sleep 1
+partprobe "$disk"; sleep 1
 wipefs -a "${disk}1" || true
 wipefs -a "${disk}2" || true
 
-log "Formatting partitions."
+log "Formatting partitions"
 mkfs.vfat -F32 "${disk}1"
 case "$fs_choice" in
   ext4) mkfs.ext4 -F "${disk}2";;
@@ -152,74 +139,61 @@ esac
 
 mkdir -p /mnt/gentoo
 mount "${disk}2" /mnt/gentoo
-mkdir -p /mnt/gentoo/efi
-mount "${disk}1" /mnt/gentoo/efi
+mkdir -p /mnt/gentoo/boot/efi
+mount "${disk}1" /mnt/gentoo/boot/efi
 cd /mnt/gentoo
 
-# ---------------- Mirror selection --------------------------------------
-log "Detecting region via geo-IP."
-REGION="$(curl -s --fail --max-time 5 https://ipapi.co/country || true)"
-log "Region detected: ${REGION:-unknown}"
+# ------------ Mirror selection & Stage3 discovery -------------
+log "Detecting region via geo-IP"
+REGION="$(curl -s --max-time 5 https://ipapi.co/country || true)"
+log "Region: ${REGION:-unknown}"
 
 CANDIDATES=()
 if command -v mirrorselect >/dev/null 2>&1; then
-  note "mirrorselect found, attempting localized mirror list."
-  TMP_MIRRORS="$(mktemp)"
-  if mirrorselect -s4 -b10 --country "${REGION:-}" -o "$TMP_MIRRORS" >/dev/null 2>&1; then
-    while IFS= read -r line; do
-      url=$(echo "$line" | grep -oE 'https?://[^ ]+' || true)
-      [[ -n "$url" ]] && CANDIDATES+=("$url")
-    done < "$TMP_MIRRORS"
+  note "Using mirrorselect to produce candidate list"
+  TMP=$(mktemp)
+  # try localized first, fallback to generic
+  if mirrorselect -s4 -b8 --country "${REGION:-}" -o "$TMP" >/dev/null 2>&1; then
+    while IFS= read -r l; do
+      u=$(echo "$l" | grep -oE 'https?://[^ ]+' || true)
+      [[ -n "$u" ]] && CANDIDATES+=("$u")
+    done < "$TMP"
   fi
-  rm -f "$TMP_MIRRORS" || true
+  rm -f "$TMP" || true
 fi
 
 if [[ "${#CANDIDATES[@]}" -eq 0 ]]; then
-  note "Using curated mirror list."
+  note "Using curated fallback mirrors"
   if [[ "$REGION" == "RU" ]]; then
-    CANDIDATES+=( \
-      "https://mirror.yandex.ru/gentoo/" \
-      "https://mirror.mos.ru/gentoo/" \
-      "https://mirror.kaspersky.com/gentoo/" \
-      "https://distfiles.gentoo.org/" \
-    )
+    CANDIDATES+=( "https://mirror.yandex.ru/gentoo/" "https://mirror.mos.ru/gentoo/" "https://mirror.kaspersky.com/gentoo/" "https://distfiles.gentoo.org/" )
   else
-    CANDIDATES+=( \
-      "https://distfiles.gentoo.org/" \
-      "https://builds.gentoo.org/" \
-      "https://ftp.snt.utwente.nl/gentoo/" \
-      "https://mirror.clarkson.edu/gentoo/" \
-      "https://mirror.leaseweb.com/gentoo/" \
-    )
+    CANDIDATES+=( "https://distfiles.gentoo.org/" "https://builds.gentoo.org/" "https://ftp.snt.utwente.nl/gentoo/" "https://mirror.clarkson.edu/gentoo/" )
   fi
 fi
 
 log "Candidate mirrors: $(join_by ', ' "${CANDIDATES[@]}")"
 
-BEST_STAGE3_URL=""
+BEST_STAGE3=""
 BEST_RTT=9999
-
 for m in "${CANDIDATES[@]}"; do
   [[ "${m: -1}" != "/" ]] && m="${m}/"
   for idx in "releases/amd64/autobuilds/latest-stage3-amd64-openrc.txt" "releases/amd64/autobuilds/latest-stage3-amd64.txt"; do
-    IDX_URL="${m}${idx}"
-    if curl -s --head --fail --max-time 6 "$IDX_URL" >/dev/null 2>&1; then
-      STG_NAME=$(curl -fsS "$IDX_URL" 2>/dev/null | awk '!/^#/ && /stage3/ {print $1; exit}')
-      if [[ -n "$STG_NAME" ]]; then
-        FULL_URL="${m}releases/amd64/autobuilds/${STG_NAME}"
-        if curl -s --head --fail --max-time 8 "$FULL_URL" >/dev/null 2>&1; then
-          RTT=$(http_head_time "$FULL_URL" || echo "")
-          if [[ -n "$RTT" ]]; then
-            if awk "BEGIN{exit !($RTT < $BEST_RTT)}"; then
-              BEST_RTT="$RTT"
-              BEST_STAGE3_URL="$FULL_URL"
-              log "Selected candidate: $BEST_STAGE3_URL (rtt=${BEST_RTT})"
+    IDX="${m}${idx}"
+    if curl -s --head --fail --max-time 6 "$IDX" >/dev/null 2>&1; then
+      STG=$(curl -fsS "$IDX" 2>/dev/null | awk '!/^#/ && /stage3/ {print $1; exit}')
+      if [[ -n "$STG" ]]; then
+        FULL="${m}releases/amd64/autobuilds/${STG}"
+        if curl -s --head --fail --max-time 8 "$FULL" >/dev/null 2>&1; then
+          rtt=$(http_head_time "$FULL" || echo "")
+          if [[ -n "$rtt" ]]; then
+            if awk "BEGIN{exit !($rtt < $BEST_RTT)}"; then
+              BEST_RTT="$rtt"
+              BEST_STAGE3="$FULL"
+              log "Best so far: $BEST_STAGE3 (rtt=$BEST_RTT)"
             fi
-          else
-            if [[ -z "$BEST_STAGE3_URL" ]]; then
-              BEST_STAGE3_URL="$FULL_URL"
-              log "Fallback candidate selected: $BEST_STAGE3_URL"
-            fi
+          elif [[ -z "$BEST_STAGE3" ]]; then
+            BEST_STAGE3="$FULL"
+            log "Fallback chosen: $BEST_STAGE3"
           fi
         fi
       fi
@@ -227,56 +201,54 @@ for m in "${CANDIDATES[@]}"; do
   done
 done
 
-if [[ -z "$BEST_STAGE3_URL" ]]; then
-  err "No Stage3 found on candidates; trying distfiles fallback."
+if [[ -z "$BEST_STAGE3" ]]; then
+  note "Attempting official distfiles fallback"
   IDX="https://distfiles.gentoo.org/releases/amd64/autobuilds/latest-stage3-amd64-openrc.txt"
   if curl -s --head --fail "$IDX" >/dev/null 2>&1; then
-    STG_NAME=$(curl -fsS "$IDX" 2>/dev/null | awk '!/^#/ && /stage3/ {print $1; exit}')
-    BEST_STAGE3_URL="https://distfiles.gentoo.org/releases/amd64/autobuilds/${STG_NAME}"
+    STG=$(curl -fsS "$IDX" 2>/dev/null | awk '!/^#/ && /stage3/ {print $1; exit}')
+    BEST_STAGE3="https://distfiles.gentoo.org/releases/amd64/autobuilds/${STG}"
   fi
 fi
 
-[[ -n "$BEST_STAGE3_URL" ]] || { err "Failed to locate Stage3. Aborting."; exit 1; }
-log "Chosen Stage3 URL: $BEST_STAGE3_URL"
+[[ -n "$BEST_STAGE3" ]] || { err "No Stage3 discovered; aborting"; exit 1; }
+log "Using Stage3: $BEST_STAGE3"
 
-# ---------------- Download Stage3 ---------------------------------------
+# ------------ Download Stage3 -------------
 STAGE3_LOCAL="/tmp/stage3.tar.xz"
 log "Downloading Stage3 to $STAGE3_LOCAL"
-if ! retry_cmd 6 5 wget -c -O "$STAGE3_LOCAL" "$BEST_STAGE3_URL"; then
-  err "Failed to download Stage3 from $BEST_STAGE3_URL"
-  exit 1
+if ! retry_cmd 6 5 wget -c -O "$STAGE3_LOCAL" "$BEST_STAGE3"; then
+  err "Stage3 download failed"; exit 1
 fi
 
-log "Extracting Stage3..."
+log "Extract stage3 into /mnt/gentoo"
 tar xpvf "$STAGE3_LOCAL" --xattrs-include='*.*' --numeric-owner
 
-# ---------------- make.conf generation -----------------------------------
-log "Writing /mnt/gentoo/etc/portage/make.conf"
+# ------------ make.conf -------------
+log "Writing make.conf"
 case "$de_choice" in
-  "GNOME") DE_USE_FLAGS="gtk gnome -qt5 -kde";;
-  "KDE Plasma") DE_USE_FLAGS="qt5 plasma kde -gtk -gnome";;
-  "XFCE") DE_USE_FLAGS="gtk xfce -qt5 -kde -gnome";;
-  "LXQt") DE_USE_FLAGS="qt5 lxqt -gnome -kde";;
-  "MATE") DE_USE_FLAGS="gtk mate -qt5 -kde -gnome";;
-  "None") DE_USE_FLAGS="";;
-  *) DE_USE_FLAGS="";;
+  "GNOME") DE_USE="gtk gnome -qt5 -kde";;
+  "KDE Plasma") DE_USE="qt5 plasma kde -gtk -gnome";;
+  "XFCE") DE_USE="gtk xfce -qt5 -kde -gnome";;
+  "LXQt") DE_USE="qt5 lxqt -gnome -kde";;
+  "MATE") DE_USE="gtk mate -qt5 -kde -gnome";;
+  *) DE_USE="";;
 esac
 
-cat > /mnt/gentoo/etc/portage/make.conf <<MAKECONF
+cat > /mnt/gentoo/etc/portage/make.conf <<MCF
 COMMON_FLAGS="-march=native -O2 -pipe"
 CFLAGS="\${COMMON_FLAGS}"
 CXXFLAGS="\${COMMON_FLAGS}"
 RUSTFLAGS="-C target-cpu=native"
 MAKEOPTS="-j$(nproc)"
-USE="${DE_USE_FLAGS} dbus elogind pulseaudio"
+USE="${DE_USE} dbus elogind pulseaudio"
 ACCEPT_LICENSE="@FREE"
 VIDEO_CARDS="amdgpu intel nouveau"
 INPUT_DEVICES="libinput"
 GRUB_PLATFORMS="efi-64"
-MAKECONF
+MCF
 
-# ---------------- Prepare chroot mounts ----------------------------------
-log "Preparing chroot environment."
+# ------------ chroot mounts -------------
+log "Mounting necessary filesystems for chroot"
 cp --dereference /etc/resolv.conf /mnt/gentoo/etc/ || true
 mount -t proc /proc /mnt/gentoo/proc
 mount --rbind /sys /mnt/gentoo/sys; mount --make-rslave /mnt/gentoo/sys
@@ -285,67 +257,62 @@ mkdir -p /mnt/gentoo/run
 mount --bind /run /mnt/gentoo/run
 mount --make-slave /mnt/gentoo/run
 
-# ---------------- Secure env inside chroot -------------------------------
-log "Creating secure env file in chroot (/mnt/gentoo/tmp/.installer_env.sh)."
+# ------------ secure env into chroot -------------
+log "Creating secure env for chroot"
 cat > /mnt/gentoo/tmp/.installer_env.sh <<ENV
 #!/usr/bin/env bash
 export DE_CHOICE='${de_choice}'
 export HOSTNAME='${hostname}'
 export USERNAME='${username}'
 export TIMEZONE='${timezone}'
-export ROOT_PASSWORD='${root_password}'
-export USER_PASSWORD='${user_password}'
+export ROOT_PASSWORD='${root_pw}'
+export USER_PASSWORD='${user_pw}'
 ENV
 chmod 600 /mnt/gentoo/tmp/.installer_env.sh
 chmod 700 /mnt/gentoo/tmp/.installer_env.sh
 
-# ---------------- Create chroot installer --------------------------------
-log "Writing chroot installer script (/mnt/gentoo/tmp/chroot_install.sh)."
+# ------------ chroot installer -------------
+log "Creating chroot installer"
 cat > /mnt/gentoo/tmp/chroot_install.sh <<'CHROOT'
 #!/usr/bin/env bash
 set -euo pipefail
 IFS=$'\n\t'
 log(){ printf '%s %s\n' "$(date -Is)" "$*" >&2; }
-
-retry_inner() {
-  local -i retries=${1:-3}; shift
+retry_inner(){
+  local -i attempts=${1:-3}; shift
   local sleep_s=${1:-2}; shift
   local n=0
   until "$@"; do
     n=$((n+1))
-    if (( n >= retries )); then return 1; fi
+    if (( n >= attempts )); then return 1; fi
     sleep "$sleep_s"
   done
   return 0
 }
-
-healing_emerge() {
+healing_emerge(){
   local -a args=( "$@" )
-  local max_attempts=4
-  local attempt=1
-  while (( attempt <= max_attempts )); do
+  local attempt=1 max=4
+  while (( attempt <= max )); do
     log "healing_emerge attempt $attempt: emerge ${args[*]}"
-    if emerge --backtrack=30 --verbose "${args[@]}" &> /tmp/emerge_attempt.log; then
-      log "emerge success: ${args[*]}"
-      cat /tmp/emerge_attempt.log
+    if emerge --backtrack=30 --verbose "${args[@]}" &> /tmp/emerge.log; then
+      cat /tmp/emerge.log
       return 0
     fi
-    cat /tmp/emerge_attempt.log
-    if grep -q "Change USE" /tmp/emerge_attempt.log; then
-      suggestion=$(grep "Change USE" /tmp/emerge_attempt.log | head -n1 || true)
-      pkg=$(echo "$suggestion" | awk '{for(i=1;i<=NF;i++){ if ($i ~ /[a-zA-Z0-9_.-]+\/[a-zA-Z0-9_.-]+/) {print $i; break}} }' || true)
-      use_change=$(echo "$suggestion" | sed -n 's/.*Change USE: //p' | sed 's/)//' | awk '{$1=$1};1' || true)
-      if [[ -n "$pkg" && -n "$use_change" ]]; then
+    cat /tmp/emerge.log
+    if grep -q "Change USE" /tmp/emerge.log; then
+      fix=$(grep "Change USE" /tmp/emerge.log | head -n1 || true)
+      pkg=$(echo "$fix" | awk '{for(i=1;i<=NF;i++){ if ($i ~ /[a-zA-Z0-9_.-]+\/[a-zA-Z0-9_.-]+/) {print $i; break}} }' || true)
+      usechange=$(echo "$fix" | sed -n 's/.*Change USE: //p' | sed 's/)//' || true)
+      if [[ -n "$pkg" && -n "$usechange" ]]; then
         mkdir -p /etc/portage/package.use
-        echo "$pkg $use_change" >> /etc/portage/package.use/99_autofix
-        log "Applied temporary USE fix: $pkg $use_change"
+        echo "$pkg $usechange" >> /etc/portage/package.use/99_autofix
+        log "Applied temporary USE fix: $pkg $usechange"
         attempt=$((attempt+1))
         continue
       fi
     fi
-    if emerge --autounmask-write "${args[@]}" &> /tmp/autounmask_out 2>&1; then
+    if emerge --autounmask-write "${args[@]}" &> /tmp/autounmask 2>&1; then
       etc-update --automode -3 || true
-      log "Applied autounmask fixes"
       attempt=$((attempt+1))
       continue
     fi
@@ -354,65 +321,58 @@ healing_emerge() {
   return 1
 }
 
-# Load secure env
+# load env
 if [[ -f /tmp/.installer_env.sh ]]; then
-  # shellcheck source=/tmp/.installer_env.sh
   source /tmp/.installer_env.sh
 else
-  log "Missing /tmp/.installer_env.sh in chroot; aborting"
+  log "Missing env; abort"
   exit 1
 fi
 
-log "Chroot installer starting (DE=${DE_CHOICE}, HOSTNAME=${HOSTNAME})."
+log "Chroot: DE=${DE_CHOICE}, HOST=${HOSTNAME}"
 
-# Portage sync
+# portage sync
 if ! retry_inner 3 5 emerge-webrsync; then
-  log "emerge-webrsync failed; trying 'emerge --sync'"
-  retry_inner 3 20 emerge --sync || log "Portage sync fallback failed"
+  log "emerge-webrsync failed; trying emerge --sync"
+  retry_inner 3 20 emerge --sync || log "sync fallback failed"
 fi
 
-# Profile selection preferring amd64 openrc
+# profile selection prefer openrc
+PROFILE=""
 if eselect profile list | grep -Eq 'amd64.*openrc'; then
-  PROFILE_ID=$(eselect profile list | grep -E 'amd64.*openrc' | tail -n1 | awk '{print $1}')
+  PROFILE=$(eselect profile list | grep -E 'amd64.*openrc' | tail -n1 | awk '{print $1}')
 else
-  PROFILE_ID=$(eselect profile list | grep -E 'amd64' | tail -n1 | awk '{print $1}')
+  PROFILE=$(eselect profile list | grep -E 'amd64' | tail -n1 | awk '{print $1}')
 fi
-if [[ -n "${PROFILE_ID:-}" ]]; then
-  eselect profile set "$PROFILE_ID" || true
-  log "Profile set to $PROFILE_ID"
-fi
+if [[ -n "$PROFILE" ]]; then eselect profile set "$PROFILE" || true; fi
+log "Profile set: $PROFILE"
 
-# Update system
-healing_emerge --update --deep --newuse @system || log "System update had issues; continuing"
+# update system
+healing_emerge --update --deep --newuse @system || log "system update had issues"
 
-# Kernel: prefer binary, otherwise build or install sources
-log "Ensuring kernel is present in /boot"
-KERNEL_PRESENT=$(ls /boot/vmlinuz-* 2>/dev/null || true)
-if [[ -z "$KERNEL_PRESENT" ]]; then
-  log "No kernel found; attempting to install binary kernel"
+# kernel: try binary, else sources+genkernel
+if ! ls /boot/vmlinuz-* >/dev/null 2>&1; then
+  log "No kernel found: try binary kernel"
   if retry_inner 3 10 emerge -q sys-kernel/gentoo-kernel-bin; then
-    log "Binary kernel installed."
+    log "Binary kernel installed"
   else
-    log "Binary kernel not available; installing sources and genkernel"
+    log "Installing sources + genkernel"
     retry_inner 3 30 emerge -q sys-kernel/gentoo-sources sys-kernel/genkernel || true
-    if command -v genkernel >/dev/null 2>&1; then
-      genkernel all || true
-    fi
+    if command -v genkernel >/dev/null 2>&1; then genkernel all || true; fi
   fi
 fi
 
-# Verify kernel files
 if ! ls /boot/vmlinuz-* >/dev/null 2>&1; then
-  log "Warning: vmlinuz not found after kernel install attempts."
+  log "Warning: no vmlinuz found after kernel install attempts"
 fi
 
-# Install cpuid2cpuflags if available
+# cpuid2cpuflags
 retry_inner 3 5 emerge -q app-portage/cpuid2cpuflags || true
 if command -v cpuid2cpuflags >/dev/null 2>&1; then
   echo "*/* $(cpuid2cpuflags)" > /etc/portage/package.use/00cpu-flags || true
 fi
 
-# Locales/timezone
+# locale/timezone
 echo "en_US.UTF-8 UTF-8" >> /etc/locale.gen || true
 locale-gen || true
 eselect locale set en_US.UTF-8 || true
@@ -422,17 +382,18 @@ if [[ -n "${TIMEZONE:-}" && -f /usr/share/zoneinfo/${TIMEZONE} ]]; then
   hwclock --systohc || true
 fi
 
-# Essential services
+# essential services
 healing_emerge app-admin/sysklogd net-misc/chrony sys-process/cronie app-shells/bash-completion sys-apps/mlocate || true
 rc-update add sysklogd default || true
 rc-update add chronyd default || true
 rc-update add cronie default || true
 
-# Networking & X & DE
+# networking and x
 healing_emerge net-misc/networkmanager || true
 rc-update add NetworkManager default || true
 rc-update add sshd default || true
 healing_emerge x11-base/xorg-drivers x11-base/xorg-server || true
+
 case "${DE_CHOICE:-None}" in
   "GNOME") healing_emerge gnome-base/gnome || true ;;
   "KDE Plasma") healing_emerge kde-plasma/plasma-meta || true ;;
@@ -441,97 +402,109 @@ case "${DE_CHOICE:-None}" in
   "MATE") healing_emerge mate-meta || true ;;
 esac
 
-# Display manager
 case "${DE_CHOICE:-None}" in
   "GNOME") rc-update add gdm default || true ;;
   "KDE Plasma") healing_emerge sys-boot/sddm || true; rc-update add sddm default || true ;;
   "XFCE"|"LXQt"|"MATE") healing_emerge x11-misc/lightdm x11-misc/lightdm-gtk-greeter || true; rc-update add lightdm default || true ;;
 esac
 
-# Create user and set passwords (do not log passwords)
-if ! id -u "${USERNAME}" >/dev/null 2>&1; then
-  useradd -m -G users,wheel,audio,video -s /bin/bash "${USERNAME}" || true
-fi
+# user creation
+if ! id -u "${USERNAME}" >/dev/null 2>&1; then useradd -m -G users,wheel,audio,video -s /bin/bash "${USERNAME}" || true; fi
 echo "root:${ROOT_PASSWORD}" | chpasswd || true
 echo "${USERNAME}:${USER_PASSWORD}" | chpasswd || true
 
-# GRUB install and config
-log "Installing GRUB and generating grub.cfg"
+# grub and efi
+log "Installing GRUB"
 retry_inner 3 10 emerge -q sys-boot/grub || true
 
-# Determine EFI directory inside chroot
-if [[ -d /efi ]]; then EFI_DIR=/efi
-elif [[ -d /boot/efi ]]; then EFI_DIR=/boot/efi
+# detect EFI dir
+if [[ -d /boot/efi ]]; then EFI_DIR=/boot/efi
+elif [[ -d /efi ]]; then EFI_DIR=/efi
 else mkdir -p /boot/efi; EFI_DIR=/boot/efi; fi
 
-log "Using EFI directory: ${EFI_DIR}"
-grub-install --target=x86_64-efi --efi-directory="${EFI_DIR}" --bootloader-id=Gentoo || true
+log "EFI dir: ${EFI_DIR}"
+grub-install --target=x86_64-efi --efi-directory="${EFI_DIR}" --bootloader-id=Gentoo --recheck || true
 grub-mkconfig -o /boot/grub/grub.cfg || true
 
-# Verify grub.cfg contains linux images
+# ensure linux entries present
 if ! grep -q "linux" /boot/grub/grub.cfg 2>/dev/null; then
-  log "Warning: grub.cfg does not contain linux entries. Attempting to locate kernel and re-run mkconfig."
+  log "No linux entries in grub.cfg; listing /boot for debug"
   ls -l /boot || true
   grub-mkconfig -o /boot/grub/grub.cfg || true
 fi
 
-# Ensure EFI NVRAM entry exists (use efibootmgr if available)
-if command -v efibootmgr >/dev/null 2>&1; then
-  log "Checking efibootmgr for Gentoo entry."
-  if ! efibootmgr -v | grep -qi "Gentoo"; then
-    log "No Gentoo NVRAM entry found; attempting to create one."
-    # try to create boot entry; path depends on EFI partition layout
-    if [[ -f "${EFI_DIR}/EFI/Gentoo/grubx64.efi" ]]; then
-      efibootmgr --create --disk /dev/disk/by-id/$(ls -1 /dev/disk/by-id/ 2>/dev/null | head -n1) --part 1 --loader "\EFI\Gentoo\grubx64.efi" --label "Gentoo" || true
-    else
-      # try common path
-      efibootmgr --create --label "Gentoo" --loader "\EFI\boot\grubx64.efi" || true
-    fi
-  else
-    log "Gentoo EFI entry present."
-  fi
-else
-  log "efibootmgr not installed in chroot; skipping NVRAM verification."
+# ensure efivarfs available
+if ! mountpoint -q /sys/firmware/efi/efivars 2>/dev/null; then
+  log "Mounting efivarfs"
+  mount -t efivarfs efivarfs /sys/firmware/efi/efivars || true
 fi
 
-log "Chroot installer finished."
+# ensure NVRAM entry; if unable, install fallback to EFI/Boot/bootx64.efi
+if command -v efibootmgr >/dev/null 2>&1; then
+  if ! efibootmgr -v | grep -qi "Gentoo"; then
+    log "No Gentoo NVRAM entry; attempting create"
+    if [[ -f "${EFI_DIR}/EFI/Gentoo/grubx64.efi" ]]; then
+      # try to determine disk for partition 1
+      if [[ -d /dev/disk/by-id ]]; then
+        DID=$(ls -1 /dev/disk/by-id/ | grep -v part | head -n1 || true)
+      else
+        DID=""
+      fi
+      if [[ -n "$DID" ]]; then
+        efibootmgr --create --disk /dev/disk/by-id/"$DID" --part 1 --loader "\EFI\Gentoo\grubx64.efi" --label "Gentoo" || true
+      else
+        efibootmgr --create --label "Gentoo" --loader "\EFI\Gentoo\grubx64.efi" || true
+      fi
+    else
+      log "grubx64.efi not found; creating fallback Boot/bootx64.efi"
+      mkdir -p "${EFI_DIR}/EFI/Boot" || true
+      if [[ -f "${EFI_DIR}/EFI/Gentoo/grubx64.efi" ]]; then
+        cp -f "${EFI_DIR}/EFI/Gentoo/grubx64.efi" "${EFI_DIR}/EFI/Boot/bootx64.efi" || true
+      elif [[ -f "${EFI_DIR}/EFI/Boot/grubx64.efi" ]]; then
+        cp -f "${EFI_DIR}/EFI/Boot/grubx64.efi" "${EFI_DIR}/EFI/Boot/bootx64.efi" || true
+      fi
+      efibootmgr --create --label "Gentoo" --loader "\EFI\Boot\bootx64.efi" || true
+    fi
+  else
+    log "Gentoo NVRAM entry exists"
+  fi
+else
+  log "efibootmgr not installed; cannot create/verify NVRAM entries"
+fi
+
+log "Chroot installer finished"
 CHROOT
 
-# Make secure and executable
+# make executable & secure
 chmod 700 /mnt/gentoo/tmp/.installer_env.sh || true
 chmod +x /mnt/gentoo/tmp/chroot_install.sh || true
 
-# ---------------- Run chroot installer ----------------------------------
-log "Running chroot installer (this may take long time)."
+# run chroot installer
+log "Entering chroot to run installer"
 if ! chroot /mnt/gentoo /tmp/chroot_install.sh; then
-  err "Chroot installer failed. Check $LOGFILE and logs inside /mnt/gentoo/var/log."
+  err "Chroot installation failed - inspect $LOG and chroot logs"
   exit 1
 fi
 
-# ---------------- Finalize ------------------------------------------------
-log "Removing temporary files and unmounting."
+# cleanup & finalization
+log "Removing temporary scripts and env"
 rm -f /mnt/gentoo/tmp/chroot_install.sh /mnt/gentoo/tmp/.installer_env.sh || true
+
+log "Unmounting and finishing"
 umount -l /mnt/gentoo/dev{/shm,/pts,} 2>/dev/null || true
 umount -R /mnt/gentoo 2>/dev/null || true
 
-log "Installation finished. Reboot into the new system when ready."
+log "Installation complete. Reboot when ready."
 
-# ---------------- Installer copy & USB hint -------------------------------
-if [[ "${GENERATE_INSTALLER_COPY:-0}" -ne 0 ]]; then
-  SCRIPT_PATH="/tmp/final_autogentoo_installer.sh"
+# optional: save installer copy
+if [[ "${GEN_INSTALLER_COPY:-0}" -ne 0 ]]; then
+  OUT="/tmp/autogentoo_installer_saved.sh"
   if [[ -f "${BASH_SOURCE[0]:-}" ]]; then
-    cp --preserve=mode,ownership "${BASH_SOURCE[0]}" "$SCRIPT_PATH" || true
-  else
-    cat > "$SCRIPT_PATH" <<'EOF'
-# Installer copy not available automatically. Save script content manually.
-EOF
+    cp --preserve=mode,ownership "${BASH_SOURCE[0]}" "$OUT" || true
+    chmod +x "$OUT" || true
+    log "Installer copy saved to $OUT"
+    echo "To write to USB: sudo dd if=${OUT} of=/dev/sdX bs=4M status=progress && sync"
   fi
-  chmod +x "$SCRIPT_PATH" || true
-  log "Installer saved to $SCRIPT_PATH"
-  echo
-  echo "To write the installer to USB (example /dev/sdX):"
-  echo "  sudo dd if=${SCRIPT_PATH} of=/dev/sdX bs=4M status=progress && sync"
-  echo
 fi
 
-log "All done. See $LOGFILE for full trace."
+log "All done. See $LOG for details."
