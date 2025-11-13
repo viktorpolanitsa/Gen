@@ -15,6 +15,7 @@
 # WARNING: This script WILL ERASE data on the selected disk. Use only on systems
 # where you accept complete disk reformat. Test in VM first.
 set -euo pipefail
+export TZ="UTC"
 IFS=$'\n\t'
 
 # ---------------- Logging -------------------------------------------------
