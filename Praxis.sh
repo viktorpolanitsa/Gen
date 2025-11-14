@@ -10,6 +10,7 @@
 #  - Chroot installer with self-healing emerge heuristics, kernel install fallback
 #  - GRUB installation with NVRAM verification, --removable fallback (bootx64.efi)
 #  - efivarfs handling, efibootmgr checks & creation
+#  - fstab generation
 #  - Logging, retries, safe cleanup (trap)
 #
 # WARNING: This script WILL ERASE TARGET DISK. Test in VM first.
@@ -46,14 +47,15 @@ retry_cmd(){
 
 http_head_time(){
   local url="$1"
-  curl -s -o /dev/null -w '%{time_total}' --head --max-time 8 "$url" 2>/dev/null || echo ""
+  curl -s -o /dev/null -w '%{time_total}' --head --max-time 8 "$url" 2>/dev/null || echo "9999"
 }
 
 join_by(){ local IFS="$1"; shift; echo "$*"; }
 
 cleanup(){
   log "Cleanup: attempting to unmount and remove temp files"
-  rm -f /mnt/gentoo/tmp/.installer_env.sh 2>/dev/null || true
+  ## FIX: Added chroot_install.sh to cleanup
+  rm -f /mnt/gentoo/tmp/.installer_env.sh /mnt/gentoo/tmp/chroot_install.sh 2>/dev/null || true
   umount -l /mnt/gentoo/dev{/shm,/pts,} 2>/dev/null || true
   umount -l /mnt/gentoo/run 2>/dev/null || true
   umount -R /mnt/gentoo 2>/dev/null || true
@@ -113,34 +115,41 @@ log "Config: disk=$disk fs=$fs_choice de=$de_choice host=$hostname user=$usernam
 # ------------ Disk prep -------------
 log "Preparing disk: unmounting and flush buffers"
 swapoff -a || true
+## FIX: Safer unmounting. Unmount only partitions on the target disk.
+findmnt -R /mnt/gentoo | awk 'NR>1 {print $1}' | xargs -r umount -f || true
+findmnt -n -o SOURCE --target "$disk" | xargs -r umount -f || true
 umount -R /mnt/gentoo || true
-umount -R "${disk}"* || true
 blockdev --flushbufs "$disk" || true
 sleep 1
 
 log "Partitioning: GPT, EFI 512MiB + root"
 sfdisk --force --wipe always --wipe-partitions always "$disk" <<PART
 label: gpt
-${disk}1 : size=512MiB, type=uefi
-${disk}2 : type=linux
+,512M,U,*
+,,L
 PART
 
 partprobe "$disk"; sleep 1
-wipefs -a "${disk}1" || true
-wipefs -a "${disk}2" || true
+## FIX: Determine partition names robustly
+efi_part=$(lsblk -np -o NAME "${disk}" | sed -n 2p)
+root_part=$(lsblk -np -o NAME "${disk}" | sed -n 3p)
+[[ -b "$efi_part" && -b "$root_part" ]] || { err "Could not determine partition devices"; exit 1; }
 
-log "Formatting partitions"
-mkfs.vfat -F32 "${disk}1"
+wipefs -a "$efi_part" || true
+wipefs -a "$root_part" || true
+
+log "Formatting partitions: ${efi_part} (EFI), ${root_part} (root)"
+mkfs.vfat -F32 "$efi_part"
 case "$fs_choice" in
-  ext4) mkfs.ext4 -F "${disk}2";;
-  xfs) mkfs.xfs -f "${disk}2";;
-  btrfs) mkfs.btrfs -f "${disk}2";;
+  ext4) mkfs.ext4 -F "$root_part";;
+  xfs) mkfs.xfs -f "$root_part";;
+  btrfs) mkfs.btrfs -f "$root_part";;
 esac
 
 mkdir -p /mnt/gentoo
-mount "${disk}2" /mnt/gentoo
+mount "$root_part" /mnt/gentoo
 mkdir -p /mnt/gentoo/boot/efi
-mount "${disk}1" /mnt/gentoo/boot/efi
+mount "$efi_part" /mnt/gentoo/boot/efi
 cd /mnt/gentoo
 
 # ------------ Mirror selection & Stage3 discovery -------------
@@ -152,7 +161,7 @@ CANDIDATES=()
 if command -v mirrorselect >/dev/null 2>&1; then
   note "Using mirrorselect to produce candidate list"
   TMP=$(mktemp)
-  # try localized first, fallback to generic
+  trap 'rm -f "$TMP"' EXIT
   if mirrorselect -s4 -b8 --country "${REGION:-}" -o "$TMP" >/dev/null 2>&1; then
     while IFS= read -r l; do
       u=$(echo "$l" | grep -oE 'https?://[^ ]+' || true)
@@ -160,6 +169,7 @@ if command -v mirrorselect >/dev/null 2>&1; then
     done < "$TMP"
   fi
   rm -f "$TMP" || true
+  trap - EXIT # remove specific trap
 fi
 
 if [[ "${#CANDIDATES[@]}" -eq 0 ]]; then
@@ -173,44 +183,53 @@ fi
 
 log "Candidate mirrors: $(join_by ', ' "${CANDIDATES[@]}")"
 
+## FIX: Reworked mirror selection logic for correctness and robustness
 BEST_STAGE3=""
-BEST_RTT=9999
+BEST_RTT="9999"
+VALID_STAGE3_URLS=()
+
 for m in "${CANDIDATES[@]}"; do
   [[ "${m: -1}" != "/" ]] && m="${m}/"
   for idx in "releases/amd64/autobuilds/latest-stage3-amd64-openrc.txt" "releases/amd64/autobuilds/latest-stage3-amd64.txt"; do
-    IDX="${m}${idx}"
-    if curl -s --head --fail --max-time 6 "$IDX" >/dev/null 2>&1; then
-      STG=$(curl -fsS "$IDX" 2>/dev/null | awk '!/^#/ && /stage3/ {print $1; exit}')
-      if [[ -n "$STG" ]]; then
-        FULL="${m}releases/amd64/autobuilds/${STG}"
-        if curl -s --head --fail --max-time 8 "$FULL" >/dev/null 2>&1; then
-          rtt=$(http_head_time "$FULL" || echo "")
-          if [[ -n "$rtt" ]]; then
-            if awk "BEGIN{exit !($rtt < $BEST_RTT)}"; then
-              BEST_RTT="$rtt"
-              BEST_STAGE3="$FULL"
-              log "Best so far: $BEST_STAGE3 (rtt=$BEST_RTT)"
-            fi
-          elif [[ -z "$BEST_STAGE3" ]]; then
-            BEST_STAGE3="$FULL"
-            log "Fallback chosen: $BEST_STAGE3"
-          fi
+    IDX_URL="${m}${idx}"
+    if curl -s --head --fail --max-time 6 "$IDX_URL" >/dev/null 2>&1; then
+      STG_FILE=$(curl -fsS "$IDX_URL" 2>/dev/null | awk '!/^#/ && /stage3/ {print $1; exit}')
+      if [[ -n "$STG_FILE" ]]; then
+        FULL_URL="${m}releases/amd64/autobuilds/${STG_FILE}"
+        if curl -s --head --fail --max-time 8 "$FULL_URL" >/dev/null 2>&1; then
+          VALID_STAGE3_URLS+=("$FULL_URL")
+          log "Found valid Stage3: $FULL_URL"
+          break # Found a valid stage3 from this mirror, move to next mirror
         fi
       fi
     fi
   done
 done
 
-if [[ -z "$BEST_STAGE3" ]]; then
-  note "Attempting official distfiles fallback"
+if [[ ${#VALID_STAGE3_URLS[@]} -eq 0 ]]; then
+  note "No Stage3 found in mirrors, attempting official distfiles fallback"
   IDX="https://distfiles.gentoo.org/releases/amd64/autobuilds/latest-stage3-amd64-openrc.txt"
-  if curl -s --head --fail "$IDX" >/dev/null 2>&1; then
-    STG=$(curl -fsS "$IDX" 2>/dev/null | awk '!/^#/ && /stage3/ {print $1; exit}')
-    BEST_STAGE3="https://distfiles.gentoo.org/releases/amd64/autobuilds/${STG}"
+  STG=$(curl -fsS "$IDX" 2>/dev/null | awk '!/^#/ && /stage3/ {print $1; exit}')
+  if [[ -n "$STG" ]]; then
+    VALID_STAGE3_URLS+=("https://distfiles.gentoo.org/releases/amd64/autobuilds/${STG}")
   fi
 fi
 
-[[ -n "$BEST_STAGE3" ]] || { err "No Stage3 discovered; aborting"; exit 1; }
+[[ ${#VALID_STAGE3_URLS[@]} -gt 0 ]] || { err "No Stage3 discovered; aborting"; exit 1; }
+
+log "Ranking ${#VALID_STAGE3_URLS[@]} valid Stage3 URLs by RTT..."
+BEST_STAGE3="${VALID_STAGE3_URLS[0]}" # Default to the first one found
+for url in "${VALID_STAGE3_URLS[@]}"; do
+  rtt=$(http_head_time "$url")
+  log "Checking RTT for $url ... RTT: $rtt"
+  # awk is used for floating point comparison, which bash doesn't support natively
+  if awk "BEGIN{exit !($rtt < $BEST_RTT)}"; then
+    BEST_RTT="$rtt"
+    BEST_STAGE3="$url"
+    log "New best: $BEST_STAGE3 (rtt=$BEST_RTT)"
+  fi
+done
+
 log "Using Stage3: $BEST_STAGE3"
 
 # ------------ Download Stage3 -------------
@@ -267,9 +286,11 @@ export USERNAME='${username}'
 export TIMEZONE='${timezone}'
 export ROOT_PASSWORD='${root_pw}'
 export USER_PASSWORD='${user_pw}'
+export ROOT_PART='${root_part}'
+export EFI_PART='${efi_part}'
 ENV
+## FIX: Set correct permissions (600), removed redundant 700
 chmod 600 /mnt/gentoo/tmp/.installer_env.sh
-chmod 700 /mnt/gentoo/tmp/.installer_env.sh
 
 # ------------ chroot installer -------------
 log "Creating chroot installer"
@@ -299,6 +320,7 @@ healing_emerge(){
       return 0
     fi
     cat /tmp/emerge.log
+    # WARNING: The following parser is extremely brittle and may break with new portage versions.
     if grep -q "Change USE" /tmp/emerge.log; then
       fix=$(grep "Change USE" /tmp/emerge.log | head -n1 || true)
       pkg=$(echo "$fix" | awk '{for(i=1;i<=NF;i++){ if ($i ~ /[a-zA-Z0-9_.-]+\/[a-zA-Z0-9_.-]+/) {print $i; break}} }' || true)
@@ -348,7 +370,10 @@ if [[ -n "$PROFILE" ]]; then eselect profile set "$PROFILE" || true; fi
 log "Profile set: $PROFILE"
 
 # update system
-healing_emerge --update --deep --newuse @system || log "system update had issues"
+healing_emerge --update --deep --newuse @world || log "world update had issues"
+
+## FIX: Install linux-firmware, critical for modern hardware
+healing_emerge sys-kernel/linux-firmware
 
 # kernel: try binary, else sources+genkernel
 if ! ls /boot/vmlinuz-* >/dev/null 2>&1; then
@@ -366,11 +391,23 @@ if ! ls /boot/vmlinuz-* >/dev/null 2>&1; then
   log "Warning: no vmlinuz found after kernel install attempts"
 fi
 
+## FIX: Generate fstab, which was completely missing
+log "Generating fstab"
+echo "# ${ROOT_PART} (root)" >> /etc/fstab
+echo "UUID=$(blkid -s UUID -o value "${ROOT_PART}") / auto defaults,noatime 0 1" >> /etc/fstab
+echo "# ${EFI_PART} (efi)" >> /etc/fstab
+echo "UUID=$(blkid -s UUID -o value "${EFI_PART}") /boot/efi vfat defaults,noatime 0 2" >> /etc/fstab
+
 # cpuid2cpuflags
 retry_inner 3 5 emerge -q app-portage/cpuid2cpuflags || true
 if command -v cpuid2cpuflags >/dev/null 2>&1; then
   echo "*/* $(cpuid2cpuflags)" > /etc/portage/package.use/00cpu-flags || true
 fi
+
+## FIX: Set hostname correctly
+log "Setting hostname"
+echo "hostname=\"${HOSTNAME}\"" > /etc/conf.d/hostname
+echo "${HOSTNAME}" > /etc/hostname
 
 # locale/timezone
 echo "en_US.UTF-8 UTF-8" >> /etc/locale.gen || true
@@ -404,7 +441,7 @@ esac
 
 case "${DE_CHOICE:-None}" in
   "GNOME") rc-update add gdm default || true ;;
-  "KDE Plasma") healing_emerge sys-boot/sddm || true; rc-update add sddm default || true ;;
+  "KDE Plasma") healing_emerge sys-auth/sddm || true; rc-update add sddm default || true ;;
   "XFCE"|"LXQt"|"MATE") healing_emerge x11-misc/lightdm x11-misc/lightdm-gtk-greeter || true; rc-update add lightdm default || true ;;
 esac
 
@@ -415,68 +452,52 @@ echo "${USERNAME}:${USER_PASSWORD}" | chpasswd || true
 
 # grub and efi
 log "Installing GRUB"
-retry_inner 3 10 emerge -q sys-boot/grub || true
+retry_inner 3 10 emerge -q sys-boot/grub sys-boot/efibootmgr || true
 
-# detect EFI dir
-if [[ -d /boot/efi ]]; then EFI_DIR=/boot/efi
-elif [[ -d /efi ]]; then EFI_DIR=/efi
-else mkdir -p /boot/efi; EFI_DIR=/boot/efi; fi
-
+EFI_DIR=/boot/efi
 log "EFI dir: ${EFI_DIR}"
 grub-install --target=x86_64-efi --efi-directory="${EFI_DIR}" --bootloader-id=Gentoo --recheck || true
 grub-mkconfig -o /boot/grub/grub.cfg || true
 
-# ensure linux entries present
 if ! grep -q "linux" /boot/grub/grub.cfg 2>/dev/null; then
   log "No linux entries in grub.cfg; listing /boot for debug"
   ls -l /boot || true
   grub-mkconfig -o /boot/grub/grub.cfg || true
 fi
 
-# ensure efivarfs available
 if ! mountpoint -q /sys/firmware/efi/efivars 2>/dev/null; then
   log "Mounting efivarfs"
   mount -t efivarfs efivarfs /sys/firmware/efi/efivars || true
 fi
 
-# ensure NVRAM entry; if unable, install fallback to EFI/Boot/bootx64.efi
 if command -v efibootmgr >/dev/null 2>&1; then
   if ! efibootmgr -v | grep -qi "Gentoo"; then
     log "No Gentoo NVRAM entry; attempting create"
     if [[ -f "${EFI_DIR}/EFI/Gentoo/grubx64.efi" ]]; then
-      # try to determine disk for partition 1
-      if [[ -d /dev/disk/by-id ]]; then
-        DID=$(ls -1 /dev/disk/by-id/ | grep -v part | head -n1 || true)
-      else
-        DID=""
-      fi
-      if [[ -n "$DID" ]]; then
-        efibootmgr --create --disk /dev/disk/by-id/"$DID" --part 1 --loader "\EFI\Gentoo\grubx64.efi" --label "Gentoo" || true
-      else
-        efibootmgr --create --label "Gentoo" --loader "\EFI\Gentoo\grubx64.efi" || true
-      fi
-    else
-      log "grubx64.efi not found; creating fallback Boot/bootx64.efi"
-      mkdir -p "${EFI_DIR}/EFI/Boot" || true
-      if [[ -f "${EFI_DIR}/EFI/Gentoo/grubx64.efi" ]]; then
-        cp -f "${EFI_DIR}/EFI/Gentoo/grubx64.efi" "${EFI_DIR}/EFI/Boot/bootx64.efi" || true
-      elif [[ -f "${EFI_DIR}/EFI/Boot/grubx64.efi" ]]; then
-        cp -f "${EFI_DIR}/EFI/Boot/grubx64.efi" "${EFI_DIR}/EFI/Boot/bootx64.efi" || true
-      fi
-      efibootmgr --create --label "Gentoo" --loader "\EFI\Boot\bootx64.efi" || true
+      efibootmgr --create --disk "${ROOT_PART%?}" --part 1 --loader "\EFI\Gentoo\grubx64.efi" --label "Gentoo" || true
     fi
-  else
-    log "Gentoo NVRAM entry exists"
+  fi
+  # Fallback to removable media path if entry still not found
+  if ! efibootmgr -v | grep -qi "Gentoo"; then
+    log "NVRAM entry creation failed or not supported, installing to fallback path"
+    mkdir -p "${EFI_DIR}/EFI/Boot" || true
+    if [[ -f "${EFI_DIR}/EFI/Gentoo/grubx64.efi" ]]; then
+      cp -f "${EFI_DIR}/EFI/Gentoo/grubx64.efi" "${EFI_DIR}/EFI/Boot/bootx64.efi" || true
+      log "Installed GRUB to fallback EFI/Boot/bootx64.efi"
+    fi
   fi
 else
-  log "efibootmgr not installed; cannot create/verify NVRAM entries"
+  log "efibootmgr not installed; cannot create/verify NVRAM entries. Relying on fallback path."
+  mkdir -p "${EFI_DIR}/EFI/Boot" || true
+  if [[ -f "${EFI_DIR}/EFI/Gentoo/grubx64.efi" ]]; then
+    cp -f "${EFI_DIR}/EFI/Gentoo/grubx64.efi" "${EFI_DIR}/EFI/Boot/bootx64.efi" || true
+  fi
 fi
 
 log "Chroot installer finished"
 CHROOT
 
-# make executable & secure
-chmod 700 /mnt/gentoo/tmp/.installer_env.sh || true
+# make executable
 chmod +x /mnt/gentoo/tmp/chroot_install.sh || true
 
 # run chroot installer
@@ -487,7 +508,7 @@ if ! chroot /mnt/gentoo /tmp/chroot_install.sh; then
 fi
 
 # cleanup & finalization
-log "Removing temporary scripts and env"
+log "Final cleanup"
 rm -f /mnt/gentoo/tmp/chroot_install.sh /mnt/gentoo/tmp/.installer_env.sh || true
 
 log "Unmounting and finishing"
@@ -496,14 +517,12 @@ umount -R /mnt/gentoo 2>/dev/null || true
 
 log "Installation complete. Reboot when ready."
 
-# optional: save installer copy
 if [[ "${GEN_INSTALLER_COPY:-0}" -ne 0 ]]; then
   OUT="/tmp/autogentoo_installer_saved.sh"
   if [[ -f "${BASH_SOURCE[0]:-}" ]]; then
     cp --preserve=mode,ownership "${BASH_SOURCE[0]}" "$OUT" || true
     chmod +x "$OUT" || true
     log "Installer copy saved to $OUT"
-    echo "To write to USB: sudo dd if=${OUT} of=/dev/sdX bs=4M status=progress && sync"
   fi
 fi
 
