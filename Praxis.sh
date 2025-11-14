@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/usr/-bin/env bash
 # autogentoo_final_full.sh
 # Fully consolidated Gentoo installer (single-file)
 # Features:
@@ -115,7 +115,6 @@ log "Config: disk=$disk fs=$fs_choice de=$de_choice host=$hostname user=$usernam
 # ------------ Disk prep -------------
 log "Preparing disk: unmounting and flush buffers"
 swapoff -a || true
-## FIX: Safer unmounting. Unmount only partitions on the target disk.
 findmnt -R /mnt/gentoo | awk 'NR>1 {print $1}' | xargs -r umount -f || true
 findmnt -n -o SOURCE --target "$disk" | xargs -r umount -f || true
 umount -R /mnt/gentoo || true
@@ -129,11 +128,31 @@ label: gpt
 ,,L
 PART
 
-partprobe "$disk"; sleep 1
-## FIX: Determine partition names robustly
-efi_part=$(lsblk -np -o NAME "${disk}" | sed -n 2p)
-root_part=$(lsblk -np -o NAME "${disk}" | sed -n 3p)
-[[ -b "$efi_part" && -b "$root_part" ]] || { err "Could not determine partition devices"; exit 1; }
+partprobe "$disk"; sleep 2 # Увеличим задержку
+
+## FIX 2.0: Determine partition names explicitly based on disk type
+if [[ "$disk" =~ "nvme" ]]; then
+  efi_part="${disk}p1"
+  root_part="${disk}p2"
+else
+  efi_part="${disk}1"
+  root_part="${disk}2"
+fi
+
+log "Determined partitions: EFI=${efi_part}, Root=${root_part}"
+
+# Добавим цикл ожидания для максимальной надёжности
+for i in {1..5}; do
+  if [[ -b "$efi_part" && -b "$root_part" ]]; then
+    log "Partitions are visible to the kernel."
+    break
+  fi
+  log "Waiting for partitions to become visible... (${i}/5)"
+  sleep 1
+done
+
+[[ -b "$efi_part" && -b "$root_part" ]] || { err "Could not determine partition devices after waiting"; exit 1; }
+
 
 wipefs -a "$efi_part" || true
 wipefs -a "$root_part" || true
@@ -289,7 +308,6 @@ export USER_PASSWORD='${user_pw}'
 export ROOT_PART='${root_part}'
 export EFI_PART='${efi_part}'
 ENV
-## FIX: Set correct permissions (600), removed redundant 700
 chmod 600 /mnt/gentoo/tmp/.installer_env.sh
 
 # ------------ chroot installer -------------
