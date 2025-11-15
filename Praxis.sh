@@ -139,8 +139,8 @@ mkdir -p /mnt/gentoo/boot/efi
 mount "${disk}1" /mnt/gentoo/boot/efi
 cd /mnt/gentoo
 
-# ---------------- fstab generation ----------------
-# placeholder (the real fstab will be generated after extracting Stage3)
+# ---------------- fstab generation placeholder ----------------
+# (Actual fstab is generated after Stage3 extraction)
 
 # ---------------- Mirror selection & Stage3 discovery ----------------
 log "Detecting region (geo-IP)"
@@ -159,7 +159,6 @@ if command -v mirrorselect >/dev/null 2>&1; then
   fi
   rm -f "$TMP" || true
 fi
-
 if [[ "${#CANDIDATES[@]}" -eq 0 ]]; then
   note "Using curated mirror list"
   if [[ "$REGION" == "RU" ]]; then
@@ -168,7 +167,6 @@ if [[ "${#CANDIDATES[@]}" -eq 0 ]]; then
     CANDIDATES+=( "https://distfiles.gentoo.org/" "https://builds.gentoo.org/" "https://ftp.snt.utwente.nl/gentoo/" "https://mirror.clarkson.edu/gentoo/" )
   fi
 fi
-
 log "Candidate mirrors: $(join_by ', ' "${CANDIDATES[@]}")"
 
 BEST_STAGE3=""
@@ -198,7 +196,6 @@ for m in "${CANDIDATES[@]}"; do
     fi
   done
 done
-
 if [[ -z "$BEST_STAGE3" ]]; then
   note "Trying official distfiles as fallback"
   IDX="https://distfiles.gentoo.org/releases/amd64/autobuilds/latest-stage3-amd64-openrc.txt"
@@ -207,7 +204,6 @@ if [[ -z "$BEST_STAGE3" ]]; then
     BEST_STAGE3="https://distfiles.gentoo.org/releases/amd64/autobuilds/${STG}"
   fi
 fi
-
 [[ -n "$BEST_STAGE3" ]] || { err "Failed to locate a Stage3 tarball on candidate mirrors"; exit 1; }
 log "Stage3 chosen: $BEST_STAGE3"
 
@@ -217,28 +213,23 @@ log "Downloading Stage3 -> $STAGE3_LOCAL"
 if ! retry_cmd 6 5 wget -c -O "$STAGE3_LOCAL" "$BEST_STAGE3"; then
   err "Stage3 download failed"; exit 1
 fi
-
 log "Extracting Stage3 into /mnt/gentoo"
 tar xpvf "$STAGE3_LOCAL" --xattrs-include='*.*' --numeric-owner
 
-  # ---------------- fstab generation ----------------
-  # Now that the Stage3 has been extracted, `/mnt/gentoo/etc` exists and we can
-  # safely create an `/etc/fstab`. The Gentoo installation guide recommends
-  # defining root and EFI partitions using UUIDs in fstab so the kernel knows
-  # what to mount at boot.
-  log "Generating fstab for root and EFI partitions"
-  ROOT_UUID=$(blkid -s UUID -o value "${disk}2" 2>/dev/null || true)
-  EFI_UUID=$(blkid -s UUID -o value "${disk}1" 2>/dev/null || true)
-  if [[ -n "$ROOT_UUID" && -n "$EFI_UUID" ]]; then
-    mkdir -p /mnt/gentoo/etc || true
-    cat > /mnt/gentoo/etc/fstab <<EOF
+# ---------------- Generate fstab ----------------
+log "Generating fstab for root and EFI partitions"
+ROOT_UUID=$(blkid -s UUID -o value "${disk}2" 2>/dev/null || true)
+EFI_UUID=$(blkid -s UUID -o value "${disk}1" 2>/dev/null || true)
+if [[ -n "$ROOT_UUID" && -n "$EFI_UUID" ]]; then
+  mkdir -p /mnt/gentoo/etc || true
+  cat > /mnt/gentoo/etc/fstab <<EOF
 UUID=${ROOT_UUID}  /          ${fs_choice}  noatime      0 1
 UUID=${EFI_UUID}   /boot/efi  vfat        noatime      0 2
 EOF
-    log "fstab created with ROOT_UUID=$ROOT_UUID and EFI_UUID=$EFI_UUID"
-  else
-    note "Unable to determine UUIDs for fstab; please create /mnt/gentoo/etc/fstab manually"
-  fi
+  log "fstab created with ROOT_UUID=$ROOT_UUID and EFI_UUID=$EFI_UUID"
+else
+  note "Unable to determine UUIDs for fstab; please create /mnt/gentoo/etc/fstab manually"
+fi
 
 # ---------------- make.conf ----------------
 log "Generating /mnt/gentoo/etc/portage/make.conf"
@@ -250,7 +241,6 @@ case "$de_choice" in
   LXQt) DE_USE="qt5 lxqt -gnome -kde";;
   *) DE_USE="";;
 esac
-
 cat > /mnt/gentoo/etc/portage/make.conf <<MCF
 COMMON_FLAGS="-march=native -O2 -pipe"
 CFLAGS="\${COMMON_FLAGS}"
@@ -264,76 +254,130 @@ INPUT_DEVICES="libinput"
 GRUB_PLATFORMS="efi-64"
 MCF
 
-# ---------------- chroot setup ----------------
-log "Preparing chroot environment"
-# mount kernel filesystems
-for d in /dev /proc /sys /run; do mount --rbind "$d" "/mnt/gentoo$d" || true; done
+# ---------------- chroot mounts ----------------
+log "Preparing chroot mounts and copying resolv.conf"
+cp --dereference /etc/resolv.conf /mnt/gentoo/etc/ || true
+mount -t proc /proc /mnt/gentoo/proc
+mount --rbind /sys /mnt/gentoo/sys; mount --make-rslave /mnt/gentoo/sys
+mount --rbind /dev /mnt/gentoo/dev; mount --make-rslave /mnt/gentoo/dev
+mkdir -p /mnt/gentoo/run
+mount --bind /run /mnt/gentoo/run
+mount --make-slave /mnt/gentoo/run
 
-# copy DNS config
-cp -L /etc/resolv.conf /mnt/gentoo/etc/ || true
-
-# install helper script inside chroot
-cat > /mnt/gentoo/tmp/.installer_env.sh <<'ENVEOF'
-export FS_CHOICE='${fs_choice}'
+# ---------------- secure env ----------------
+log "Writing secure environment to /mnt/gentoo/tmp/.installer_env.sh"
+cat > /mnt/gentoo/tmp/.installer_env.sh <<ENV
+#!/usr/bin/env bash
 export DE_CHOICE='${de_choice}'
 export HOSTNAME='${hostname}'
 export USERNAME='${username}'
 export TIMEZONE='${timezone}'
 export ROOT_PASSWORD='${root_pw}'
 export USER_PASSWORD='${user_pw}'
-ENVEOF
+ENV
+chmod 600 /mnt/gentoo/tmp/.installer_env.sh
+chmod 700 /mnt/gentoo/tmp/.installer_env.sh
 
-# install chroot script
+# ---------------- chroot script ----------------
+log "Creating chroot installer script"
 cat > /mnt/gentoo/tmp/chroot_install.sh <<'CHROOT'
 #!/usr/bin/env bash
 set -euo pipefail
-# source env
-source /tmp/.installer_env.sh || true
-
-log() { printf '%s %s\n' "$(date -Is)" "$*"; }
-retry_inner() {
-  local -i tries=${1:-3}; shift
+IFS=$'\n\t'
+log(){ printf '%s %s\n' "$(date -Is)" "$*" >&2; }
+retry_inner(){
+  local -i attempts=${1:-3}; shift
   local sleep_s=${1:-2}; shift
   local n=0
   until "$@"; do
     n=$((n+1))
-    if (( n >= tries )); then return 1; fi
+    if (( n >= attempts )); then return 1; fi
     sleep "$sleep_s"
   done
   return 0
 }
-healing_emerge() {
-  local ok=0
-  if command -v emerge >/dev/null 2>&1; then
-    if retry_inner 3 10 emerge -q --autounmask-write --ask=n "$@"; then ok=1; fi
-  fi
-  if (( ok == 0 )); then
-    log "Running revdep-rebuild and dispatch-conf"
-    if command -v revdep-rebuild >/dev/null 2>&1; then revdep-rebuild -i || true; fi
-    if command -v dispatch-conf >/dev/null 2>&1; then dispatch-conf || true; fi
-    retry_inner 3 10 emerge -q --autounmask-write --ask=n "$@" || true
-  fi
+healing_emerge(){
+  local -a args=( "$@" )
+  local attempt=1 max=4
+  while (( attempt <= max )); do
+    log "healing_emerge attempt $attempt: emerge ${args[*]}"
+    if emerge --backtrack=30 --verbose "${args[@]}" &> /tmp/emerge.log; then
+      cat /tmp/emerge.log
+      return 0
+    fi
+    cat /tmp/emerge.log
+    if grep -q "Change USE" /tmp/emerge.log; then
+      fix=$(grep "Change USE" /tmp/emerge.log | head -n1 || true)
+      pkg=$(echo "$fix" | awk '{for(i=1;i<=NF;i++){ if ($i ~ /[a-zA-Z0-9_.-]+\/[a-zA-Z0-9_.-]+/) {print $i; break}} }' || true)
+      usechange=$(echo "$fix" | sed -n 's/.*Change USE: //p' | sed 's/)//' || true)
+      if [[ -n "$pkg" && -n "$usechange" ]]; then
+        mkdir -p /etc/portage/package.use
+        echo "$pkg $usechange" >> /etc/portage/package.use/99_autofix
+        log "Applied temporary USE fix: $pkg $usechange"
+        attempt=$((attempt+1))
+        continue
+      fi
+    fi
+    if emerge --autounmask-write "${args[@]}" &> /tmp/autounmask 2>&1; then
+      etc-update --automode -3 || true
+      attempt=$((attempt+1))
+      continue
+    fi
+    return 1
+  done
+  return 1
 }
 
-# set hostname
-echo "$HOSTNAME" > /etc/hostname || true
-
-# select profile (prefer merged-usr if available)
-DEFAULT_PROFILE=$(eselect profile list | grep ".*" | awk '/desktop/ {print $2; exit}' || true)
-if [[ -n "$DEFAULT_PROFILE" ]]; then
-  eselect profile set "$DEFAULT_PROFILE" || true
+# load env
+if [[ -f /tmp/.installer_env.sh ]]; then
+  source /tmp/.installer_env.sh
 else
-  eselect profile set 1 || true
+  log "/tmp/.installer_env.sh missing; abort"
+  exit 1
+fi
+log "Chroot started: DE=${DE_CHOICE}, HOSTNAME=${HOSTNAME}"
+
+# Ensure the Portage repository exists & sync
+mkdir -p /var/db/repos/gentoo || true
+if ! retry_inner 3 5 emerge-webrsync; then
+  log "emerge-webrsync failed; attempting emerge --sync as fallback"
+  if ! retry_inner 3 20 emerge --sync; then
+    log "Portage repository sync failed. Unable to continue installation."
+    exit 1
+  fi
 fi
 
-# Accept linux-firmware license
-echo "sys-kernel/linux-firmware linux-firmware" >> /etc/portage/package.license || true
+# Profile selection: prefer merged-usr or amd64 openrc
+log "Selecting appropriate profile"
+PROFILE=""
+if eselect profile list | grep -q 'merged-usr'; then
+  PROFILE=$(eselect profile list | grep 'merged-usr' | awk '{print $1}' | tail -n1 || true)
+fi
+if [[ -z "$PROFILE" ]]; then
+  if eselect profile list | grep -Eq 'amd64.*openrc'; then
+    PROFILE=$(eselect profile list | grep -E 'amd64.*openrc' | tail -n1 | awk '{print $1}')
+  else
+    PROFILE=$(eselect profile list | grep -E 'amd64' | tail -n1 | awk '{print $1}')
+  fi
+fi
+if [[ -n "$PROFILE" ]]; then
+  eselect profile set "$PROFILE" || true
+  log "Profile set to $PROFILE"
+else
+  log "Unable to detect profile automatically; please set manually"
+fi
 
-# install world set
-healing_emerge @system || true
-healing_emerge app-admin/sudo || true
+# Accept linux‑firmware license & keywords
+log "Ensuring linux-firmware license and keyword acceptance"
+mkdir -p /etc/portage/package.license /etc/portage/package.accept_keywords
+echo "sys-kernel/linux-firmware linux-fw-redistributable" > /etc/portage/package.license/linux-firmware || true
+echo "sys-kernel/linux-firmware ~amd64" > /etc/portage/package.accept_keywords/linux-firmware || true
 
-# kernel selection
+# Update system/world
+healing_emerge --update --deep --newuse @world || log "world update had issues; proceeding"
+
+# Kernel: binary first, else sources+genkernel
+log "Kernel: try binary kernel"
 if ! ls /boot/vmlinuz-* >/dev/null 2>&1; then
   if retry_inner 3 10 emerge -q sys-kernel/gentoo-kernel-bin; then
     log "Binary kernel installed"
@@ -343,18 +387,15 @@ if ! ls /boot/vmlinuz-* >/dev/null 2>&1; then
     if command -v genkernel >/dev/null 2>&1; then genkernel all || true; fi
   fi
 fi
+if ! ls /boot/vmlinuz-* >/dev/null 2>&1; then log "Warning: no kernel found"; fi
 
-if ! ls /boot/vmlinuz-* >/dev/null 2>&1; then
-  log "Warning: no kernel found after attempts"
-fi
-
-# cpu flags
+# CPU flags
 retry_inner 3 5 emerge -q app-portage/cpuid2cpuflags || true
 if command -v cpuid2cpuflags >/dev/null 2>&1; then
   echo "*/* $(cpuid2cpuflags)" > /etc/portage/package.use/00cpu-flags || true
 fi
 
-# locales & timezone
+# Locales & timezone
 echo "en_US.UTF-8 UTF-8" >> /etc/locale.gen || true
 locale-gen || true
 eselect locale set en_US.UTF-8 || true
@@ -364,20 +405,18 @@ if [[ -n "${TIMEZONE:-}" && -f /usr/share/zoneinfo/${TIMEZONE} ]]; then
   hwclock --systohc || true
 fi
 
-# essential services
+# Essential services
 healing_emerge app-admin/sysklogd net-misc/chrony sys-process/cronie app-shells/bash-completion sys-apps/mlocate || true
 rc-update add sysklogd default || true
 rc-update add chronyd default || true
 rc-update add cronie default || true
 
-# networking & ssh
-# Install NetworkManager for network management and OpenSSH for the SSH daemon.
-# OpenSSH provides the ssh client and the sshd server, which is required before adding the sshd service to OpenRC.
+# Networking & ssh
 healing_emerge net-misc/networkmanager net-misc/openssh || true
 rc-update add NetworkManager default || true
 rc-update add sshd default || true
 
-# X and DE packages (best-effort)
+# X and desktop environment
 healing_emerge x11-base/xorg-drivers x11-base/xorg-server || true
 case "${DE_CHOICE:-None}" in
   GNOME) healing_emerge gnome-base/gnome || true ;;
@@ -387,54 +426,50 @@ case "${DE_CHOICE:-None}" in
   LXQt) healing_emerge lxqt-meta || true ;;
 esac
 
-# display manager
+# Display manager
 case "${DE_CHOICE:-None}" in
   GNOME) rc-update add gdm default || true ;;
   "KDE Plasma"|KDE) healing_emerge sys-boot/sddm || true; rc-update add sddm default || true ;;
   XFCE|MATE|LXQt) healing_emerge x11-misc/lightdm x11-misc/lightdm-gtk-greeter || true; rc-update add lightdm default || true ;;
 esac
 
-# create user and set passwords
-if ! id -u "${USERNAME}" >/dev/null 2>&1; then useradd -m -G users,wheel,audio,video -s /bin/bash "${USERNAME}" || true; fi
+# Create groups & user, set passwords
+for grp in users wheel audio video; do
+  if ! getent group "$grp" >/dev/null 2>&1; then groupadd "$grp" || true; fi
+done
+if ! id -u "${USERNAME}" >/dev/null 2>&1; then
+  useradd -m -G users,wheel,audio,video -s /bin/bash "${USERNAME}" || true
+fi
 echo "root:${ROOT_PASSWORD}" | chpasswd || true
 echo "${USERNAME}:${USER_PASSWORD}" | chpasswd || true
 
-# install GRUB and configure EFI
+# Install GRUB & configure EFI
 log "Install GRUB and configure EFI"
 retry_inner 3 10 emerge -q sys-boot/grub || true
-
-# pick EFI dir inside chroot
 if [[ -d /boot/efi ]]; then EFI_DIR=/boot/efi
 elif [[ -d /efi ]]; then EFI_DIR=/efi
 else mkdir -p /boot/efi; EFI_DIR=/boot/efi; fi
-
 log "Using EFI directory: ${EFI_DIR}"
-# install with --removable to create fallback bootx64.efi
 grub-install --target=x86_64-efi --efi-directory="${EFI_DIR}" --bootloader-id=Gentoo --recheck --removable || true
 grub-mkconfig -o /boot/grub/grub.cfg || true
-
-# ensure linux entries exist in grub.cfg
 if ! grep -q "linux" /boot/grub/grub.cfg 2>/dev/null; then
   log "grub.cfg lacks linux entries; listing /boot for debug"
   ls -l /boot || true
   grub-mkconfig -o /boot/grub/grub.cfg || true
 fi
 
-# mount efivarfs in chroot to permit efibootmgr writes
+# Mount efivarfs for efibootmgr
 if ! mountpoint -q /sys/firmware/efi/efivars 2>/dev/null; then
   log "Mounting efivarfs inside chroot"
   mount -t efivarfs efivarfs /sys/firmware/efi/efivars || true
 fi
-
-# ensure NVRAM entry exists, else create or fallback
+# Ensure NVRAM entry
 if command -v efibootmgr >/dev/null 2>&1; then
   if ! efibootmgr -v | grep -qi "Gentoo"; then
     log "Trying to create NVRAM entry for Gentoo"
     if [[ -f "${EFI_DIR}/EFI/Gentoo/grubx64.efi" ]]; then
       DISK_DEV=""
-      if [[ -d /dev/disk/by-id ]]; then
-        DISK_DEV=$(ls -1 /dev/disk/by-id/ | grep -v part | head -n1 || true)
-      fi
+      if [[ -d /dev/disk/by-id ]]; then DISK_DEV=$(ls -1 /dev/disk/by-id/ | grep -v part | head -n1 || true); fi
       if [[ -n "$DISK_DEV" ]]; then
         efibootmgr --create --disk /dev/disk/by-id/"$DISK_DEV" --part 1 --loader "\\EFI\\Gentoo\\grubx64.efi" --label "Gentoo" || true
       else
@@ -456,7 +491,6 @@ if command -v efibootmgr >/dev/null 2>&1; then
 else
   log "efibootmgr not available in chroot; NVRAM creation deferred to host-side step"
 fi
-
 log "Chroot installation finished"
 CHROOT
 
@@ -466,12 +500,102 @@ chmod +x /mnt/gentoo/tmp/chroot_install.sh || true
 log "Entering chroot to run installer (this will take time)."
 if ! chroot /mnt/gentoo /tmp/chroot_install.sh; then
   err "Chroot installer failed — inspect $LOG and chroot logs under /mnt/gentoo/var/log"
-  # continue to post-chroot fixes attempt to salvage
 fi
 
 # ---------------- Post-chroot: Ensure EFI fallback + NVRAM (host) ----------------
 log "Host-side EFI fix & NVRAM creation (run on host, not in chroot)"
-
-# mount efivarfs on host if available
 if [[ -d /sys/firmware/efi ]]; then
-  if ! mountpoint -q /sys/firmware/efi/efivars 2>/div><!-- truncated by assistant -->
+  if ! mountpoint -q /sys/firmware/efi/efivars 2>/dev/null; then
+    log "Mounting efivarfs on host"
+    mount -t efivarfs efivarfs /sys/firmware/efi/efivars || true
+  fi
+else
+  err "Host is not booted in UEFI mode; cannot write NVRAM"
+fi
+
+EFI_MOUNT_POINT="/mnt/gentoo/boot/efi"
+if ! mountpoint -q "$EFI_MOUNT_POINT"; then
+  ESP_DEV=""
+  ESP_DEV=$(blkid -t PARTLABEL=EFI -o device 2>/dev/null || true)
+  if [[ -z "$ESP_DEV" ]]; then
+    DEV_CAND=$(lsblk -rno NAME,FSTYPE | awk '$2=="vfat"{print "/dev/"$1}' | head -n1 || true)
+    if [[ -n "$DEV_CAND" ]]; then ESP_DEV="$DEV_CAND"; fi
+  fi
+  if [[ -n "$ESP_DEV" && -b "$ESP_DEV" ]]; then
+    log "Mounting ESP $ESP_DEV -> $EFI_MOUNT_POINT"
+    mkdir -p "$EFI_MOUNT_POINT"
+    mount "$ESP_DEV" "$EFI_MOUNT_POINT" || true
+  else
+    note "Cannot auto-detect ESP. Ensure /mnt/gentoo/boot/efi is mounted correctly."
+  fi
+fi
+
+INSTALLED_GRUB="${EFI_MOUNT_POINT}/EFI/Gentoo/grubx64.efi"
+FALLBACK_DIR="${EFI_MOUNT_POINT}/EFI/Boot"
+FALLBACK_BIN="${FALLBACK_DIR}/bootx64.efi"
+
+if [[ -f "$INSTALLED_GRUB" ]]; then
+  mkdir -p "$FALLBACK_DIR" || true
+  if [[ ! -f "$FALLBACK_BIN" ]] || ! cmp -s "$INSTALLED_GRUB" "$FALLBACK_BIN"; then
+    cp -f "$INSTALLED_GRUB" "$FALLBACK_BIN" || true
+    log "Created fallback EFI: $FALLBACK_BIN"
+  else
+    log "Fallback EFI already present"
+  fi
+else
+  POSSIBLE=$(find /mnt/gentoo/boot /mnt/gentoo/efi -type f -iname "grubx64.efi" -print -quit 2>/dev/null || true)
+  if [[ -n "$POSSIBLE" ]]; then
+    mkdir -p "$FALLBACK_DIR" || true
+    cp -f "$POSSIBLE" "$FALLBACK_BIN" || true
+    log "Copied discovered grub ($POSSIBLE) to fallback $FALLBACK_BIN"
+  else
+    log "No grubx64.efi found; grub-install may have failed in chroot"
+  fi
+fi
+
+# Try to create NVRAM entry on host
+if command -v efibootmgr >/dev/null 2>&1; then
+  if efibootmgr -v | grep -qi "Gentoo"; then
+    log "Gentoo NVRAM entry already present on host"
+  else
+    ESP_DEV_PATH=$(findmnt -n -o SOURCE --target "$EFI_MOUNT_POINT" 2>/dev/null || true)
+    if [[ -n "$ESP_DEV_PATH" ]]; then
+      DISK_DEVICE=$(echo "$ESP_DEV_PATH" | sed -r 's/(p?[0-9]+)$//')
+      PART_NO=$(echo "$ESP_DEV_PATH" | sed -r 's/.*p?([0-9]+)$/\1/')
+      log "ESP device: $ESP_DEV_PATH (disk: $DISK_DEVICE, part: $PART_NO)"
+      LOADER_PATH="\\EFI\\Gentoo\\grubx64.efi"
+      if efibootmgr --create --disk "$DISK_DEVICE" --part "$PART_NO" --loader "$LOADER_PATH" --label "Gentoo" >/dev/null 2>&1; then
+      log "Created NVRAM entry for Gentoo"
+      else
+        log "efibootmgr create failed; trying fallback loader path"
+        efibootmgr --create --disk "$DISK_DEVICE" --part "$PART_NO" --loader "\\EFI\\Boot\\bootx64.efi" --label "Gentoo" >/dev/null 2>&1 || true
+      fi
+    else
+      log "Cannot determine ESP device path; skip efibootmgr creation"
+    fi
+  fi
+  log "efibootmgr -v output:"
+  efibootmgr -v || true
+else
+  log "efibootmgr not present on host; please install efibootmgr and create NVRAM entry manually if required"
+fi
+
+# ---------------- Final cleanup & unmount ----------------
+log "Removing temporary chroot files"
+rm -f /mnt/gentoo/tmp/chroot_install.sh /mnt/gentoo/tmp/.installer_env.sh || true
+log "Unmounting /mnt/gentoo"
+umount -l /mnt/gentoo/dev{/shm,/pts,} 2>/dev/null || true
+umount -R /mnt/gentoo 2>/dev/null || true
+log "Installation finished. Reboot into the new system when ready."
+
+# ---------------- Save installer copy if requested ----------------
+if [[ "${SAVE_INSTALLER_COPY:-0}" -ne 0 ]]; then
+  OUT="/tmp/autogentoo_installer_saved.sh"
+  if [[ -f "${BASH_SOURCE[0]:-}" ]]; then
+    cp --preserve=mode,ownership "${BASH_SOURCE[0]}" "$OUT" || true
+    chmod +x "$OUT" || true
+    log "Installer copy saved to $OUT"
+    echo "Write to USB example: sudo dd if=${OUT} of=/dev/sdX bs=4M status=progress && sync"
+  fi
+fi
+log "All done. See $LOG for full trace."
