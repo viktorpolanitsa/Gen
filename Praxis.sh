@@ -4,18 +4,17 @@
 # Author: viktorpolanitsa
 # License: MIT
 #
-# Полностью автоматизированный установщик Gentoo Linux,
-# реализующий функционал, описанный в README:
-# - интерактивный мастер;
-# - чекпоинты и восстановление;
-# - LUKS2, LVM, отдельный /home, swap/zram;
-# - Btrfs с подтомами @ и @home, boot environments;
-# - OpenRC/systemd, standard/hardened;
-# - LSM: AppArmor / SELinux / none;
-# - UFW, DE (KDE/GNOME/XFCE/i3/server);
-# - ядро: genkernel / gentoo-kernel / gentoo-kernel-bin / manual;
-# - ccache, binpkg, LTO;
-# - автообновления, CPU frequency scaling.
+# Fully automated Gentoo Linux installer implementing the features described in the README:
+# - Interactive configuration wizard
+# - Checkpoints and resume
+# - LUKS2, LVM, separate /home, swap/zram
+# - Btrfs with @ and @home subvolumes, boot environments
+# - OpenRC/systemd, standard/hardened profiles
+# - LSM: AppArmor / SELinux / none
+# - UFW, desktop environment (KDE/GNOME/XFCE/i3/server)
+# - Kernel: genkernel / gentoo-kernel / gentoo-kernel-bin / manual
+# - ccache, binpkg, LTO
+# - Automatic updates, CPU frequency scaling
 
 set -euo pipefail
 IFS=$'\n\t'
@@ -27,16 +26,20 @@ LIVECD_FIX_LOG="/var/log/genesis-livecd-fix.log"
 LOG_FILE="/var/log/genesis-install.log"
 ERR_LOG="/var/log/genesis-install-error.log"
 
-# defaults
+# Defaults
 FORCE_AUTO=0
 SKIP_CHECKSUM=0
 
+# Ensure basic paths exist
+mkdir -p /var/log /mnt/gentoo
+
+# Global logging
 exec > >(tee -a "$LOG_FILE") 2> >(tee -a "$ERR_LOG" >&2)
 
-log() { printf '%s [INFO] %s\n'  "$(date -Is)" "$*"; }
-warn(){ printf '%s [WARN] %s\n'  "$(date -Is)" "$*" >&2; }
-err() { printf '%s [ERROR] %s\n' "$(date -Is)" "$*" >&2; }
-die() { err "$*"; exit 1; }
+log()  { printf '%s [INFO]  %s\n'  "$(date -Is)" "$*"; }
+warn() { printf '%s [WARN]  %s\n'  "$(date -Is)" "$*" >&2; }
+err()  { printf '%s [ERROR] %s\n'  "$(date -Is)" "$*" >&2; }
+die()  { err "$*"; exit 1; }
 
 retry_cmd() {
   local -i attempts=${1:-3}; shift
@@ -65,7 +68,7 @@ clear_checkpoint() {
 }
 
 cleanup() {
-  log "Cleanup: unmounting /mnt/gentoo and removing temp env"
+  log "Cleanup: unmounting /mnt/gentoo and cleaning temporary environment"
   rm -f /mnt/gentoo/tmp/.genesis_env.sh 2>/dev/null || true
   umount -l /mnt/gentoo/dev{/shm,/pts,} 2>/dev/null || true
   umount -l /mnt/gentoo/run 2>/dev/null || true
@@ -79,11 +82,16 @@ ${GENESIS_NAME} v${GENESIS_VERSION}
 
 Usage: $0 [--force|--auto] [--skip-checksum]
 
-  --force, --auto       Автоматически отвечать "да" на вопросы подтверждения.
-  --skip-checksum       Отключить проверку целостности Stage3 (НЕ рекомендуется).
+  --force, --auto       Automatically answer "yes" to confirmation questions.
+  --skip-checksum       Disable Stage3 integrity verification (NOT recommended).
 
 EOF
 }
+
+# Must be root
+if [[ $EUID -ne 0 ]]; then
+  die "This script must be run as root."
+fi
 
 # ---------------- ARGS ----------------
 while (( $# )); do
@@ -97,14 +105,14 @@ done
 
 # ---------------- LiveCD self-heal ----------------
 self_heal_livecd() {
-  log "Самодиагностика и самовосстановление LiveCD"
+  log "LiveCD self-diagnostics and self-healing"
 
-  # zram при < 6 ГБ RAM
+  # zram if RAM < 6 GiB
   local mem_kb
   mem_kb=$(awk '/MemTotal/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)
   if (( mem_kb > 0 && mem_kb < 6*1024*1024 )); then
     if ! grep -q zram /proc/swaps 2>/dev/null; then
-      log "Мало RAM (${mem_kb} kB) — настраиваю ZRAM swap"
+      log "Low RAM (${mem_kb} kB) — configuring ZRAM swap"
       modprobe zram || true
       echo $((mem_kb*1024/2)) > /sys/block/zram0/disksize 2>/dev/null || true
       mkswap /dev/zram0 2>/dev/null || true
@@ -112,22 +120,22 @@ self_heal_livecd() {
     fi
   fi
 
-  # необходимые утилиты
+  # Required tools
   local need_tools=( lsblk sfdisk mkfs.ext4 mkfs.xfs mkfs.btrfs cryptsetup pvcreate vgcreate lvcreate btrfs )
   local missing=()
   for t in "${need_tools[@]}"; do
     command -v "$t" >/dev/null 2>&1 || missing+=("$t")
   done
   if ((${#missing[@]})); then
-    log "Отсутствуют утилиты: ${missing[*]}"
+    log "Missing tools: ${missing[*]}"
     if command -v emerge >/dev/null 2>&1; then
-      log "Пробую доустановить: ${missing[*]} (лог: $LIVECD_FIX_LOG)"
+      log "Trying to install missing tools: ${missing[*]} (log: $LIVECD_FIX_LOG)"
       (
         emerge --quiet sys-fs/cryptsetup sys-fs/lvm2 sys-fs/btrfs-progs sys-fs/xfsprogs \
                sys-apps/util-linux sys-apps/pv || true
       ) >>"$LIVECD_FIX_LOG" 2>&1
     else
-      warn "emerge не найден; пропускаю доустановку"
+      warn "emerge not found; skipping tool installation"
     fi
   fi
 }
@@ -140,7 +148,7 @@ GPU_VENDOR="Unknown"
 GPU_DRIVER="amdgpu"
 
 detect_hardware() {
-  log "Определение CPU/GPU"
+  log "Detecting CPU/GPU"
   if command -v lscpu >/dev/null 2>&1; then
     CPU_VENDOR=$(lscpu | awk -F: '/Vendor ID:/ {gsub(/^[ \t]+/, "", $2); print $2}')
     CPU_MODEL=$(lscpu | awk -F: '/Model name:/ {sub(/^ +/, "", $2); print $2}')
@@ -172,26 +180,25 @@ handle_resume() {
   local cp
   cp=$(get_checkpoint)
   if [[ "$cp" != "0" ]]; then
-    log "Обнаружен незавершённый инсталляционный чекпоинт: stage=$cp"
+    log "Found unfinished installation checkpoint: stage=$cp"
     if (( FORCE_AUTO )); then
-      log "FORCE/auto: продолжаю с чекпоинта $cp"
+      log "FORCE/auto: resuming from checkpoint $cp"
       return
     fi
-    echo "[C]ontinue — продолжить с этого шага"
-    echo "[R]estart  — начать установку заново"
-    echo "[A]bort    — отменить"
-    read -rp "Ваш выбор [C/R/A]: " ans
+    echo "[C]ontinue — resume from this stage"
+    echo "[R]estart  — start installation from scratch"
+    echo "[A]bort    — cancel and exit"
+    read -rp "Your choice [C/R/A]: " ans
     case "$ans" in
-      C|c|"") log "Продолжаю с чекпоинта $cp";;
-      R|r) log "Сбрасываю чекпоинты и начинаю заново"; clear_checkpoint;;
-      A|a) die "Отменено пользователем";;
-      *) log "Неизвестный ответ, по умолчанию — Continue";;
+      C|c|"") log "Continuing from checkpoint $cp";;
+      R|r) log "Clearing checkpoints and starting over"; clear_checkpoint;;
+      A|a) die "Aborted by user";;
+      *) log "Unknown answer, default: Continue";;
     esac
   fi
 }
 
-# ---------------- Wizard ----------------
-# переменные конфигурации
+# ---------------- Interactive wizard ----------------
 TARGET_DISK=""
 BOOT_MODE="uefi"      # uefi|bios
 FS_TYPE="btrfs"       # btrfs|xfs|ext4
@@ -234,30 +241,30 @@ yesno() {
 }
 
 wizard() {
-  log "Запуск интерактивного мастера"
+  log "Starting interactive configuration wizard"
 
-  # диск
+  # Disk
   lsblk -dno NAME,SIZE,MODEL
-  read -rp "Укажите целевой диск (например, sda или nvme0n1): " d
-  [[ -n "$d" ]] || die "Диск не указан"
+  read -rp "Select target disk (e.g. sda or nvme0n1): " d
+  [[ -n "$d" ]] || die "No disk selected"
   TARGET_DISK="/dev/${d##*/}"
-  [[ -b "$TARGET_DISK" ]] || die "Блоковое устройство $TARGET_DISK не найдено"
+  [[ -b "$TARGET_DISK" ]] || die "Block device $TARGET_DISK not found"
 
-  # UEFI/BIOS
+  # Boot mode detection
   if [[ -d /sys/firmware/efi ]]; then
     BOOT_MODE="uefi"
   else
     BOOT_MODE="bios"
   fi
-  log "Обнаружен режим загрузки: $BOOT_MODE"
+  log "Detected boot mode: $BOOT_MODE"
 
-  # FS
+  # Root filesystem
   if (( ! FORCE_AUTO )); then
-    echo "Файловая система root:"
-    echo "1) Btrfs (по умолчанию, подтомы @ и @home, boot environments)"
+    echo "Root filesystem:"
+    echo "1) Btrfs (default, @ and @home subvolumes, boot environments)"
     echo "2) XFS"
     echo "3) Ext4"
-    read -rp "Выбор [1/2/3, по умолчанию 1]: " f
+    read -rp "Choice [1/2/3, default 1]: " f
     case "$f" in
       2) FS_TYPE="xfs";;
       3) FS_TYPE="ext4";;
@@ -266,32 +273,32 @@ wizard() {
   fi
 
   # LVM
-  ans=$(yesno "Использовать LVM?" "yes")
+  ans=$(yesno "Use LVM?" "yes")
   [[ "$ans" =~ ^[Yy] ]] && USE_LVM=1 || USE_LVM=0
 
   # LUKS
-  ans=$(yesno "Включить полное шифрование диска (LUKS2)?" "yes")
+  ans=$(yesno "Enable full disk encryption (LUKS2)?" "yes")
   [[ "$ans" =~ ^[Yy] ]] && USE_LUKS=1 || USE_LUKS=0
 
-  # encrypt /boot (только UEFI+LVM+LUKS)
+  # Encrypt /boot (UEFI+LVM+LUKS only)
   if (( USE_LUKS )) && (( USE_LVM )) && [[ "$BOOT_MODE" == "uefi" ]]; then
-    ans=$(yesno "Шифровать /boot (кроме маленького EFI-раздела)?" "no")
+    ans=$(yesno "Encrypt /boot (except small EFI partition)?" "no")
     [[ "$ans" =~ ^[Yy] ]] && ENCRYPT_BOOT=1 || ENCRYPT_BOOT=0
   else
     ENCRYPT_BOOT=0
   fi
 
   # /home
-  ans=$(yesno "Создать отдельный /home (LVM или Btrfs subvolume)?" "yes")
+  ans=$(yesno "Create separate /home (LVM LV or Btrfs subvolume)?" "yes")
   [[ "$ans" =~ ^[Yy] ]] && SEPARATE_HOME=1 || SEPARATE_HOME=0
 
-  # swap
+  # Swap
   if (( ! FORCE_AUTO )); then
-    echo "Swap:"
-    echo "1) ZRAM (в ОЗУ)"
-    echo "2) Отдельный swap-раздел / LV"
-    echo "3) Без swap"
-    read -rp "Выбор [1/2/3, по умолчанию 1]: " s
+    echo "Swap configuration:"
+    echo "1) ZRAM (in RAM)"
+    echo "2) Dedicated swap LV/partition"
+    echo "3) No swap"
+    read -rp "Choice [1/2/3, default 1]: " s
     case "$s" in
       2) SWAP_MODE="partition";;
       3) SWAP_MODE="none";;
@@ -299,29 +306,29 @@ wizard() {
     esac
   fi
 
-  # init
+  # Init system
   if (( ! FORCE_AUTO )); then
-    echo "Система инициализации:"
-    echo "1) OpenRC (рекомендуется)"
+    echo "Init system:"
+    echo "1) OpenRC (recommended)"
     echo "2) systemd"
-    read -rp "Выбор [1/2, по умолчанию 1]: " i
+    read -rp "Choice [1/2, default 1]: " i
     case "$i" in
       2) INIT_SYSTEM="systemd";;
       *) INIT_SYSTEM="openrc";;
     esac
   fi
 
-  # profile
-  ans=$(yesno "Использовать hardened-профиль (повышенная безопасность)?" "no")
+  # Profile flavor
+  ans=$(yesno "Use hardened profile (more security)?" "no")
   [[ "$ans" =~ ^[Yy] ]] && PROFILE_FLAVOR="hardened" || PROFILE_FLAVOR="standard"
 
   # LSM
   if (( ! FORCE_AUTO )); then
-    echo "LSM (модуль безопасности ядра):"
-    echo "1) Нет"
+    echo "Kernel LSM (security module):"
+    echo "1) None"
     echo "2) AppArmor"
     echo "3) SELinux"
-    read -rp "Выбор [1/2/3, по умолчанию 1]: " l
+    read -rp "Choice [1/2/3, default 1]: " l
     case "$l" in
       2) LSM_CHOICE="apparmor";;
       3) LSM_CHOICE="selinux";;
@@ -330,18 +337,18 @@ wizard() {
   fi
 
   # UFW
-  ans=$(yesno "Включить базовый firewall через UFW?" "yes")
+  ans=$(yesno "Enable basic firewall via UFW?" "yes")
   [[ "$ans" =~ ^[Yy] ]] && ENABLE_UFW=1 || ENABLE_UFW=0
 
-  # DE
+  # Desktop / server profile
   if (( ! FORCE_AUTO )); then
-    echo "Профиль среды:"
+    echo "System profile:"
     echo "1) KDE Plasma"
     echo "2) GNOME"
     echo "3) XFCE"
-    echo "4) i3-wm (минималистичный)"
-    echo "5) Server (без графики)"
-    read -rp "Выбор [1-5, по умолчанию 1]: " de
+    echo "4) i3-wm (minimalistic)"
+    echo "5) Server (no GUI)"
+    read -rp "Choice [1-5, default 1]: " de
     case "$de" in
       2) DE_CHOICE="gnome";;
       3) DE_CHOICE="xfce";;
@@ -351,14 +358,14 @@ wizard() {
     esac
   fi
 
-  # kernel
+  # Kernel management
   if (( ! FORCE_AUTO )); then
-    echo "Управление ядром:"
-    echo "1) gentoo-kernel-bin (быстрее всего)"
-    echo "2) gentoo-kernel"
-    echo "3) genkernel (сборка ядра автоматически)"
-    echo "4) Ручная настройка (только ставит источники)"
-    read -rp "Выбор [1-4, по умолчанию 1]: " k
+    echo "Kernel management:"
+    echo "1) gentoo-kernel-bin (fastest, prebuilt)"
+    echo "2) gentoo-kernel (managed sources)"
+    echo "3) genkernel (automatic kernel build)"
+    echo "4) Manual (only install sources)"
+    read -rp "Choice [1-4, default 1]: " k
     case "$k" in
       2) KERNEL_MODE="gentoo-kernel";;
       3) KERNEL_MODE="genkernel";;
@@ -367,40 +374,40 @@ wizard() {
     esac
   fi
 
-  # perf
-  ans=$(yesno "Включить ccache?" "yes")
+  # Performance options
+  ans=$(yesno "Enable ccache?" "yes")
   [[ "$ans" =~ ^[Yy] ]] && ENABLE_CCACHE=1 || ENABLE_CCACHE=0
-  ans=$(yesno "Включить сборку бинарных пакетов (buildpkg)?" "yes")
+  ans=$(yesno "Enable binary packages (buildpkg)?" "yes")
   [[ "$ans" =~ ^[Yy] ]] && ENABLE_BINPKG=1 || ENABLE_BINPKG=0
-  ans=$(yesno "Включить LTO (экспериментально)?" "no")
+  ans=$(yesno "Enable LTO (experimental)?" "no")
   [[ "$ans" =~ ^[Yy] ]] && ENABLE_LTO=1 || ENABLE_LTO=0
 
-  # bundles
-  ans=$(yesno "Установить Flatpak + Distrobox?" "yes")
+  # Bundles
+  ans=$(yesno "Install Flatpak + Distrobox?" "yes")
   [[ "$ans" =~ ^[Yy] ]] && BUNDLE_FLATPAK=1 || BUNDLE_FLATPAK=0
-  ans=$(yesno "\"Кибернетический терминал\" (zsh + starship)?" "yes")
+  ans=$(yesno "Install \"Cyber terminal\" (zsh + starship)?" "yes")
   [[ "$ans" =~ ^[Yy] ]] && BUNDLE_TERM=1 || BUNDLE_TERM=0
-  ans=$(yesno "Инструменты разработчика (git, VSCode, Docker)?" "yes")
+  ans=$(yesno "Developer tools (git, VSCode, Docker)?" "yes")
   [[ "$ans" =~ ^[Yy] ]] && BUNDLE_DEV=1 || BUNDLE_DEV=0
-  ans=$(yesno "Офис и графика (LibreOffice, GIMP, Inkscape)?" "yes")
+  ans=$(yesno "Office and graphics (LibreOffice, GIMP, Inkscape)?" "yes")
   [[ "$ans" =~ ^[Yy] ]] && BUNDLE_OFFICE=1 || BUNDLE_OFFICE=0
-  ans=$(yesno "Игровой набор (Steam, Lutris, Wine)?" "no")
+  ans=$(yesno "Gaming set (Steam, Lutris, Wine)?" "no")
   [[ "$ans" =~ ^[Yy] ]] && BUNDLE_GAMING=1 || BUNDLE_GAMING=0
 
-  # auto update
-  ans=$(yesno "Включить еженедельное автообновление системы?" "yes")
+  # Auto update
+  ans=$(yesno "Enable weekly system auto-update?" "yes")
   [[ "$ans" =~ ^[Yy] ]] && AUTO_UPDATE=1 || AUTO_UPDATE=0
 
-  # CPU freq
-  ans=$(yesno "Включить управление частотой CPU (для ноутбуков)?" "yes")
+  # CPU frequency tuning
+  ans=$(yesno "Enable CPU frequency management (laptops etc.)?" "yes")
   [[ "$ans" =~ ^[Yy] ]] && CPU_FREQ_TUNE=1 || CPU_FREQ_TUNE=0
 
-  # hostname/user/timezone
+  # Hostname/user/timezone
   read -rp "Hostname [gentoo]: " HOSTNAME; HOSTNAME=${HOSTNAME:-gentoo}
   read -rp "Username [gentoo]: " USERNAME; USERNAME=${USERNAME:-gentoo}
-  read -rp "Timezone (e.g. Europe/Moscow) [UTC]: " TIMEZONE; TIMEZONE=${TIMEZONE:-UTC}
+  read -rp "Timezone (e.g. Europe/Warsaw) [UTC]: " TIMEZONE; TIMEZONE=${TIMEZONE:-UTC}
 
-  # passwords
+  # Passwords
   if (( ! FORCE_AUTO )); then
     read -rsp "Root password: " ROOT_PASSWORD; echo
     read -rsp "Confirm root password: " r2; echo
@@ -413,21 +420,21 @@ wizard() {
     USER_PASSWORD="changeme_user"
   fi
 
-  # итог перед уничтожением диска
+  # Final summary before wiping the disk
   echo
-  echo "ИТОГ КОНФИГУРАЦИИ:"
-  echo "Диск:          $TARGET_DISK"
-  echo "Режим загрузки: $BOOT_MODE"
-  echo "ФС:            $FS_TYPE"
+  echo "CONFIGURATION SUMMARY:"
+  echo "Disk:          $TARGET_DISK"
+  echo "Boot mode:     $BOOT_MODE"
+  echo "Root FS:       $FS_TYPE"
   echo "LVM:           $USE_LVM"
   echo "LUKS2:         $USE_LUKS (encrypt /boot=$ENCRYPT_BOOT)"
-  echo "Отд. /home:    $SEPARATE_HOME"
+  echo "Separate /home:$SEPARATE_HOME"
   echo "Swap:          $SWAP_MODE"
-  echo "init:          $INIT_SYSTEM"
-  echo "Профиль:       $PROFILE_FLAVOR"
+  echo "Init:          $INIT_SYSTEM"
+  echo "Profile:       $PROFILE_FLAVOR"
   echo "LSM:           $LSM_CHOICE"
   echo "UFW:           $ENABLE_UFW"
-  echo "DE:            $DE_CHOICE"
+  echo "Desktop:       $DE_CHOICE"
   echo "Kernel:        $KERNEL_MODE"
   echo "ccache:        $ENABLE_CCACHE ; binpkg: $ENABLE_BINPKG ; LTO: $ENABLE_LTO"
   echo "Bundles:       flatpak=$BUNDLE_FLATPAK term=$BUNDLE_TERM dev=$BUNDLE_DEV office=$BUNDLE_OFFICE gaming=$BUNDLE_GAMING"
@@ -439,11 +446,11 @@ wizard() {
   echo
 
   if (( FORCE_AUTO )); then
-    log "FORCE/auto: подтверждение уничтожения диска пропущено"
+    log "FORCE/auto: disk wipe confirmation skipped"
     return
   fi
-  read -rp "ВНИМАНИЕ: ВСЕ ДАННЫЕ НА $TARGET_DISK БУДУТ УНИЧТОЖЕНЫ. Введите YES для продолжения: " conf
-  [[ "$conf" == "YES" ]] || die "Отменено пользователем"
+  read -rp "WARNING: ALL DATA ON $TARGET_DISK WILL BE DESTROYED. Type YES to continue: " conf
+  [[ "$conf" == "YES" ]] || die "Aborted by user"
 }
 
 # ---------------- Disk / LUKS / LVM / FS ----------------
@@ -454,51 +461,64 @@ LV_SWAP="lvswap"
 LV_HOME="lvhome"
 LV_BOOT="lvboot"
 
+# Helper: build partition name (handles nvme0n1 -> nvme0n1p1)
+partition_prefix_for_disk() {
+  local d="$1"
+  if [[ "$d" =~ [0-9]$ ]]; then
+    echo "${d}p"
+  else
+    echo "$d"
+  fi
+}
+
 partition_and_setup_storage() {
-  log "Разметка и подготовка диска $TARGET_DISK"
+  log "Partitioning and preparing disk $TARGET_DISK"
   swapoff -a || true
   umount -R /mnt/gentoo || true
   blockdev --flushbufs "$TARGET_DISK" || true
   sleep 1
 
+  local part_prefix
+  part_prefix=$(partition_prefix_for_disk "$TARGET_DISK")
+
   if [[ "$BOOT_MODE" == "uefi" ]]; then
-    log "Разметка GPT для UEFI"
+    log "Creating GPT layout for UEFI"
     if (( USE_LUKS )); then
       # EFI (FAT32) + LUKS PV
       sfdisk --force --wipe always "$TARGET_DISK" <<PART
 label: gpt
-${TARGET_DISK}1 : size=512MiB, type=uefi, name="EFI"
-${TARGET_DISK}2 : type=linux, name="cryptroot"
+${part_prefix}1 : size=512MiB, type=uefi, name="EFI"
+${part_prefix}2 : type=linux, name="cryptroot"
 PART
     else
       # EFI + plain root
       sfdisk --force --wipe always "$TARGET_DISK" <<PART
 label: gpt
-${TARGET_DISK}1 : size=512MiB, type=uefi, name="EFI"
-${TARGET_DISK}2 : type=linux, name="root"
+${part_prefix}1 : size=512MiB, type=uefi, name="EFI"
+${part_prefix}2 : type=linux, name="root"
 PART
     fi
   else
-    log "Разметка GPT для BIOS (BIOS boot + root)"
+    log "Creating GPT layout for BIOS (BIOS boot + root)"
     if (( USE_LUKS )); then
       sfdisk --force --wipe always "$TARGET_DISK" <<PART
 label: gpt
-${TARGET_DISK}1 : size=1MiB, type=21686148-6449-6E6F-744E-656564454649, name="BIOS"
-${TARGET_DISK}2 : type=linux, name="cryptroot"
+${part_prefix}1 : size=1MiB, type=21686148-6449-6E6F-744E-656564454649, name="BIOS"
+${part_prefix}2 : type=linux, name="cryptroot"
 PART
     else
       sfdisk --force --wipe always "$TARGET_DISK" <<PART
 label: gpt
-${TARGET_DISK}1 : size=1MiB, type=21686148-6449-6E6F-744E-656564454649, name="BIOS"
-${TARGET_DISK}2 : type=linux, name="root"
+${part_prefix}1 : size=1MiB, type=21686148-6449-6E6F-744E-656564454649, name="BIOS"
+${part_prefix}2 : type=linux, name="root"
 PART
     fi
   fi
 
   partprobe "$TARGET_DISK"; sleep 2
   local p1 p2
-  p1="${TARGET_DISK}1"
-  p2="${TARGET_DISK}2"
+  p1="${part_prefix}1"
+  p2="${part_prefix}2"
 
   # EFI
   if [[ "$BOOT_MODE" == "uefi" ]]; then
@@ -507,7 +527,7 @@ PART
 
   # LUKS / LVM / FS
   if (( USE_LUKS )); then
-    log "Создаю LUKS2 на $p2"
+    log "Creating LUKS2 on $p2"
     echo -n "$ROOT_PASSWORD" | cryptsetup luksFormat --type luks2 --pbkdf argon2id --cipher aes-xts-plain64 --key-size 512 "$p2" -
     echo -n "$ROOT_PASSWORD" | cryptsetup open "$p2" cryptroot -
     ROOT_MAPPER="/dev/mapper/cryptroot"
@@ -516,11 +536,10 @@ PART
   fi
 
   if (( USE_LVM )); then
-    log "Настройка LVM поверх $ROOT_MAPPER"
+    log "Setting up LVM on $ROOT_MAPPER"
     pvcreate "$ROOT_MAPPER"
     vgcreate "$VG_NAME" "$ROOT_MAPPER"
 
-    # размеры: root основной, swap по выбору, home по выбору
     local swap_lv_size="4G"
     if (( SEPARATE_HOME )); then
       lvcreate -n "$LV_ROOT" -l 60%FREE "$VG_NAME"
@@ -536,7 +555,6 @@ PART
     fi
 
     if (( ENCRYPT_BOOT )); then
-      # отдельный LV под /boot внутри LUKS
       lvcreate -n "$LV_BOOT" -L 512M "$VG_NAME" || true
     fi
 
@@ -545,7 +563,7 @@ PART
     local swap_dev="/dev/${VG_NAME}/${LV_SWAP:-}"
     local boot_dev="/dev/${VG_NAME}/${LV_BOOT:-}"
 
-    # FS
+    # Filesystems
     if [[ "$FS_TYPE" == "btrfs" ]]; then
       mkfs.btrfs -f "$root_dev"
       mount "$root_dev" /mnt/gentoo
@@ -588,13 +606,13 @@ PART
       fi
     fi
 
-    # swap
+    # swap LV
     if [[ "$SWAP_MODE" == "partition" ]] && [[ -n "$swap_dev" ]]; then
       mkswap "$swap_dev"
     fi
 
   else
-    # без LVM
+    # Without LVM
     if [[ "$FS_TYPE" == "btrfs" ]]; then
       mkfs.btrfs -f "$ROOT_MAPPER"
       mount "$ROOT_MAPPER" /mnt/gentoo
@@ -611,7 +629,7 @@ PART
     else
       mkfs."$FS_TYPE" -F "$ROOT_MAPPER"
       mount "$ROOT_MAPPER" /mnt/gentoo
-      # отдельный /home в non-LVM схеме не делаем на auto
+      # separate /home is not created automatically in non-LVM + non-Btrfs scheme
     fi
 
     if [[ "$BOOT_MODE" == "uefi" ]]; then
@@ -620,12 +638,24 @@ PART
     fi
 
     if [[ "$SWAP_MODE" == "partition" ]]; then
-      # отдельный swap-раздел не выделен, можно предупредить
-      warn "Выбран swap-раздел без LVM, но отдельного раздела не создано (упрощённая схема)."
+      warn "Swap 'partition' was selected without LVM, but a dedicated swap partition is not created in simplified scheme."
     fi
   fi
+}
 
-  checkpoint "storage_done"
+# ---------------- Network check ----------------
+check_network() {
+  log "Checking network connectivity"
+  if ping -c1 -W3 1.1.1.1 >/dev/null 2>&1 || ping -c1 -W3 8.8.8.8 >/dev/null 2>&1; then
+    log "Basic network connectivity OK"
+    return 0
+  fi
+  warn "No response from 1.1.1.1/8.8.8.8. Trying DNS-based check..."
+  if wget -q --spider https://distfiles.gentoo.org; then
+    log "HTTP connectivity to distfiles.gentoo.org OK"
+    return 0
+  fi
+  die "No network connectivity detected. Check network configuration before running the installer."
 }
 
 # ---------------- Stage3 download ----------------
@@ -633,10 +663,11 @@ STAGE3_URL=""
 STAGE3_LOCAL="/tmp/stage3.tar.xz"
 
 select_stage3_url() {
-  log "Выбор Stage3"
-  local region mirrors=() idx stg full rtt best_rtt=99999 best=""
+  log "Selecting Stage3 tarball"
+  local region mirrors=() idx stg full rtt best_rtt=99999 best="" 
+
   region=$(curl -s --max-time 5 https://ipapi.co/country 2>/dev/null || echo "")
-  log "Регион по geo-IP: ${region:-unknown}"
+  log "Region by geo-IP: ${region:-unknown}"
 
   if command -v mirrorselect >/dev/null 2>&1; then
     local tmp
@@ -659,11 +690,22 @@ select_stage3_url() {
     )
   fi
 
-  for m in "${mirrors[@]}"; do
-    for idx in \
-      "releases/amd64/autobuilds/latest-stage3-amd64-openrc.txt" \
+  # Prefer Stage3 matching selected init system
+  local stage_files=()
+  if [[ "$INIT_SYSTEM" == "systemd" ]]; then
+    stage_files+=(
       "releases/amd64/autobuilds/latest-stage3-amd64-systemd.txt"
-    do
+      "releases/amd64/autobuilds/latest-stage3-amd64-openrc.txt"
+    )
+  else
+    stage_files+=(
+      "releases/amd64/autobuilds/latest-stage3-amd64-openrc.txt"
+      "releases/amd64/autobuilds/latest-stage3-amd64-systemd.txt"
+    )
+  fi
+
+  for m in "${mirrors[@]}"; do
+    for idx in "${stage_files[@]}"; do
       local url="$m$idx"
       if curl -s --head --fail --max-time 6 "$url" >/dev/null 2>&1; then
         stg=$(curl -fsS "$url" 2>/dev/null | awk '!/^#/ && /stage3/ {print $1; exit}')
@@ -686,42 +728,47 @@ select_stage3_url() {
   done
 
   if [[ -z "$best" ]]; then
-    local idx="https://distfiles.gentoo.org/releases/amd64/autobuilds/latest-stage3-amd64-openrc.txt"
+    local idx
+    if [[ "$INIT_SYSTEM" == "systemd" ]]; then
+      idx="https://distfiles.gentoo.org/releases/amd64/autobuilds/latest-stage3-amd64-systemd.txt"
+    else
+      idx="https://distfiles.gentoo.org/releases/amd64/autobuilds/latest-stage3-amd64-openrc.txt"
+    fi
     if curl -s --head --fail "$idx" >/dev/null 2>&1; then
       stg=$(curl -fsS "$idx" | awk '!/^#/ && /stage3/ {print $1; exit}')
       best="https://distfiles.gentoo.org/releases/amd64/autobuilds/${stg}"
     fi
   fi
 
-  [[ -n "$best" ]] || die "Не удалось подобрать Stage3"
+  [[ -n "$best" ]] || die "Failed to select Stage3 tarball"
   STAGE3_URL="$best"
-  log "Выбран Stage3: $STAGE3_URL (rtt=${best_rtt})"
+  log "Selected Stage3: $STAGE3_URL (rtt=${best_rtt})"
 }
 
 download_stage3() {
-  log "Скачивание Stage3 -> $STAGE3_LOCAL"
-  retry_cmd 6 5 wget -c -O "$STAGE3_LOCAL" "$STAGE3_URL" || die "Не удалось скачать Stage3"
+  log "Downloading Stage3 -> $STAGE3_LOCAL"
+  retry_cmd 6 5 wget -c -O "$STAGE3_LOCAL" "$STAGE3_URL" || die "Failed to download Stage3"
 
   if (( ! SKIP_CHECKSUM )); then
     local dig="/tmp/stage3.DIGESTS"
     local dig_url="${STAGE3_URL%.tar.xz}.DIGESTS"
-    log "Скачивание DIGESTS -> $dig"
-    retry_cmd 3 5 wget -O "$dig" "$dig_url" || die "Не удалось скачать DIGESTS"
-    log "Проверка SHA512 Stage3"
-    grep -A999 "SHA512 HASH" "$dig" | awk 'NF>=2 && $1 !~ /^#/ {print $1"  '"$STAGE3_LOCAL"'"}' | sha512sum -c - || die "Проверка SHA512 не прошла"
+    log "Downloading DIGESTS -> $dig"
+    retry_cmd 3 5 wget -O "$dig" "$dig_url" || die "Failed to download DIGESTS"
+    log "Verifying Stage3 SHA512"
+    grep -A999 "SHA512 HASH" "$dig" | awk 'NF>=2 && $1 !~ /^#/ {print $1"  '"$STAGE3_LOCAL"'"}' | sha512sum -c - || die "SHA512 verification failed"
   else
-    warn "--skip-checksum: проверка целостности Stage3 отключена"
+    warn "--skip-checksum: Stage3 integrity check disabled"
   fi
 }
 
 extract_stage3() {
-  log "Распаковка Stage3 в /mnt/gentoo"
+  log "Extracting Stage3 to /mnt/gentoo"
   tar xpvf "$STAGE3_LOCAL" -C /mnt/gentoo --xattrs-include='*.*' --numeric-owner
 }
 
 # ---------------- fstab + make.conf ----------------
 generate_fstab_and_makeconf() {
-  log "Генерация fstab и make.conf"
+  log "Generating fstab and make.conf"
   local root_dev efi_dev root_uuid efi_uuid
   root_dev=$(findmnt -no SOURCE /mnt/gentoo || true)
   efi_dev=$(findmnt -no SOURCE /mnt/gentoo/boot/efi 2>/dev/null || true)
@@ -729,31 +776,50 @@ generate_fstab_and_makeconf() {
   efi_uuid=$(blkid -s UUID -o value "$efi_dev" 2>/dev/null || true)
   mkdir -p /mnt/gentoo/etc
 
+  local root_opts home_opts
+  if [[ "$FS_TYPE" == "btrfs" ]]; then
+    root_opts="noatime,compress=zstd:3,subvol=@"
+    home_opts="noatime,compress=zstd:3,subvol=@home"
+  else
+    root_opts="noatime"
+    home_opts="noatime"
+  fi
+
   {
     if [[ -n "$root_uuid" ]]; then
-      local opts="noatime"
-      [[ "$FS_TYPE" == "btrfs" ]] && opts="noatime,compress=zstd:3"
-      echo "UUID=${root_uuid}  /          ${FS_TYPE}  ${opts}  0 1"
+      echo "UUID=${root_uuid}  /          ${FS_TYPE}  ${root_opts}  0 1"
     fi
     if [[ -n "$efi_uuid" ]]; then
       echo "UUID=${efi_uuid}   /boot/efi  vfat  noatime  0 2"
     fi
   } > /mnt/gentoo/etc/fstab
 
-  # LUKS/LVM swap/home
+  # LUKS/LVM swap/home entries
   if (( USE_LVM )); then
     if [[ "$SWAP_MODE" == "partition" ]]; then
       if lvdisplay "/dev/${VG_NAME}/${LV_SWAP}" >/dev/null 2>&1; then
-        echo "/dev/${VG_NAME}/${LV_SWAP}  none  swap  sw  0 0" >> /mnt/gentoo/etc/fstab
+        echo "/dev/${VG_NAME}/${LV_SWAP}  none   swap  sw        0 0" >> /mnt/gentoo/etc/fstab
       fi
     fi
-    if (( SEPARATE_HOME )) && [[ "$FS_TYPE" != "btrfs" ]]; then
-      if lvdisplay "/dev/${VG_NAME}/${LV_HOME}" >/dev/null 2>&1; then
-        echo "/dev/${VG_NAME}/${LV_HOME}  /home  ${FS_TYPE}  noatime  0 2" >> /mnt/gentoo/etc/fstab
+    if (( SEPARATE_HOME )); then
+      if [[ "$FS_TYPE" == "btrfs" ]]; then
+        # /home on Btrfs subvolume on same LV
+        if [[ -n "$root_uuid" ]]; then
+          echo "UUID=${root_uuid}  /home      btrfs ${home_opts}  0 2" >> /mnt/gentoo/etc/fstab
+        fi
+      else
+        if lvdisplay "/dev/${VG_NAME}/${LV_HOME}" >/dev/null 2>&1; then
+          echo "/dev/${VG_NAME}/${LV_HOME}  /home   ${FS_TYPE}  noatime  0 2" >> /mnt/gentoo/etc/fstab
+        fi
       fi
     fi
     if (( ENCRYPT_BOOT )) && lvdisplay "/dev/${VG_NAME}/${LV_BOOT}" >/dev/null 2>&1; then
       echo "/dev/${VG_NAME}/${LV_BOOT}  /boot  ext4  noatime  0 2" >> /mnt/gentoo/etc/fstab
+    fi
+  else
+    # Non-LVM Btrfs: add /home entry if separate subvolume
+    if [[ "$FS_TYPE" == "btrfs" ]] && (( SEPARATE_HOME )) && [[ -n "$root_uuid" ]]; then
+      echo "UUID=${root_uuid}  /home      btrfs ${home_opts}  0 2" >> /mnt/gentoo/etc/fstab
     fi
   fi
 
@@ -804,7 +870,7 @@ MCF
 
 # ---------------- chroot preparation ----------------
 prepare_chroot_mounts() {
-  log "Подготовка chroot-монтов"
+  log "Preparing chroot mounts"
   cp --dereference /etc/resolv.conf /mnt/gentoo/etc/ || true
   mount -t proc /proc /mnt/gentoo/proc
   mount --rbind /sys /mnt/gentoo/sys; mount --make-rslave /mnt/gentoo/sys
@@ -815,7 +881,7 @@ prepare_chroot_mounts() {
 }
 
 write_genesis_env() {
-  log "Запись /mnt/gentoo/tmp/.genesis_env.sh"
+  log "Writing /mnt/gentoo/tmp/.genesis_env.sh"
   mkdir -p /mnt/gentoo/tmp
   cat > /mnt/gentoo/tmp/.genesis_env.sh <<ENV
 DE_CHOICE='${DE_CHOICE}'
@@ -856,11 +922,12 @@ ENV
 }
 
 write_chroot_installer() {
-  log "Создание /mnt/gentoo/tmp/genesis_chroot_install.sh"
+  log "Creating /mnt/gentoo/tmp/genesis_chroot_install.sh"
   cat > /mnt/gentoo/tmp/genesis_chroot_install.sh <<'CHROOT'
 #!/usr/bin/env bash
 set -euo pipefail
 IFS=$'\n\t'
+
 log(){ printf '%s [CHROOT] %s\n' "$(date -Is)" "$*"; }
 
 healing_emerge() {
@@ -888,10 +955,10 @@ log "Chroot: HOSTNAME=${HOSTNAME}, USERNAME=${USERNAME}, DE=${DE_CHOICE}, INIT=$
 # Sync Portage
 if ! emerge-webrsync; then
   log "emerge-webrsync failed; trying emerge --sync"
-  emerge --sync || log "emerge --sync also had issues; continue"
+  emerge --sync || log "emerge --sync also had issues; continuing"
 fi
 
-# Profile select
+# Profile selection
 PROFILE_ID=""
 if [[ "$PROFILE_FLAVOR" == "hardened" ]]; then
   if [[ "$INIT_SYSTEM" == "systemd" ]]; then
@@ -922,7 +989,7 @@ echo "sys-kernel/linux-firmware linux-fw-redistributable" > /etc/portage/package
 echo "sys-kernel/linux-firmware ~amd64" > /etc/portage/package.accept_keywords/linux-firmware
 
 # World update
-healing_emerge --update --deep --newuse @world || log "@world update had issues"
+healing_emerge --update --deep --newuse @world || log "@world update encountered issues"
 
 # Locales & timezone
 echo "en_US.UTF-8 UTF-8" >> /etc/locale.gen
@@ -958,7 +1025,7 @@ else
   systemctl enable systemd-timesyncd.service || true
 fi
 
-# Networking & ssh
+# Networking & SSH
 healing_emerge net-misc/networkmanager net-misc/openssh || true
 if [[ "$INIT_SYSTEM" == "openrc" ]]; then
   rc-update add NetworkManager default || true
@@ -1001,7 +1068,7 @@ elif [[ "$KERNEL_MODE" == "genkernel" ]]; then
   genkernel all || true
 else
   healing_emerge sys-kernel/gentoo-sources || true
-  log "Ручной режим ядра: настройте и соберите ядро самостоятельно."
+  log "Manual kernel mode: configure and build the kernel yourself."
 fi
 
 # Xorg & DE
@@ -1009,16 +1076,16 @@ if [[ "$DE_CHOICE" != "server" ]]; then
   healing_emerge x11-base/xorg-drivers x11-base/xorg-server || true
 fi
 case "$DE_CHOICE" in
-  kde) healing_emerge kde-plasma/plasma-meta konsole dolphin || true ;;
+  kde)   healing_emerge kde-plasma/plasma-meta kde-apps/konsole kde-apps/dolphin || true ;;
   gnome) healing_emerge gnome-base/gnome || true ;;
-  xfce) healing_emerge xfce-base/xfce4-meta xfce-extra/xfce4-goodies || true ;;
-  i3) healing_emerge x11-wm/i3 x11-terms/alacritty || true ;;
+  xfce)  healing_emerge xfce-base/xfce4-meta xfce-extra/xfce4-goodies || true ;;
+  i3)    healing_emerge x11-wm/i3 x11-terms/alacritty || true ;;
   server) : ;;
 esac
 
 # Display manager
 if [[ "$DE_CHOICE" == "kde" ]]; then
-  healing_emerge sys-apps/sddm || true
+  healing_emerge x11-misc/sddm || true
   if [[ "$INIT_SYSTEM" == "openrc" ]]; then
     rc-update add sddm default || true
   else
@@ -1044,7 +1111,7 @@ if [[ "$BUNDLE_FLATPAK" -eq 1 ]]; then
   healing_emerge sys-apps/flatpak app-containers/distrobox || true
 fi
 if [[ "$BUNDLE_TERM" -eq 1 ]]; then
-  healing_emerge app-shells/zsh media-fonts/nerdfonts app-shells/starship || true
+  healing_emerge app-shells/zsh media-fonts/nerd-fonts app-shells/starship || true
 fi
 if [[ "$BUNDLE_DEV" -eq 1 ]]; then
   healing_emerge dev-vcs/git dev-util/visual-studio-code-bin app-containers/docker || true
@@ -1061,7 +1128,7 @@ if [[ "$BUNDLE_GAMING" -eq 1 ]]; then
   healing_emerge games-util/steam-launcher games-util/lutris app-emulation/wine || true
 fi
 
-# CPU freq
+# CPU frequency tools
 if [[ "$CPU_FREQ_TUNE" -eq 1 ]]; then
   healing_emerge sys-power/cpupower || true
   if [[ "$INIT_SYSTEM" == "openrc" ]]; then
@@ -1147,24 +1214,24 @@ if [[ -d /boot/efi/EFI ]]; then
   fi
 fi
 
-log "Chroot-построение завершено"
+log "Chroot build completed"
 CHROOT
   chmod +x /mnt/gentoo/tmp/genesis_chroot_install.sh
 }
 
 run_chroot_install() {
-  log "Запуск chroot-инсталлятора"
+  log "Running chroot installer"
   chroot /mnt/gentoo /bin/bash /tmp/genesis_chroot_install.sh
 }
 
 post_chroot_efi_fix() {
-  log "Пост-chroot EFI проверка"
+  log "Post-chroot EFI check"
   if [[ ! -d /sys/firmware/efi ]]; then
-    warn "Хост загружен не в UEFI, пропускаю efibootmgr"
+    warn "Host is not booted in UEFI mode, skipping efibootmgr"
     return
   fi
   if ! command -v efibootmgr >/dev/null 2>&1; then
-    warn "efibootmgr отсутствует на LiveCD, пропускаю"
+    warn "efibootmgr is not available on LiveCD, skipping EFI entry creation"
     return
   fi
   if ! efibootmgr | grep -qi gentoo; then
@@ -1182,51 +1249,56 @@ post_chroot_efi_fix() {
 }
 
 # ---------------- MAIN ----------------
-log "${GENESIS_NAME} v${GENESIS_VERSION} стартует"
+log "${GENESIS_NAME} v${GENESIS_VERSION} starting"
+
 self_heal_livecd
 detect_hardware
 handle_resume
 
-if [[ "$(get_checkpoint)" == "0" ]]; then
+cp_stage=$(get_checkpoint)
+
+if [[ "$cp_stage" == "0" ]]; then
   wizard
   checkpoint "wizard_done"
+  cp_stage="wizard_done"
 fi
 
-if [[ "$(get_checkpoint)" == "wizard_done" ]]; then
+if [[ "$cp_stage" == "wizard_done" ]]; then
   partition_and_setup_storage
+  checkpoint "storage_done"
+  cp_stage="storage_done"
 fi
 
-checkpoint "storage_done"
-
-if [[ "$(get_checkpoint)" == "storage_done" ]]; then
+if [[ "$cp_stage" == "storage_done" ]]; then
+  check_network
   select_stage3_url
   download_stage3
   extract_stage3
+  checkpoint "stage3_done"
+  cp_stage="stage3_done"
 fi
 
-checkpoint "stage3_done"
-
-if [[ "$(get_checkpoint)" == "stage3_done" ]]; then
+if [[ "$cp_stage" == "stage3_done" ]]; then
   generate_fstab_and_makeconf
   prepare_chroot_mounts
   write_genesis_env
-  write_chroot_installer()
+  write_chroot_installer
+  checkpoint "chroot_script_ready"
+  cp_stage="chroot_script_ready"
 fi
 
-checkpoint "chroot_script_ready"
-
-if [[ "$(get_checkpoint)" == "chroot_script_ready" ]]; then
+if [[ "$cp_stage" == "chroot_script_ready" ]]; then
   run_chroot_install
+  checkpoint "chroot_done"
+  cp_stage="chroot_done"
 fi
 
-checkpoint "chroot_done"
-
-if [[ "$(get_checkpoint)" == "chroot_done" ]]; then
+if [[ "$cp_stage" == "chroot_done" ]]; then
   post_chroot_efi_fix
 fi
 
 clear_checkpoint
-log "Установка завершена. Рекомендуется выполнить:"
+log "Installation finished. Recommended next commands:"
 log "  exit"
 log "  umount -R /mnt/gentoo"
 log "  reboot"
